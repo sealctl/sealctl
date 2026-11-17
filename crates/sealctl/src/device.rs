@@ -155,3 +155,21 @@ pub fn ensure_user_pin(tx: &mut Card<Transaction>) -> Result<()> {
     tx.verify_user_pinpad(&prompt("Enter your PIN on the Ledger"))
         .context("PIN verification")
 }
+
+/// A wrong PIN or a "reject" on the device: retrying would ask again (and a wrong PIN would use
+/// up another of the card's three tries).
+pub fn is_user_refusal(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_ascii_lowercase();
+    [
+        "63c",
+        "6982",
+        "6983",
+        "6985",
+        "5501",
+        "rejected",
+        "wrong pin",
+        "incorrect pin",
+    ]
+    .iter()
+    .any(|p| s.contains(p))
+}

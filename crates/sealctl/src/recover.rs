@@ -44,12 +44,14 @@ fn big(hex_str: &str) -> BigUint {
 
 /// BIP39 seed from a recovery phrase (the checksum is verified).
 pub fn bip39_seed(words: &str, passphrase: &str) -> Result<Zeroizing<[u8; 64]>> {
-    let normalized = words
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    let m = bip39::Mnemonic::parse_in(bip39::Language::English, &normalized)
+    let mut normalized = Zeroizing::new(String::with_capacity(words.len()));
+    for (i, w) in words.split_whitespace().enumerate() {
+        if i > 0 {
+            normalized.push(' ');
+        }
+        normalized.extend(w.chars().flat_map(char::to_lowercase));
+    }
+    let m = bip39::Mnemonic::parse_in(bip39::Language::English, normalized.as_str())
         .map_err(|e| anyhow::anyhow!("not a valid recovery phrase: {e}"))?;
     Ok(Zeroizing::new(m.to_seed(passphrase)))
 }

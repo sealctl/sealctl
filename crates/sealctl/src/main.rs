@@ -148,6 +148,15 @@ enum Cmd {
     #[command(subcommand)]
     Kit(KitCmd),
 
+    /// AI coding agents: install a skill (how to use sealctl), hooks (block pasted keys, deny
+    /// commands/files that would reveal secrets) and deny rules, for every agent found.
+    #[command(subcommand)]
+    Ai(AiCmd),
+
+    /// (internal) Hook entry point called by AI agents; reads the hook JSON on stdin.
+    #[command(hide = true)]
+    Hook { tool: String },
+
     /// Disaster recovery without a Ledger: recompute your decryption key from the 24 words and
     /// serve it through the agent, so unlock / backup restore / secrets work. Verified against
     /// your certificate. Exposes the phrase to this computer — use only to recover, offline.
@@ -297,17 +306,25 @@ enum ScheduleCmd {
 
 #[derive(Subcommand)]
 enum SecretCmd {
-    /// Store a secret (value from stdin, or asked without echo).
+    /// Store a secret (value asked without echo, from stdin, or from the clipboard).
     Set {
         name: String,
         #[arg(long)]
         force: bool,
+        /// Take the value from the clipboard and clear it — safe with AI agents: the value is
+        /// never typed, printed or seen by the agent.
+        #[arg(long)]
+        from_clipboard: bool,
     },
-    /// Print a secret (or copy it with -c, cleared after 45 s).
+    /// Copy a secret to the clipboard (-c, cleared after 30 s), or print it into a pipe.
+    /// Never prints inside an AI agent's session, nor to a terminal without --show.
     Get {
         name: String,
         #[arg(long, short)]
         clip: bool,
+        /// Print to the terminal anyway.
+        #[arg(long)]
+        show: bool,
     },
     /// List secret names.
     Ls,
@@ -320,9 +337,12 @@ enum SecretCmd {
         /// Name prefix, e.g. the project name.
         #[arg(long)]
         prefix: String,
-        /// Delete the .env file afterwards.
+        /// Delete the .env file afterwards (only after every value read back correctly).
         #[arg(long)]
         delete: bool,
+        /// Replace secrets that already exist under these names.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -357,10 +377,13 @@ enum SshCmd {
     },
     /// Print a public key: an encrypted key file's by name, or the Ledger key's.
     Pubkey { name: Option<String> },
-    /// Print the passphrase of an encrypted key file (for ssh-keygen -p / other agents).
+    /// Copy the passphrase of an encrypted key file (for ssh-keygen -p / other agents) to the
+    /// clipboard, cleared after 30 s; --show prints it, or pipe it.
     Passphrase {
         #[arg(default_value = "ed25519")]
         name: String,
+        #[arg(long)]
+        show: bool,
     },
     /// Run the agent in the foreground.
     Agent {
@@ -371,6 +394,16 @@ enum SshCmd {
     Install,
     /// Remove the login service.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum AiCmd {
+    /// Install for every AI agent found (or only the named ones).
+    Install { tools: Vec<String> },
+    /// Remove everything `ai install` added.
+    Uninstall { tools: Vec<String> },
+    /// Show what is installed where.
+    Status { tools: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -457,12 +490,32 @@ fn real_main(cli: Cli) -> Result<()> {
             no_backup,
             force,
         } => {
-            volume::lock_all(no_backup, force)?;
+            // forget cached keys even if a volume refuses to lock
+            let locked = volume::lock_all(no_backup, force);
             if ssh::forget() {
                 println!("🔒 SSH keys forgotten by the agent");
             }
             if agent::stop()? {
                 println!("🔒 agent stopped — the Ledger is needed again next time");
+            }
+            locked
+        }
+        Cmd::Hook { tool } => sealctl::ai::run_hook(&tool),
+        Cmd::Ai(a) => {
+            let (reports, verb) = match a {
+                AiCmd::Install { tools } => (sealctl::ai::install(&tools)?, "installed"),
+                AiCmd::Uninstall { tools } => (sealctl::ai::uninstall(&tools)?, "removed"),
+                AiCmd::Status { tools } => (sealctl::ai::status(&tools)?, ""),
+            };
+            for r in &reports {
+                println!("{} {}", if r.detected { "●" } else { "○" }, r.tool);
+                for l in &r.lines {
+                    println!("    {l}");
+                }
+            }
+            if verb == "installed" {
+                println!("\nRestart running AI sessions to load the skill and hooks.");
+                println!("Store keys by copying them and asking: \"store it as myapp/openai\".");
             }
             Ok(())
         }
@@ -661,17 +714,35 @@ fn real_main(cli: Cli) -> Result<()> {
         },
 
         Cmd::Secret(s) => match s {
-            SecretCmd::Set { name, force } => {
-                let v = secrets::read_value(&name)?;
+            SecretCmd::Set {
+                name,
+                force,
+                from_clipboard,
+            } => {
+                let v = if from_clipboard {
+                    util::take_clipboard()?
+                } else {
+                    secrets::read_value(&name)?
+                };
+                for f in sealctl::guard::find_secrets(&String::from_utf8_lossy(&v)) {
+                    eprintln!("   looks like: {} {}", f.kind, f.preview);
+                }
                 secrets::set(agent::oracle(&ctx)?.as_mut(), &name, &v, force)?;
                 eprintln!("✅ stored {name}");
                 Ok(())
             }
-            SecretCmd::Get { name, clip } => {
+            SecretCmd::Get { name, clip, show } => {
+                if let (true, Some(agent)) = (clip, sealctl::guard::ai_agent()) {
+                    // the agent could read the clipboard right back
+                    anyhow::bail!("refusing to copy a secret inside {agent}; use `sealctl run -- <command>`");
+                }
+                if !clip {
+                    sealctl::guard::may_print_secret(show).map_err(anyhow::Error::msg)?;
+                }
                 let v = secrets::get(agent::oracle(&ctx)?.as_mut(), &name)?;
                 if clip {
-                    util::copy_to_clipboard_with_clear(&v, 45)?;
-                    eprintln!("📋 copied {name} (clears in 45 s)");
+                    util::copy_to_clipboard_with_clear(&v, 30)?;
+                    eprintln!("📋 copied {name} (clears in 30 s)");
                 } else {
                     println!("{}", v.as_str());
                 }
@@ -684,9 +755,12 @@ fn real_main(cli: Cli) -> Result<()> {
                 Ok(())
             }
             SecretCmd::Rm { name } => secrets::remove(&name),
-            SecretCmd::ImportEnv { file, prefix, delete } => {
-                project::import_dotenv(agent::oracle(&ctx)?.as_mut(), &file, &prefix, delete)
-            }
+            SecretCmd::ImportEnv {
+                file,
+                prefix,
+                delete,
+                force,
+            } => project::import_dotenv(agent::oracle(&ctx)?.as_mut(), &file, &prefix, delete, force),
         },
         Cmd::Run {
             env,
@@ -754,10 +828,22 @@ fn real_main(cli: Cli) -> Result<()> {
                 println!("{}", ssh::public_key_line(&cert::own()?)?);
                 Ok(())
             }
-            SshCmd::Passphrase { name } => {
+            SshCmd::Passphrase { name, show } => {
+                use std::io::IsTerminal;
+                let to_clipboard = std::io::stdout().is_terminal() && !show;
+                if !to_clipboard {
+                    sealctl::guard::may_print_secret(show).map_err(anyhow::Error::msg)?;
+                } else if let Some(agent) = sealctl::guard::ai_agent() {
+                    anyhow::bail!("refusing inside {agent}: run it in your own terminal");
+                }
                 let public = ssh::read_public(&ssh::key_path(&name)?)?;
                 let pass = ssh::passphrase_for(agent::oracle(&ctx)?.as_mut(), &public)?;
-                println!("{}", *pass);
+                if to_clipboard {
+                    util::copy_to_clipboard_with_clear(&pass, 30)?;
+                    eprintln!("📋 passphrase copied (clears in 30 s)");
+                } else {
+                    println!("{}", *pass);
+                }
                 Ok(())
             }
             SshCmd::Agent { socket } => ssh::run_agent(ctx, socket),

@@ -73,7 +73,10 @@ pub fn running_app(t: &mut dyn Exchange) -> Result<(String, String)> {
         return Err(anyhow!("GET APP AND VERSION failed: {}", hex(sw)));
     }
     let nlen = data[1] as usize;
-    let name = String::from_utf8_lossy(&data[2..2 + nlen]).into_owned();
+    let name = data
+        .get(2..2 + nlen)
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .ok_or_else(|| anyhow!("malformed GET APP AND VERSION reply"))?;
     let vlen = data.get(2 + nlen).copied().unwrap_or(0) as usize;
     let version = data
         .get(3 + nlen..3 + nlen + vlen)

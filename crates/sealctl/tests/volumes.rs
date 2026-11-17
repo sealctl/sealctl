@@ -97,7 +97,7 @@ fn lifecycle(kind: Kind, mount_in_tmp: bool) {
         let err = sealctl::backup::init(&mut ledger, &name, &repo, Some(&repo), &[])
             .expect_err("URL key was removed by rekey");
         assert!(format!("{err:#}").contains("not for key id"), "{err:#}");
-        fs::remove_dir_all(vol.inner_dir()).unwrap();
+        assert!(!vol.inner_dir().exists(), "a failed init writes no credentials");
         sealctl::backup::init(&mut ledger, &name, &repo, None, &[]).expect("reconnect to existing repo");
         sealctl::backup::run(std::slice::from_ref(&name), false, false, true)
             .expect("backup after reconnect");

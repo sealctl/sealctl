@@ -121,9 +121,10 @@ impl Decoder {
             self.total = Some(u16::from_be_bytes([payload[0], payload[1]]) as usize);
             payload = &payload[2..];
         }
-        self.expected_seq = self.expected_seq.wrapping_add(1);
+        // a reply is at most 64 KiB, far below 65 536 frames: refuse to wrap the counter
+        self.expected_seq = self.expected_seq.checked_add(1).ok_or(FramingError::Short)?;
         let total = self.total.unwrap_or(0);
-        let need = total - self.data.len();
+        let need = total.saturating_sub(self.data.len());
         self.data.extend_from_slice(&payload[..payload.len().min(need)]);
         if self.data.len() >= total {
             return Ok(Some(std::mem::take(&mut self.data)));

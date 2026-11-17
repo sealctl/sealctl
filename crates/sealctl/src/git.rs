@@ -33,6 +33,24 @@ const SETTINGS: &[&str] = &[
     "tag.gpgsign",
 ];
 
+fn shim_path() -> Result<std::path::PathBuf> {
+    Ok(paths::config_dir()?.join("git-ssh-keygen"))
+}
+
+/// `~/.config/sealctl/git-ssh-keygen`: runs `sealctl git ssh-keygen "$@"`.
+fn write_shim(exe: &std::path::Path) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = shim_path()?;
+    std::fs::create_dir_all(path.parent().context("config dir")?)?;
+    let quoted = format!("'{}'", exe.to_string_lossy().replace('\'', r"'\''"));
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\n# git's gpg.ssh.program, written by `sealctl git setup`\nexec {quoted} git ssh-keygen \"$@\"\n"),
+    )?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
 /// Remove the settings `setup` made.
 pub fn undo(local: bool) -> Result<()> {
     let scope = if local { "--local" } else { "--global" };
@@ -41,6 +59,9 @@ pub fn undo(local: bool) -> Result<()> {
         let _ = Command::new("git")
             .args(["config", scope, "--unset", key])
             .status();
+    }
+    if !local {
+        let _ = std::fs::remove_file(shim_path()?);
     }
     println!(
         "✅ git ({}) no longer signs with sealctl",
@@ -67,15 +88,12 @@ pub fn setup(local: bool, key: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(paths::config_dir()?)?;
     std::fs::write(&allowed, format!("{email} namespaces=\"git\" {line}\n"))?;
 
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::stable_exe()?;
     let scope = if local { "--local" } else { "--global" };
     git_config(scope, "gpg.format", "ssh")?;
     git_config(scope, "user.signingkey", &format!("key::{line}"))?;
-    git_config(
-        scope,
-        "gpg.ssh.program",
-        &format!("{} git ssh-keygen", exe.display()),
-    )?;
+    // gpg.ssh.program must be ONE executable (git doesn't split arguments): a small wrapper
+    git_config(scope, "gpg.ssh.program", &write_shim(&exe)?.to_string_lossy())?;
     git_config(scope, "gpg.ssh.allowedSignersFile", &allowed.to_string_lossy())?;
     git_config(scope, "commit.gpgsign", "true")?;
     git_config(scope, "tag.gpgsign", "true")?;

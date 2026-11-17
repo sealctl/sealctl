@@ -94,6 +94,7 @@ impl Server {
         };
         let s = match attempt(&mut self.card) {
             Ok(s) => s,
+            Err(e) if crate::device::is_user_refusal(&e) => return Err(e),
             Err(e) => {
                 log::info!("retrying with a fresh device connection after: {e:#}");
                 self.card = None;
@@ -138,9 +139,9 @@ pub fn run_with(ctx: Ctx, limits: Limits, soft: Option<Box<dyn Oracle + Send>>) 
             soft,
             cache: HashMap::new(),
         }),
-        last: Mutex::new(Instant::now()),
+        last: Mutex::new(crate::util::Since::now()),
         stop: AtomicBool::new(false),
-        started: Instant::now(),
+        started: crate::util::Since::now(),
         limits,
     });
     let result = loop {
@@ -154,7 +155,8 @@ pub fn run_with(ctx: Ctx, limits: Limits, soft: Option<Box<dyn Oracle + Send>>) 
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                shared.touch();
+                // (only derivations count as activity — a status poller must not keep the
+                // session alive)
                 let sh = Arc::clone(&shared);
                 // one thread per client: a slow or silent client never blocks others
                 std::thread::spawn(move || {
@@ -170,7 +172,8 @@ pub fn run_with(ctx: Ctx, limits: Limits, soft: Option<Box<dyn Oracle + Send>>) 
         }
     };
     shared.stop.store(true, Ordering::SeqCst);
-    if let Ok(mut srv) = shared.server.lock() {
+    {
+        let mut srv = shared.server.lock().unwrap_or_else(|e| e.into_inner());
         srv.cache.clear(); // entries are Zeroizing: wiped on drop
         srv.card = None;
     }
@@ -180,16 +183,16 @@ pub fn run_with(ctx: Ctx, limits: Limits, soft: Option<Box<dyn Oracle + Send>>) 
 
 struct Shared {
     server: Mutex<Server>,
-    last: Mutex<Instant>,
+    last: Mutex<crate::util::Since>,
     stop: AtomicBool,
-    started: Instant,
+    started: crate::util::Since,
     limits: Limits,
 }
 
 impl Shared {
     fn touch(&self) {
         if let Ok(mut l) = self.last.lock() {
-            *l = Instant::now();
+            *l = crate::util::Since::now();
         }
     }
 
@@ -247,13 +250,22 @@ fn serve(sh: &Shared, stream: UnixStream) -> Result<()> {
             out.write_all(b"ERR agent session ended - run the command again\n")?;
             return Ok(());
         }
-        sh.touch();
         let reply = if let Some(hex_u) = req.strip_prefix("X25519 ") {
+            sh.touch();
             let res = parse32(hex_u).and_then(|u| {
-                sh.server
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("agent state poisoned"))?
-                    .x25519(u)
+                // A panic while talking to the device (malformed reply) must not poison the
+                // agent for the rest of the session: drop the connection and carry on.
+                let mut srv = sh.server.lock().unwrap_or_else(|e| {
+                    let mut g = e.into_inner();
+                    g.card = None;
+                    g
+                });
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| srv.x25519(u))).unwrap_or_else(
+                    |_| {
+                        srv.card = None;
+                        Err(anyhow::anyhow!("the device sent a malformed reply"))
+                    },
+                )
             });
             match res {
                 Ok(s) => {
@@ -262,6 +274,11 @@ fn serve(sh: &Shared, stream: UnixStream) -> Result<()> {
                 }
                 Err(e) => format!("ERR {}\n", format!("{e:#}").replace('\n', " ")),
             }
+        } else if req == "TOUCH" {
+            // activity that uses this session without a derivation (SSH signing with a key
+            // unlocked in it)
+            sh.touch();
+            "OK\n".to_string()
         } else if req == "STATUS" {
             let idle_left = sh.limits.idle.saturating_sub(sh.idle_for()).as_secs();
             let life_left = sh.limits.max_life.saturating_sub(sh.started.elapsed()).as_secs();
@@ -274,6 +291,7 @@ fn serve(sh: &Shared, stream: UnixStream) -> Result<()> {
         } else {
             "ERR unknown request\n".to_string()
         };
+        let reply = Zeroizing::new(reply); // same buffer, wiped on drop
         out.write_all(reply.as_bytes())?;
     }
 }
@@ -301,14 +319,15 @@ impl AgentClient {
         })
     }
 
-    fn request(&mut self, line: &str) -> Result<String> {
+    fn request(&mut self, line: &str) -> Result<Zeroizing<String>> {
         self.writer.write_all(format!("{line}\n").as_bytes())?;
-        let mut resp = String::new();
+        // replies carry derived values: keep them in buffers that are wiped on drop
+        let mut resp = Zeroizing::new(String::new());
         self.reader.read_line(&mut resp)?;
-        let resp = resp.trim_end().to_string();
+        let resp = resp.trim_end();
         match resp.strip_prefix("OK") {
-            Some(rest) => Ok(rest.trim().to_string()),
-            None => bail!("{}", resp.strip_prefix("ERR ").unwrap_or(&resp)),
+            Some(rest) => Ok(Zeroizing::new(rest.trim().to_string())),
+            None => bail!("{}", resp.strip_prefix("ERR ").unwrap_or(resp)),
         }
     }
 
@@ -323,6 +342,16 @@ impl AgentClient {
     pub fn stop(&mut self) -> Result<()> {
         self.request("STOP").map(|_| ())
     }
+
+    /// Count as activity: keeps the session from expiring while it is being used.
+    pub fn touch(&mut self) -> Result<()> {
+        self.request("TOUCH").map(|_| ())
+    }
+}
+
+/// Is an agent session running? (Doesn't start one.)
+pub fn session_alive() -> bool {
+    AgentClient::connect().is_ok()
 }
 
 impl Oracle for AgentClient {
@@ -350,11 +379,13 @@ pub fn connect_or_spawn(ctx: &Ctx, limits: Limits) -> Result<AgentClient> {
     if let Ok(c) = AgentClient::connect() {
         return Ok(c);
     }
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::stable_exe()?;
     let log = paths::state_dir()?.join("agent.log");
     std::fs::create_dir_all(paths::state_dir()?)?;
     let logf = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let mut cmd = std::process::Command::new(exe);
+    // never keep a volume busy: a working directory inside it would block `sealctl lock`
+    cmd.current_dir("/");
     cmd.args(["--transport", ctx.transport_name()])
         .args(["--ble-scan", &ctx.scan.as_secs().to_string()])
         .args(["agent", "run"])

@@ -2,10 +2,10 @@
 //!
 //! * **Encrypted key files** (`~/.ssh/sealctl_<name>`, made by `sealctl ssh keygen`): standard
 //!   OpenSSH private keys whose passphrase is derived on the Ledger from the key's own public
-//!   fingerprint. The agent decrypts a key on first use and keeps it in memory for the session —
-//!   1 h without use, 24 h at most (`SEALCTL_AGENT_IDLE_MIN`, `SEALCTL_AGENT_MAX_HOURS`) — so SSH
-//!   and git signing don't need the device for every signature. `ssh-add -D` / `sealctl lock`
-//!   forget them.
+//!   fingerprint. The agent decrypts a key on first use and keeps it for the sealctl session
+//!   (`sealctl agent`): signing counts as activity, and the key is forgotten when the session
+//!   ends — 1 h without use, 24 h at most (`SEALCTL_AGENT_IDLE_MIN`, `SEALCTL_AGENT_MAX_HOURS`),
+//!   `sealctl lock`, or `ssh-add -D`.
 //! * **The Ledger's OpenPGP authentication key** (Ed25519): every signature is made on the device
 //!   with INTERNAL AUTHENTICATE, exactly like gpg-agent's SSH support. One worker thread owns the
 //!   device connection and keeps it open between requests, reconnecting when needed.
@@ -137,14 +137,16 @@ pub fn forget() -> bool {
 
 struct Unlocked {
     key: PrivateKey,
-    since: Instant,
-    used: Instant,
+    since: crate::util::Since,
+    used: crate::util::Since,
 }
 
 /// Decrypted keys, by fingerprint.
 struct SoftKeys {
     limits: crate::agent::Limits,
     keys: HashMap<String, Unlocked>,
+    /// Bumped by "forget all": an unlock that was in flight meanwhile must not be cached.
+    generation: u64,
 }
 
 impl SoftKeys {
@@ -208,10 +210,19 @@ fn worker(ctx: Ctx, rx: mpsc::Receiver<(Vec<u8>, Reply)>) {
             ensure_user_pin(&mut tx)?;
             Ok(tx.card().internal_authenticate(data.clone())?)
         };
-        let res = attempt(&mut card).or_else(|e| {
+        // a malformed device reply must not kill this thread (the agent would stay up but
+        // never sign with the Ledger key again)
+        let guarded = |card: &mut Option<openpgp_card::Card<openpgp_card::state::Open>>| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attempt(card)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the device sent a malformed reply")))
+        };
+        let res = guarded(&mut card).or_else(|e| {
+            if crate::device::is_user_refusal(&e) {
+                return Err(e);
+            }
             log::info!("retrying with a fresh connection after: {e:#}");
             card = None;
-            attempt(&mut card)
+            guarded(&mut card)
         });
         last_used = Instant::now();
         let _ = reply.send(res.map_err(|e| format!("{:#}", crate::device::explain(e))));
@@ -239,11 +250,17 @@ impl Agent {
             let mut soft = self.soft.lock().unwrap_or_else(|e| e.into_inner());
             soft.prune();
             if let Some(u) = soft.keys.get_mut(&fp) {
-                u.used = Instant::now();
-                return u.key.try_sign(&data).map_err(agent_err);
+                u.used = crate::util::Since::now();
+                let sig = u.key.try_sign(&data).map_err(agent_err);
+                // signing keeps the sealctl session alive, like any other use of it
+                tokio::task::spawn_blocking(|| {
+                    let _ = crate::agent::AgentClient::connect().and_then(|mut c| c.touch());
+                });
+                return sig;
             }
         }
         let ctx = self.ctx;
+        let generation = self.soft.lock().unwrap_or_else(|e| e.into_inner()).generation;
         let key = tokio::task::spawn_blocking(move || -> Result<PrivateKey> {
             let mut oracle = crate::agent::oracle(&ctx)?;
             unlock_file(oracle.as_mut(), &path)
@@ -256,8 +273,12 @@ impl Agent {
         })?;
         log::info!("unlocked {fp} for this session");
         let sig = key.try_sign(&data).map_err(agent_err)?;
-        let now = Instant::now();
+        let now = crate::util::Since::now();
         let mut soft = self.soft.lock().unwrap_or_else(|e| e.into_inner());
+        if soft.generation != generation {
+            // forgotten while we were waiting for the Ledger: sign this once, keep nothing
+            return Ok(sig);
+        }
         soft.keys.insert(
             fp,
             Unlocked {
@@ -292,7 +313,9 @@ impl Session for Agent {
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
         // the key files stay; only the decrypted copies are forgotten
-        self.soft.lock().unwrap_or_else(|e| e.into_inner()).keys.clear();
+        let mut soft = self.soft.lock().unwrap_or_else(|e| e.into_inner());
+        soft.keys.clear();
+        soft.generation += 1;
         log::info!("forgot all decrypted keys");
         Ok(())
     }
@@ -344,7 +367,26 @@ pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
     let socket = match socket {
         // A caller-chosen location: only make sure the folder exists (it may be /tmp).
         Some(s) => {
-            std::fs::create_dir_all(s.parent().context("socket dir")?)?;
+            let dir = s.parent().context("socket dir")?;
+            std::fs::create_dir_all(dir)?;
+            // someone else's (or a group-writable) folder would let them swap the socket
+            {
+                use std::os::unix::fs::MetadataExt;
+                let m = std::fs::metadata(dir)?;
+                let sticky = m.mode() & 0o1000 != 0; // like /tmp: others can't replace our file
+                if m.uid() != current_uid() && !sticky {
+                    bail!(
+                        "{} belongs to another user — choose a folder of your own",
+                        dir.display()
+                    );
+                }
+                if m.mode() & 0o022 != 0 && !sticky {
+                    bail!(
+                        "{} is writable by others — choose a private folder",
+                        dir.display()
+                    );
+                }
+            }
             s
         }
         // Our own state folder: keep it private to the user.
@@ -362,6 +404,7 @@ pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
     let soft = Arc::new(Mutex::new(SoftKeys {
         limits: crate::agent::Limits::from_env(),
         keys: HashMap::new(),
+        generation: 0,
     }));
     let agent = Agent {
         key,
@@ -382,12 +425,24 @@ pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         }
-        // forget decrypted keys when they expire, even if nobody asks
+        // Forget decrypted keys when they expire, and when the sealctl session they were
+        // unlocked in ends (idle, 24 h, `sealctl lock`): one session for volumes, secrets, SSH.
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
             loop {
                 tick.tick().await;
-                soft.lock().unwrap_or_else(|e| e.into_inner()).prune();
+                let has_keys = !soft.lock().unwrap_or_else(|e| e.into_inner()).keys.is_empty();
+                let alive = !has_keys
+                    || tokio::task::spawn_blocking(crate::agent::session_alive)
+                        .await
+                        .unwrap_or(false);
+                let mut s = soft.lock().unwrap_or_else(|e| e.into_inner());
+                if !alive && !s.keys.is_empty() {
+                    log::info!("sealctl session ended — forgetting SSH keys");
+                    s.keys.clear();
+                    s.generation += 1;
+                }
+                s.prune();
             }
         });
         tokio::select! {
@@ -398,7 +453,7 @@ pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
 }
 
 pub fn install(ctx_args: Vec<String>) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::stable_exe()?;
     let mut args = vec![exe.to_string_lossy().into_owned()];
     args.extend(ctx_args);
     args.extend(["ssh".into(), "agent".into()]);
@@ -414,4 +469,16 @@ pub fn install(ctx_args: Vec<String>) -> Result<()> {
     println!("    Host *\n        IdentityAgent {}\n", sock.display());
     println!("or per shell:  export SSH_AUTH_SOCK={}", sock.display());
     Ok(())
+}
+
+fn current_uid() -> u32 {
+    // the current user's uid, via the owner of a file we just created in our state dir
+    paths::state_dir()
+        .ok()
+        .and_then(|d| {
+            std::fs::create_dir_all(&d).ok()?;
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&d).ok().map(|m| m.uid())
+        })
+        .unwrap_or(u32::MAX)
 }

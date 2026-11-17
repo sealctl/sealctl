@@ -174,3 +174,90 @@ pub fn notify(msg: &str) {
         return;
     };
 }
+
+/// Read the clipboard as text, then clear it (used to store a copied key without it ever being
+/// typed, printed or passed through an AI agent).
+pub fn take_clipboard() -> Result<Zeroizing<Vec<u8>>> {
+    let (paste, copy): (Vec<&str>, Vec<&str>) = if cfg!(target_os = "macos") {
+        (vec!["pbpaste"], vec!["pbcopy"])
+    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() && which("wl-paste") {
+        (vec!["wl-paste", "-n"], vec!["wl-copy", "--clear"])
+    } else if which("xclip") {
+        (
+            vec!["xclip", "-selection", "clipboard", "-o"],
+            vec!["xclip", "-selection", "clipboard"],
+        )
+    } else {
+        bail!("no clipboard tool found (install wl-clipboard or xclip)");
+    };
+    let out = check(
+        Command::new(paste[0])
+            .args(&paste[1..])
+            .stdin(Stdio::null())
+            .output()?,
+        "reading the clipboard",
+    )?;
+    let mut v = Zeroizing::new(out.stdout);
+    while v.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+        v.pop();
+    }
+    if v.is_empty() {
+        bail!("the clipboard is empty — copy the key first");
+    }
+    // clear it so the key doesn't linger
+    let _ = run_with_stdin(Command::new(copy[0]).args(&copy[1..]), b"");
+    Ok(v)
+}
+
+/// Path to this program that survives upgrades: the `sealctl` on PATH (e.g. Homebrew's
+/// `/opt/homebrew/bin/sealctl` symlink) if it is this binary, else the binary itself. Used in
+/// services, hooks and git config, which would break when a versioned install folder goes away.
+pub fn stable_exe() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let real = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    if let Some(path) = std::env::var_os("PATH") {
+        // only absolute entries: a relative one (".") would make hooks run ./sealctl of
+        // whatever directory the agent is in
+        for dir in std::env::split_paths(&path).filter(|d| d.is_absolute()) {
+            let cand = dir.join("sealctl");
+            if cand.is_file() && std::fs::canonicalize(&cand).ok().as_ref() == Some(&real) {
+                return Ok(cand);
+            }
+        }
+    }
+    // Homebrew without PATH (e.g. launchd): prefer the stable prefix symlink
+    for prefix in [
+        "/opt/homebrew/bin/sealctl",
+        "/usr/local/bin/sealctl",
+        "/home/linuxbrew/.linuxbrew/bin/sealctl",
+    ] {
+        let cand = std::path::Path::new(prefix);
+        if std::fs::canonicalize(cand).ok().as_ref() == Some(&real) {
+            return Ok(cand.to_path_buf());
+        }
+    }
+    Ok(exe)
+}
+
+/// A start time whose `elapsed()` also counts system sleep. `Instant` stops while a laptop is
+/// suspended, so "1 h idle" would mean 1 h *awake*; wall-clock time keeps counting. The larger of
+/// the two is used (a wall clock set backwards can't extend a session).
+#[derive(Debug, Clone, Copy)]
+pub struct Since {
+    mono: std::time::Instant,
+    wall: std::time::SystemTime,
+}
+
+impl Since {
+    pub fn now() -> Self {
+        Since {
+            mono: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+
+    pub fn elapsed(&self) -> std::time::Duration {
+        let wall = self.wall.elapsed().unwrap_or_default();
+        self.mono.elapsed().max(wall)
+    }
+}

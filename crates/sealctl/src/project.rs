@@ -57,7 +57,7 @@ pub fn mappings(extra: &[String], use_project: bool) -> Result<BTreeMap<String, 
     let mut map = BTreeMap::new();
     if use_project {
         if let Some(p) = find(&std::env::current_dir()?) {
-            log::info!("using {}", p.display());
+            eprintln!("sealctl: secrets mapped in {}", p.display());
             map.extend(load(&p)?.env);
         }
     }
@@ -75,6 +75,10 @@ pub fn run(oracle: &mut dyn Oracle, extra: &[String], use_project: bool, argv: &
         eprintln!("note: no secrets mapped (no {FILE} found and no --env given)");
     }
     let names: Vec<&str> = map.values().map(|s| s.as_str()).collect();
+    // say which secrets go to the program — a .sealctl.toml can come from a cloned repository
+    for (var, name) in &map {
+        eprintln!("sealctl: {var} ← {name}");
+    }
     let values = if names.is_empty() {
         vec![]
     } else {
@@ -85,6 +89,18 @@ pub fn run(oracle: &mut dyn Oracle, extra: &[String], use_project: bool, argv: &
     cmd.args(args);
     for (k, v) in map.keys().zip(values.iter()) {
         cmd.env(k, v.as_str());
+    }
+
+    // Inside an AI agent, or whenever output isn't a terminal (logs, CI, pipes), whatever the
+    // program prints passes through a filter that replaces the secret values with ****.
+    use std::io::IsTerminal;
+    let mask = crate::guard::ai_agent().is_some()
+        || !std::io::stdout().is_terminal()
+        || !std::io::stderr().is_terminal();
+    // SEALCTL_NO_MASK is for humans debugging; an agent can't switch masking off
+    let opt_out = std::env::var_os("SEALCTL_NO_MASK").is_some() && crate::guard::ai_agent().is_none();
+    if mask && !values.is_empty() && !opt_out {
+        return run_masked(cmd, prog, values.iter().map(|v| v.as_bytes().to_vec()).collect());
     }
     #[cfg(unix)]
     {
@@ -99,10 +115,44 @@ pub fn run(oracle: &mut dyn Oracle, extra: &[String], use_project: bool, argv: &
     }
 }
 
+fn run_masked(mut cmd: Command, prog: &str, secrets: Vec<Vec<u8>>) -> Result<()> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting {prog}"))?;
+    let out = child.stdout.take().context("stdout")?;
+    let err = child.stderr.take().context("stderr")?;
+    let s2 = secrets.clone();
+    let t1 = std::thread::spawn(move || crate::guard::mask_stream(out, std::io::stdout(), secrets));
+    let t2 = std::thread::spawn(move || crate::guard::mask_stream(err, std::io::stderr(), s2));
+    let status = child.wait().with_context(|| format!("waiting for {prog}"))?;
+    let _ = t1.join();
+    let _ = t2.join();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            std::process::exit(128 + sig);
+        }
+    }
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 /// Move a `.env` file into the secret store and write `.sealctl.toml`.
-pub fn import_dotenv(oracle: &mut dyn Oracle, dotenv: &Path, prefix: &str, delete: bool) -> Result<()> {
-    let text = std::fs::read_to_string(dotenv).with_context(|| format!("reading {}", dotenv.display()))?;
-    let vars = secrets::parse_dotenv(&text);
+pub fn import_dotenv(
+    oracle: &mut dyn Oracle,
+    dotenv: &Path,
+    prefix: &str,
+    delete: bool,
+    force: bool,
+) -> Result<()> {
+    let text = zeroize::Zeroizing::new(
+        std::fs::read_to_string(dotenv).with_context(|| format!("reading {}", dotenv.display()))?,
+    );
+    let vars = secrets::parse_dotenv(&text)
+        .with_context(|| format!("{} — nothing was imported", dotenv.display()))?;
     if vars.is_empty() {
         bail!("no variables found in {}", dotenv.display());
     }
@@ -116,11 +166,39 @@ pub fn import_dotenv(oracle: &mut dyn Oracle, dotenv: &Path, prefix: &str, delet
     } else {
         ProjectFile::default()
     };
-    for (k, v) in &vars {
-        let name = format!("{prefix}/{}", k.to_lowercase().replace('_', "-"));
-        secrets::set(oracle, &name, v.as_bytes(), true)?;
+    let named: Vec<(String, String)> = vars
+        .keys()
+        .map(|k| {
+            (
+                k.clone(),
+                format!("{prefix}/{}", k.to_lowercase().replace('_', "-")),
+            )
+        })
+        .collect();
+    // never silently replace secrets that exist already (e.g. a second .env with the same prefix)
+    let existing: Vec<&str> = named
+        .iter()
+        .filter(|(_, n)| secrets::exists(n).unwrap_or(false))
+        .map(|(_, n)| n.as_str())
+        .collect();
+    if !existing.is_empty() && !force {
+        bail!(
+            "these secrets exist already: {} — use another --prefix, or --force to replace them",
+            existing.join(", ")
+        );
+    }
+    for (k, name) in &named {
+        secrets::set(oracle, name, vars[k].as_bytes(), true)?;
         project.env.insert(k.clone(), name.clone());
         println!("  {k:<28} → {name}");
+    }
+    // read everything back before the plaintext file may be deleted
+    let names: Vec<&str> = named.iter().map(|(_, n)| n.as_str()).collect();
+    let back = secrets::get_many(oracle, &names)?;
+    for ((k, _), v) in named.iter().zip(back.iter()) {
+        if v.as_str() != vars[k].as_str() {
+            bail!("{k} did not read back identically — keeping {}", dotenv.display());
+        }
     }
     std::fs::write(&pfile, toml::to_string_pretty(&project)?)?;
     println!(

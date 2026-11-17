@@ -136,6 +136,15 @@ sealctl encrypt notes.txt -r alice.asc -o notes.asc    # to someone else (and yo
 sealctl decrypt report.pdf.gpg -o report.pdf
 ```
 
+### AI coding agents
+```sh
+sealctl ai install         # Claude Code, Codex, Gemini CLI, Copilot, Cursor, Qwen Code, …
+```
+Agents can then store keys you copy (`secret set --from-clipboard`) and run programs with them
+(`sealctl run`), but never see the values: output is masked, pasted keys are blocked before
+the model sees them, and commands that would print secrets are denied.
+See [docs/ai-agents.md](docs/ai-agents.md).
+
 ### Recovery without a Ledger
 ```sh
 sealctl recover            # 24 words → your decryption key, checked against your certificate

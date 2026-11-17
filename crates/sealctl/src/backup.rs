@@ -175,10 +175,21 @@ impl Repo {
     fn probe(&self) -> Result<Probe> {
         let mut c = self.command();
         c.args(["cat", "config"])
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let out = c.output().context("starting restic")?;
+        let out = match &self.password {
+            Password::File(_) => c.stdin(Stdio::null()).output(),
+            Password::Pipe(pw) => {
+                let mut child = c.stdin(Stdio::piped()).spawn().context("starting restic")?;
+                {
+                    use std::io::Write;
+                    let mut i = child.stdin.take().context("stdin")?;
+                    i.write_all(pw.as_bytes())?;
+                }
+                child.wait_with_output()
+            }
+        }
+        .context("starting restic")?;
         if out.status.success() {
             return Ok(Probe::Exists);
         }
@@ -327,8 +338,12 @@ pub fn init(
         password: password.to_string(),
         env,
     };
-    write_inner(&vol, &secrets)?;
-    let repo = Repo::from_unlocked(&vol)?;
+    // Check the repository with the new password first; the stored credentials (which the
+    // scheduled backups use) are only replaced once that worked.
+    let repo = Repo {
+        secrets,
+        password: Password::Pipe(password),
+    };
     match repo.probe()? {
         Probe::Exists => {
             println!("existing repository found — reconnected (same seed, same key id ⇒ same password)")
@@ -339,6 +354,7 @@ pub fn init(
              Repositories created by sealctl 0.2.0 use the URL as key id: add --key-id '{repository}'"
         ),
     }
+    write_inner(&vol, &repo.secrets)?;
     vol.backup = Some(BackupPolicy::new(repository, key_id));
     vol.save()?;
     println!("✅ backups configured for '{vol_name}' → {repository}");
@@ -486,9 +502,9 @@ pub fn restore(
 ) -> Result<()> {
     let v = Volume::load(vol)?;
     let target = target.to_string_lossy().into_owned();
-    let mut args = vec!["restore", snapshot, "--target", &target, "--tag", "sealctl"];
-    let tagf = format!("vol:{vol}");
-    args.extend(["--tag", &tagf]);
+    // one --tag with a comma = snapshots carrying BOTH tags (repeated --tag means either)
+    let tagf = format!("sealctl,vol:{vol}");
+    let mut args = vec!["restore", snapshot, "--target", &target, "--tag", &tagf];
     let incl: Vec<String> = include
         .iter()
         .map(|p| {
@@ -568,7 +584,7 @@ pub fn rekey(oracle: &mut dyn Oracle, vol_name: &str, key_id: Option<&str>) -> R
 }
 
 pub fn schedule_install(every_minutes: u64) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::stable_exe()?;
     let args = vec![
         exe.to_string_lossy().into_owned(),
         "backup".into(),

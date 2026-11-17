@@ -55,6 +55,8 @@ pub enum Purpose {
     /// Passphrase of an encrypted OpenSSH private key; id = its public key's SHA256 fingerprint
     /// as OpenSSH prints it ("SHA256:…").
     Ssh,
+    /// Device identity check (never used as a key); id = "device".
+    Check,
 }
 
 impl Purpose {
@@ -64,6 +66,7 @@ impl Purpose {
             Purpose::Restic => "restic",
             Purpose::Secrets => "secrets",
             Purpose::Ssh => "ssh",
+            Purpose::Check => "check",
         }
     }
 }
@@ -147,21 +150,41 @@ impl<O: Oracle> Oracle for Blinded<O> {
     }
 }
 
-/// Send `r·u` instead of `u`, unblind the answer with `r⁻¹`.
+/// Send `B = 8·(s·u)` instead of `u`, check the answer, unblind it with `(8s)⁻¹`.
+///
+/// * The factor 8 clears the small-order (torsion) part of `u`, which a plain `r·u` would keep:
+///   otherwise an eavesdropper could sort requests by the torsion order of their id.
+/// * The answer must be a torsion-free point other than the identity — what an honest device
+///   returns for a torsion-free `B`. A forged small-order reply would otherwise unblind to one
+///   of a handful of predictable values.
+/// * The result equals `X25519(k, u)`: `k` is a multiple of 8, so `k·u` has no torsion part.
 fn blinded_call(u: &[u8; 32], call: impl FnOnce(&[u8; 32]) -> Result<[u8; 32]>) -> Result<[u8; 32]> {
+    use curve25519_dalek::traits::IsIdentity;
     use zeroize::Zeroize;
     let mut wide = Zeroizing::new([0u8; 64]);
     getrandom::fill(wide.as_mut_slice()).map_err(|e| anyhow::anyhow!("system RNG failed: {e}"))?;
-    let mut r = Scalar::from_bytes_mod_order_wide(&wide);
-    if r == Scalar::ZERO {
+    let mut s = Scalar::from_bytes_mod_order_wide(&wide);
+    if s == Scalar::ZERO {
         bail!("degenerate blinding scalar");
     }
-    let blinded = MontgomeryPoint(*u) * r;
-    let mut r_inv = r.invert();
-    r.zeroize();
-    let resp = call(&blinded.0);
-    let out = resp.map(|s| (MontgomeryPoint(s) * r_inv).0);
-    r_inv.zeroize();
+    let eight = Scalar::from(8u8);
+    // two separate multiplications: (8s mod ℓ) as one scalar is not a multiple of 8
+    let blinded = (MontgomeryPoint(*u) * s) * eight;
+    if blinded.0 == [0u8; 32] {
+        bail!("degenerate point");
+    }
+    let mut inv = (s * eight).invert();
+    s.zeroize();
+    let out = call(&blinded.0).and_then(|resp| {
+        let ok = MontgomeryPoint(resp)
+            .to_edwards(0)
+            .is_some_and(|e| e.is_torsion_free() && !e.is_identity());
+        if !ok {
+            bail!("the device returned an invalid point — refusing (tampered link or app?)");
+        }
+        Ok((MontgomeryPoint(resp) * inv).0)
+    });
+    inv.zeroize();
     out
 }
 
@@ -173,12 +196,49 @@ pub struct CardOracle {
 }
 
 impl CardOracle {
+    /// Connect, and make sure the device is *your* Ledger before trusting any answer.
     pub fn open(ctx: &Ctx) -> Result<Self> {
-        Ok(Self {
+        let mut o = Self {
             card: ctx.open_card()?,
             pin_checked: false,
-        })
+        };
+        o.verify_identity()?;
+        Ok(o)
     }
+
+    /// Something that merely looks like a Ledger (e.g. a Bluetooth impostor echoing requests
+    /// back) would make derived keys computable by anyone. So every new connection derives a
+    /// fixed check value and compares it with the one recorded from the real device. The check
+    /// request is blinded like any other, so an impostor can't single it out.
+    fn verify_identity(&mut self) -> Result<()> {
+        let check = key_check(derive(self, Purpose::Check, "device")?.as_slice());
+        let file = device_check_file()?;
+        match std::fs::read_to_string(&file) {
+            Ok(known) if known.trim() == check => Ok(()),
+            Ok(_) => bail!(
+                "this device is not the Ledger sealctl knows (its keys differ) — refusing to use it.\n   \
+                 A fake or different device, or another recovery phrase. If you deliberately moved to \
+                 a new seed, delete {} and run `sealctl doctor`.",
+                file.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // first use: remember this device
+                std::fs::create_dir_all(file.parent().context("config dir")?)?;
+                std::fs::write(&file, format!("{check}\n"))?;
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+        }
+    }
+}
+
+/// Where the device check value is kept (per certificate when there is one).
+pub fn device_check_file() -> Result<std::path::PathBuf> {
+    let name = match crate::cert::own() {
+        Ok(c) => format!("device-check-{}", &crate::cert::fingerprint_hex(&c)[..16]),
+        Err(_) => "device-check".into(),
+    };
+    Ok(crate::paths::config_dir()?.join(name))
 }
 
 impl Oracle for CardOracle {
@@ -267,6 +327,44 @@ mod tests {
                 assert_eq!(a, b);
             }
         }
+    }
+
+    #[test]
+    fn blinded_requests_carry_no_torsion() {
+        for i in 0..200 {
+            let u = hash_to_u(Purpose::Volume, &format!("t-{i}"));
+            let mut seen = [0u8; 32];
+            blinded_call(&u, |b| {
+                seen = *b;
+                Ok(MontgomeryPoint(*b).mul_clamped([7u8; 32]).0)
+            })
+            .unwrap();
+            let e = MontgomeryPoint(seen).to_edwards(0).unwrap();
+            assert!(e.is_torsion_free(), "request {i} leaks torsion");
+        }
+    }
+
+    #[test]
+    fn forged_small_order_replies_are_rejected() {
+        let u = hash_to_u(Purpose::Secrets, "store");
+        // u-coordinates of small-order points: 0 (order 2 / identity-ish), 1 (order 4), and an
+        // order-8 point
+        let order8 = hex_literal("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157");
+        for bad in [
+            [0u8; 32],
+            {
+                let mut o = [0u8; 32];
+                o[0] = 1;
+                o
+            },
+            order8,
+        ] {
+            assert!(blinded_call(&u, |_| Ok(bad)).is_err());
+        }
+    }
+
+    fn hex_literal(h: &str) -> [u8; 32] {
+        hex::decode(h).unwrap().try_into().unwrap()
     }
 
     #[test]

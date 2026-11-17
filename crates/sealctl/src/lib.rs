@@ -6,6 +6,7 @@
 //! is specified in `docs/derived-keys.md`.
 
 pub mod agent;
+pub mod ai;
 pub mod backup;
 pub mod card;
 pub mod cert;
@@ -14,6 +15,7 @@ pub mod derive;
 pub mod device;
 pub mod doctor;
 pub mod git;
+pub mod guard;
 pub mod kit;
 pub mod paths;
 pub mod pin;

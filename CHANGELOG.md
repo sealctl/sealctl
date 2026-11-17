@@ -6,6 +6,63 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-17
+
+### Added
+
+- `sealctl ai install | uninstall | status`: integration with AI coding agents — Claude Code,
+  Codex, Gemini CLI, Qwen Code, GitHub Copilot CLI, Cursor (skill + hooks + deny rules where
+  supported), and the `sealctl-secrets` skill for OpenCode, Amp, Goose, Antigravity and Kiro.
+  Hooks block prompts containing API keys, deny commands / file reads / writes that would
+  reveal secrets, and add session context. See docs/ai-agents.md.
+- `sealctl run` masks secret values (`****`) in the program's output inside AI agents and
+  whenever output isn't a terminal.
+- `sealctl secret set --from-clipboard` (reads and clears the clipboard).
+
+- SSH keys unlocked in the agent now live as long as the sealctl session: signing counts as
+  activity, and they are forgotten when the session ends (idle, 24 h, `sealctl lock`).
+
+### Security (from an internal audit)
+
+- **Device identity:** every new connection derives a check value and compares it with the one
+  recorded from your Ledger (`~/.config/sealctl/device-check-*`, written on first use). A
+  device that only looks like a Ledger (e.g. a Bluetooth impostor echoing requests) could
+  otherwise have made derived keys computable.
+- Blinding clears the small-order component of the request (`8·s·u`), so requests no longer
+  leak the torsion class of the id; device replies must be torsion-free points (forged
+  small-order replies are rejected). Derived keys are unchanged.
+- Session timers count system sleep (a closed laptop no longer keeps keys past "1 h idle").
+- A malformed device reply can no longer crash or permanently disable the agents; wrong PIN /
+  "reject" on the device is not retried; the framing decoder can't underflow.
+- `sealctl lock` forgets SSH keys and stops the agent even if a volume refuses to lock, locks
+  the remaining volumes, and the auto-started agent no longer keeps a volume busy.
+- `backup restore` only restores the requested volume's snapshots (restic ORs repeated
+  `--tag`); `backup init` keeps working credentials until the new repository checks out.
+- `secret import-env`: a real dotenv parser (multi-line quoted values such as PEM keys,
+  escapes, comments); refuses unreadable files and existing secret names (`--force`); with
+  `--delete` the file is removed only after every value read back identically.
+- `sealctl run` masks base64 and URL-encoded forms and overlapping values; `SEALCTL_NO_MASK`
+  is ignored inside AI agents; it now prints which secrets it gives the program.
+- AI hooks: many more leaking commands and credential files are denied (`printenv VAR`,
+  `export`, environment dumps, `gh auth token`, `~/.aws/credentials`, `.npmrc`, `grep -r` over a
+  `.env`, …); Codex argv commands, MultiEdit and Grep are checked.
+- Settings files edited by `ai install` keep symlinks and permissions (new files 0600).
+- `git setup`: commit signing works — `gpg.ssh.program` now points to a small wrapper script
+  (git can't run a program with arguments there; every signed commit failed). Re-run
+  `sealctl git setup` once.
+- LUKS (Linux): a failed mount closes the decrypted device; "unlocked" includes an open
+  mapper; mount detection handles symlinked homes and spaces.
+- Unlock keeps the configured volume id unless the disk's id actually unlocks the volume;
+  systemd units are quoted correctly; hooks never use a relative `sealctl` from PATH;
+  custom SSH agent sockets must be in a private folder; more secret copies are zeroized.
+
+### Changed
+
+- `secret get`, `secret get --clip` and `ssh passphrase` refuse to run inside AI agents, and
+  don't print to a terminal without `--show` (copy with `--clip`, cleared after 30 s).
+- Services (SSH agent, backup schedule), git signing and hooks use the stable
+  `/opt/homebrew/bin/sealctl` path, so they keep working after `brew upgrade`.
+
 ## [0.3.0] - 2026-11-17
 
 ### Added

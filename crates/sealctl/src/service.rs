@@ -110,7 +110,7 @@ pub fn install(s: &Service) -> Result<()> {
         let exec = s
             .args
             .iter()
-            .map(|a| shell_quote(a))
+            .map(|a| systemd_quote(a))
             .collect::<Vec<_>>()
             .join(" ");
         let (svc_type, restart) = if s.every_secs.is_some() {
@@ -121,8 +121,9 @@ pub fn install(s: &Service) -> Result<()> {
         fs::write(
             dir.join(format!("{name}.service")),
             format!(
-                "[Unit]\nDescription={}\n\n[Service]\nType={svc_type}\nEnvironment=PATH={path_env}\nExecStart={exec}\n{restart}\n[Install]\nWantedBy=default.target\n",
-                s.description
+                "[Unit]\nDescription={}\n\n[Service]\nType={svc_type}\nEnvironment={}\nExecStart={exec}\n{restart}\n[Install]\nWantedBy=default.target\n",
+                s.description,
+                systemd_quote(&format!("PATH={path_env}"))
             ),
         )?;
         let mut enable = format!("{name}.service");
@@ -197,12 +198,29 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn shell_quote(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "/-_.=:".contains(c))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
+/// One systemd.service word: double-quoted with C escapes, and `%` / `$` doubled so systemd
+/// doesn't expand specifiers or variables inside paths.
+fn systemd_quote(a: &str) -> String {
+    let mut out = String::from("\"");
+    for c in a.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod systemd_tests {
+    #[test]
+    fn quoting() {
+        assert_eq!(super::systemd_quote("/a b/sealctl"), "\"/a b/sealctl\"");
+        assert_eq!(super::systemd_quote("100%$HOME\"x"), "\"100%%$$HOME\\\"x\"");
     }
 }

@@ -14,7 +14,7 @@ Inputs:
 
 * `k` — the X25519 private key in the OpenPGP app's **decryption** slot (slot 1, generated in
   seed mode, Curve25519). It never leaves the device.
-* `purpose` — ASCII: `volume`, `restic`, `secrets` or `ssh`.
+* `purpose` — ASCII: `volume`, `restic`, `secrets`, `ssh` or `check` (device identity only).
 * `id` — UTF-8: the volume UUID (lowercase, hyphenated), the restic repository URL, or the
   literal `store`.
 
@@ -47,14 +47,23 @@ PSO:DECIPHER `A6 { 7F49 { 86 · } }` template; the app returns the result little
 The device is never asked for `X25519(k, u)` directly (RFC 9497 *Blind* / *Finalize*):
 
 ```
-r  = fresh random scalar mod ℓ (from 64 random bytes)
-B  = r·u                     → sent to the device      (random-looking; unlinkable)
-R  = X25519(k, B) = k·r·u    ← returned by the device   (random-looking)
-S  = r⁻¹·R  = k·u            computed on the host
+s  = fresh random scalar mod ℓ (from 64 random bytes)
+B  = 8·(s·u)                 → sent to the device      (torsion-free, random-looking)
+R  = X25519(k, B)            ← returned by the device   (must be torsion-free, not identity)
+S  = (8s)⁻¹·R  = k·u         computed on the host
 ```
 
-The clamped `k` is a multiple of 8, so torsion components vanish and `r⁻¹` cancels `r` on the
-prime-order part: `S` is bit-for-bit the unblinded result (tested for all purposes). USB and
+The factor 8 removes the small-order part of `u` from the request (otherwise its torsion class
+would leak which id is derived). The clamped `k` is a multiple of 8, so `k·u` has no torsion
+part either, and `(8s)⁻¹` cancels `8s`: `S` is bit-for-bit the unblinded result (tested for all
+purposes). A reply that is not a torsion-free, non-identity point is rejected.
+
+### Device identity
+
+On each new connection sealctl derives `key_check(derive("check", "device"))` and compares it
+with the value recorded the first time (`~/.config/sealctl/device-check-<fingerprint>`). The
+request is blinded like every other, so a device that is not the user's Ledger cannot answer
+it correctly — and nothing derived over that connection is used. USB and
 Bluetooth therefore never carry `S`, and an eavesdropper cannot tell which id is derived.
 
 ## Why this shape

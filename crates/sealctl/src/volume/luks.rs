@@ -26,10 +26,37 @@ fn sudo() -> Command {
     c
 }
 
+/// /proc/mounts escapes space, tab, newline and backslash as \040 \011 \012 \134.
+fn unescape_mount(field: &str) -> String {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let v = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
+            out.push(v);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn is_mounted(mp: &Path) -> Result<bool> {
     let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-    let want = mp.to_string_lossy();
-    Ok(mounts.lines().any(|l| l.split_whitespace().nth(1) == Some(&want)))
+    // the kernel lists the resolved path (e.g. /var/home/… for a symlinked /home)
+    let want = std::fs::canonicalize(mp).unwrap_or_else(|_| mp.to_path_buf());
+    Ok(mounts.lines().any(|l| {
+        l.split_whitespace()
+            .nth(1)
+            .is_some_and(|f| Path::new(&unescape_mount(f)) == want || Path::new(&unescape_mount(f)) == mp)
+    }))
+}
+
+fn mapper_open(v: &Volume) -> bool {
+    Path::new("/dev/mapper").join(mapper_name(v)).exists()
 }
 
 impl Backend for Luks {
@@ -131,7 +158,8 @@ impl Backend for Luks {
     fn unlock(&self, v: &Volume, passphrase: &[u8]) -> Result<()> {
         let path = v.path.as_ref().context("luks needs a path")?;
         let mapper = mapper_name(v);
-        if !Path::new("/dev/mapper").join(&mapper).exists() {
+        let opened_now = !Path::new("/dev/mapper").join(&mapper).exists();
+        if opened_now {
             check(
                 run_with_stdin(
                     sudo()
@@ -143,15 +171,25 @@ impl Backend for Luks {
                 "cryptsetup open (wrong key?)",
             )?;
         }
-        std::fs::create_dir_all(&v.mountpoint)?;
-        check(
-            sudo()
-                .arg("mount")
-                .arg(format!("/dev/mapper/{mapper}"))
-                .arg(&v.mountpoint)
-                .output()?,
-            "mount",
-        )?;
+        let mounted = std::fs::create_dir_all(&v.mountpoint)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| {
+                check(
+                    sudo()
+                        .arg("mount")
+                        .arg(format!("/dev/mapper/{mapper}"))
+                        .arg(&v.mountpoint)
+                        .output()?,
+                    "mount",
+                )
+            });
+        if let Err(e) = mounted {
+            // don't leave the decrypted device open behind a failed mount
+            if opened_now {
+                let _ = sudo().args(["cryptsetup", "close", &mapper]).output();
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -167,15 +205,18 @@ impl Backend for Luks {
                 "umount (files still open? use --force)",
             )?;
         }
-        check(
-            sudo().args(["cryptsetup", "close", &mapper_name(v)]).output()?,
-            "cryptsetup close",
-        )?;
+        if mapper_open(v) {
+            check(
+                sudo().args(["cryptsetup", "close", &mapper_name(v)]).output()?,
+                "cryptsetup close",
+            )?;
+        }
         Ok(())
     }
 
+    /// Unlocked = mounted, or decrypted but not mounted (still open: must be locked too).
     fn is_unlocked(&self, v: &Volume) -> Result<bool> {
-        is_mounted(&v.mountpoint)
+        Ok(is_mounted(&v.mountpoint)? || mapper_open(v))
     }
 }
 
@@ -201,4 +242,13 @@ fn users_gid() -> String {
     )
     .trim()
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mount_paths_are_unescaped() {
+        assert_eq!(super::unescape_mount("/home/u/My\\040Vault"), "/home/u/My Vault");
+        assert_eq!(super::unescape_mount("/plain"), "/plain");
+    }
 }

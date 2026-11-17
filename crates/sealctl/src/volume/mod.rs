@@ -294,15 +294,27 @@ pub fn unlock(oracle: &mut dyn Oracle, name: &str) -> Result<Volume> {
     if vol.is_legacy() {
         bail!("'{name}' uses a stored key file (older sealctl) — convert it once with `sealctl volume rekey {name}`");
     }
-    // The disk is the source of truth for the id.
+    // The disk is the source of truth for the id — but the config is only updated once the
+    // disk's id has actually unlocked it (a damaged id file must not overwrite a good id).
     let disk_id = derive::canonical_id(&be.read_id(&vol)?);
     if disk_id != vol.id {
         eprintln!(
-            "note: volume id on disk ({disk_id}) differs from config ({}); using the disk",
+            "note: volume id on disk ({disk_id}) differs from config ({}); trying the disk's",
             vol.id
         );
-        vol.id = disk_id;
-        vol.save()?;
+        let config_id = std::mem::replace(&mut vol.id, disk_id);
+        let pass = derive::passphrase(oracle, Purpose::Volume, &vol.id)?;
+        match be.unlock(&vol, pass.as_bytes()) {
+            Ok(()) => vol.save()?,
+            Err(e) => {
+                eprintln!("   that failed ({e:#}); trying the id from the config");
+                vol.id = config_id;
+                let pass = derive::passphrase(oracle, Purpose::Volume, &vol.id)?;
+                be.unlock(&vol, pass.as_bytes())?;
+            }
+        }
+        println!("🔓 '{}' unlocked at {}", vol.name, vol.mountpoint.display());
+        return Ok(vol);
     }
     let pass = derive::passphrase(oracle, Purpose::Volume, &vol.id)?;
     be.unlock(&vol, pass.as_bytes())?;
@@ -335,11 +347,22 @@ pub fn lock(name: &str, no_backup: bool, force: bool) -> Result<()> {
 }
 
 /// Lock every unlocked volume (e.g. before leaving the computer).
+/// Lock every unlocked volume; one that refuses doesn't stop the others.
 pub fn lock_all(no_backup: bool, force: bool) -> Result<()> {
+    let mut failed = vec![];
     for v in Volume::list()? {
         if v.is_unlocked().unwrap_or(false) {
-            lock(&v.name, no_backup, force)?;
+            if let Err(e) = lock(&v.name, no_backup, force) {
+                eprintln!("❌ '{}': {e:#}", v.name);
+                failed.push(v.name);
+            }
         }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "could not lock {} — close programs using it, or add --force",
+            failed.join(", ")
+        );
     }
     Ok(())
 }
