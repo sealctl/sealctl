@@ -14,7 +14,7 @@ Inputs:
 
 * `k` — the X25519 private key in the OpenPGP app's **decryption** slot (slot 1, generated in
   seed mode, Curve25519). It never leaves the device.
-* `purpose` — ASCII: `volume`, `restic` or `secrets`.
+* `purpose` — ASCII: `volume`, `restic`, `secrets` or `ssh`.
 * `id` — UTF-8: the volume UUID (lowercase, hyphenated), the restic repository URL, or the
   literal `store`.
 
@@ -77,6 +77,7 @@ Bluetooth therefore never carry `S`, and an eavesdropper cannot tell which id is
 | `volume` | volume UUID | APFS volume UUID (`diskutil info`, readable while locked); LUKS UUID (`cryptsetup luksUUID`, chosen by sealctl); sparse bundle: `sealctl.id` file inside the bundle (chosen by sealctl) |
 | `restic` | key id: the volume name (default), or `--key-id`; repositories from 0.2.0 used the URL | you |
 | `secrets` | `store` | constant |
+| `ssh` | `SHA256:…` fingerprint of the key's public key, as OpenSSH prints it | the encrypted key file (its public part is not encrypted) |
 
 The ids are not secret. The volume id travels with the disk, so a disk can be unlocked on any
 machine with the seed: `sealctl volume import` + `sealctl unlock`.

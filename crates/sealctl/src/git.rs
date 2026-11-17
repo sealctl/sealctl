@@ -24,9 +24,37 @@ fn git_config(scope: &str, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn setup(local: bool) -> Result<()> {
+const SETTINGS: &[&str] = &[
+    "gpg.format",
+    "user.signingkey",
+    "gpg.ssh.program",
+    "gpg.ssh.allowedSignersFile",
+    "commit.gpgsign",
+    "tag.gpgsign",
+];
+
+/// Remove the settings `setup` made.
+pub fn undo(local: bool) -> Result<()> {
+    let scope = if local { "--local" } else { "--global" };
+    for key in SETTINGS {
+        // exit code 5 = not set; fine
+        let _ = Command::new("git")
+            .args(["config", scope, "--unset", key])
+            .status();
+    }
+    println!(
+        "✅ git ({}) no longer signs with sealctl",
+        scope.trim_start_matches("--")
+    );
+    Ok(())
+}
+
+pub fn setup(local: bool, key: Option<&str>) -> Result<()> {
     let cert = cert::own()?;
-    let line = ssh::public_key_line(&cert)?;
+    let line = match key {
+        Some(name) => ssh::read_public(&ssh::key_path(name)?)?.to_openssh()?,
+        None => ssh::public_key_line(&cert)?,
+    };
     let uid = cert::primary_user_id(&cert);
     let email = uid
         .split_once('<')

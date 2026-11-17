@@ -345,8 +345,23 @@ enum AgentCmd {
 
 #[derive(Subcommand)]
 enum SshCmd {
-    /// Print the public key (authorized_keys / GitHub format).
-    Pubkey,
+    /// New SSH key: random Ed25519, saved as ~/.ssh/sealctl_<name> (standard OpenSSH format),
+    /// encrypted with a passphrase derived on the Ledger from its fingerprint. The agent keeps it
+    /// unlocked for the session (1 h idle, 24 h max) — no Ledger round trip per signature.
+    Keygen {
+        #[arg(default_value = "ed25519")]
+        name: String,
+        /// Key comment (default: your certificate's user id).
+        #[arg(long)]
+        comment: Option<String>,
+    },
+    /// Print a public key: an encrypted key file's by name, or the Ledger key's.
+    Pubkey { name: Option<String> },
+    /// Print the passphrase of an encrypted key file (for ssh-keygen -p / other agents).
+    Passphrase {
+        #[arg(default_value = "ed25519")]
+        name: String,
+    },
     /// Run the agent in the foreground.
     Agent {
         #[arg(long)]
@@ -360,11 +375,17 @@ enum SshCmd {
 
 #[derive(Subcommand)]
 enum GitCmd {
-    /// Configure git to sign commits and tags with the Ledger.
+    /// Configure git to sign commits and tags (Ledger key, or an encrypted key file).
     Setup {
         /// Only for the current repository.
         #[arg(long)]
         local: bool,
+        /// Sign with the encrypted key file ~/.ssh/sealctl_<NAME> instead of the Ledger key.
+        #[arg(long)]
+        key: Option<String>,
+        /// Remove the signing settings sealctl made.
+        #[arg(long)]
+        undo: bool,
     },
     /// (internal) ssh-keygen wrapper used as gpg.ssh.program.
     #[command(hide = true, name = "ssh-keygen")]
@@ -437,6 +458,9 @@ fn real_main(cli: Cli) -> Result<()> {
             force,
         } => {
             volume::lock_all(no_backup, force)?;
+            if ssh::forget() {
+                println!("🔒 SSH keys forgotten by the agent");
+            }
             if agent::stop()? {
                 println!("🔒 agent stopped — the Ledger is needed again next time");
             }
@@ -700,15 +724,53 @@ fn real_main(cli: Cli) -> Result<()> {
         }
 
         Cmd::Ssh(s) => match s {
-            SshCmd::Pubkey => {
+            SshCmd::Keygen { name, comment } => {
+                let comment = match comment {
+                    Some(c) => c,
+                    None => cert::own()
+                        .map(|c| cert::primary_user_id(&c))
+                        .unwrap_or_else(|_| format!("sealctl {name}")),
+                };
+                let path = ssh::keygen(agent::oracle(&ctx)?.as_mut(), &name, &comment)?;
+                let public = ssh::read_public(&path)?;
+                println!(
+                    "✅ {} (encrypted; passphrase derived from your Ledger seed)",
+                    path.display()
+                );
+                println!("   {}", public.fingerprint(ssh_key::HashAlg::Sha256));
+                println!("   Back up this file — the 24 words alone cannot recreate a random key.");
+                println!(
+                    "   Public key ({}.pub) — add it to GitHub / authorized_keys:",
+                    path.display()
+                );
+                println!("   {}", public.to_openssh()?);
+                Ok(())
+            }
+            SshCmd::Pubkey { name: Some(name) } => {
+                println!("{}", ssh::read_public(&ssh::key_path(&name)?)?.to_openssh()?);
+                Ok(())
+            }
+            SshCmd::Pubkey { name: None } => {
                 println!("{}", ssh::public_key_line(&cert::own()?)?);
+                Ok(())
+            }
+            SshCmd::Passphrase { name } => {
+                let public = ssh::read_public(&ssh::key_path(&name)?)?;
+                let pass = ssh::passphrase_for(agent::oracle(&ctx)?.as_mut(), &public)?;
+                println!("{}", *pass);
                 Ok(())
             }
             SshCmd::Agent { socket } => ssh::run_agent(ctx, socket),
             SshCmd::Install => ssh::install(targs),
             SshCmd::Uninstall => sealctl::service::uninstall(ssh::AGENT_LABEL),
         },
-        Cmd::Git(GitCmd::Setup { local }) => git::setup(local),
+        Cmd::Git(GitCmd::Setup { local, key, undo }) => {
+            if undo {
+                git::undo(local)
+            } else {
+                git::setup(local, key.as_deref())
+            }
+        }
         Cmd::Git(GitCmd::SshKeygen { args }) => git::ssh_keygen_shim(&args),
 
         Cmd::Setup { uid, force } => setup::setup(&ctx, uid, force),

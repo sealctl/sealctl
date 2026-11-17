@@ -12,7 +12,7 @@ keywords = ["openpgp", "ledger", "encryption", "smartcard", "cli"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
-sealctl-ledger = { path = "../sealctl-ledger", version = "0.2.0" }
+sealctl-ledger = { path = "../sealctl-ledger", version = "0.3.0" }
 anyhow.workspace = true
 log.workspace = true
 openpgp-card.workspace = true
@@ -23,13 +23,14 @@ clap_complete = "4.6"
 env_logger.workspace = true
 tokio = { workspace = true, features = ["net", "macros", "signal"] }
 ssh-agent-lib = "0.6"
-ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519"] }
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "encryption", "getrandom"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 zeroize = "1"
 getrandom = "0.3"
 rand = "0.8"
 sha2 = "0.10"
+signature = "2"
 hex = "0.4"
 serde_json = "1"
 rpassword = "7"

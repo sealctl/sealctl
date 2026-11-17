@@ -48,10 +48,13 @@ pub const LABEL: &[u8] = b"sealctl/derive/v1";
 pub enum Purpose {
     /// Volume passphrase; id = volume UUID.
     Volume,
-    /// restic repository password; id = repository URL.
+    /// restic repository password; id = key id (volume name; the URL for 0.2.0 repositories).
     Restic,
     /// Secret store key; id = "store".
     Secrets,
+    /// Passphrase of an encrypted OpenSSH private key; id = its public key's SHA256 fingerprint
+    /// as OpenSSH prints it ("SHA256:…").
+    Ssh,
 }
 
 impl Purpose {
@@ -60,6 +63,7 @@ impl Purpose {
             Purpose::Volume => "volume",
             Purpose::Restic => "restic",
             Purpose::Secrets => "secrets",
+            Purpose::Ssh => "ssh",
         }
     }
 }

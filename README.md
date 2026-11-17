@@ -113,9 +113,21 @@ All secrets for one command are decrypted in a single device session.
 ### SSH and signed git commits
 ```sh
 sealctl ssh install        # agent as a login service; prints the ~/.ssh/config line
-sealctl ssh pubkey         # add to servers / GitHub
-sealctl git setup          # sign commits & tags with the Ledger (SSH signatures)
+
+# Everyday key: a normal encrypted OpenSSH key file whose passphrase comes from the Ledger.
+sealctl ssh keygen         # ~/.ssh/sealctl_ed25519 (+ .pub) — back the file up
+sealctl ssh pubkey ed25519 # add to servers / GitHub
+sealctl git setup --key ed25519   # sign commits & tags with it
+
+# Or the key that never leaves the Ledger (a device round trip per signature):
+sealctl ssh pubkey
+sealctl git setup
+sealctl git setup --undo   # stop signing
 ```
+The agent unlocks an encrypted key on its first use (PIN on the Ledger) and keeps it for the
+session — 1 h without use, 24 h at most — so `ssh`, `git push` and commit signing don't wait for
+the device. `sealctl lock` or `ssh-add -D` forget it. Both kinds of key are offered; pick one per
+host with `IdentityFile ~/.ssh/sealctl_ed25519.pub` + `IdentitiesOnly yes`.
 
 ### Files
 ```sh
@@ -123,6 +135,13 @@ sealctl encrypt report.pdf -o report.pdf.gpg          # to yourself
 sealctl encrypt notes.txt -r alice.asc -o notes.asc    # to someone else (and you)
 sealctl decrypt report.pdf.gpg -o report.pdf
 ```
+
+### Recovery without a Ledger
+```sh
+sealctl recover            # 24 words → your decryption key, checked against your certificate
+```
+Then `unlock`, `backup restore` and `secret get` work as usual until you stop it. Typing the
+words exposes them to that computer: only for a real recovery, ideally offline.
 
 ### Transport
 `auto` (default) tries USB, then Bluetooth. Force with `-t usb` / `-t ble`, or set

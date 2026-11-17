@@ -1,11 +1,18 @@
-//! SSH agent backed by the Ledger's OpenPGP authentication key (Ed25519).
+//! SSH agent with two kinds of keys:
 //!
-//! Signing uses the OpenPGP card INTERNAL AUTHENTICATE command, exactly like gpg-agent's SSH
-//! support; the agent only relays bytes. One worker thread owns the device connection and keeps
-//! it open between requests (fast over Bluetooth), reconnecting when needed.
+//! * **Encrypted key files** (`~/.ssh/sealctl_<name>`, made by `sealctl ssh keygen`): standard
+//!   OpenSSH private keys whose passphrase is derived on the Ledger from the key's own public
+//!   fingerprint. The agent decrypts a key on first use and keeps it in memory for the session —
+//!   1 h without use, 24 h at most (`SEALCTL_AGENT_IDLE_MIN`, `SEALCTL_AGENT_MAX_HOURS`) — so SSH
+//!   and git signing don't need the device for every signature. `ssh-add -D` / `sealctl lock`
+//!   forget them.
+//! * **The Ledger's OpenPGP authentication key** (Ed25519): every signature is made on the device
+//!   with INTERNAL AUTHENTICATE, exactly like gpg-agent's SSH support. One worker thread owns the
+//!   device connection and keeps it open between requests, reconnecting when needed.
 
-use std::path::PathBuf;
-use std::sync::mpsc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -15,10 +22,138 @@ use ssh_agent_lib::agent::{listen, Session};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
 use ssh_key::public::{Ed25519PublicKey, KeyData};
-use ssh_key::{Algorithm, Signature};
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
+use zeroize::Zeroizing;
 
+use crate::derive::{self, Oracle, Purpose};
 use crate::device::{ensure_user_pin, Ctx};
 use crate::{cert, paths};
+
+// ---- encrypted key files ----
+
+const FILE_PREFIX: &str = "sealctl_";
+
+/// The passphrase of an encrypted key file, derived from its public key's fingerprint.
+pub fn passphrase_for(oracle: &mut dyn Oracle, public: &PublicKey) -> Result<Zeroizing<String>> {
+    derive::passphrase(
+        oracle,
+        Purpose::Ssh,
+        &public.fingerprint(HashAlg::Sha256).to_string(),
+    )
+}
+
+pub fn key_path(name: &str) -> Result<PathBuf> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("key names use letters, digits, '-' and '_'");
+    }
+    Ok(paths::ssh_dir()?.join(format!("{FILE_PREFIX}{name}")))
+}
+
+/// Encrypted key files sealctl manages: `~/.ssh/sealctl_*` (without `.pub`).
+pub fn key_files() -> Vec<PathBuf> {
+    let Ok(dir) = paths::ssh_dir() else {
+        return vec![];
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut v: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(FILE_PREFIX) && !n.ends_with(".pub"))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// The public half of an encrypted key file (readable without the passphrase).
+pub fn read_public(path: &Path) -> Result<PublicKey> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(PrivateKey::from_openssh(text)
+        .with_context(|| format!("{} is not an OpenSSH private key", path.display()))?
+        .public_key()
+        .clone())
+}
+
+/// Decrypt a key file with its derived passphrase.
+pub fn unlock_file(oracle: &mut dyn Oracle, path: &Path) -> Result<PrivateKey> {
+    let text = Zeroizing::new(std::fs::read_to_string(path)?);
+    let enc = PrivateKey::from_openssh(&*text)?;
+    if !enc.is_encrypted() {
+        bail!("{} is not encrypted — refusing to use it", path.display());
+    }
+    let pass = passphrase_for(oracle, enc.public_key())?;
+    enc.decrypt(pass.as_bytes())
+        .with_context(|| format!("decrypting {} (made with another seed?)", path.display()))
+}
+
+/// `sealctl ssh keygen`: a random Ed25519 key, encrypted with the passphrase derived from its
+/// fingerprint. Writes `~/.ssh/sealctl_<name>` (0600) and `.pub`.
+pub fn keygen(oracle: &mut dyn Oracle, name: &str, comment: &str) -> Result<PathBuf> {
+    let path = key_path(name)?;
+    if path.exists() {
+        bail!("{} already exists", path.display());
+    }
+    let mut rng = rand::rngs::OsRng;
+    let mut key = PrivateKey::random(&mut rng, Algorithm::Ed25519)?;
+    key.set_comment(comment);
+    let pass = passphrase_for(oracle, key.public_key())?;
+    let enc = key.encrypt(&mut rng, pass.as_bytes())?;
+    // prove it opens again before anything is written
+    if enc.decrypt(pass.as_bytes())?.public_key() != key.public_key() {
+        bail!("encrypted key does not round-trip");
+    }
+    std::fs::create_dir_all(path.parent().context("ssh dir")?)?;
+    paths::write_private(&path, enc.to_openssh(LineEnding::LF)?.as_bytes())?;
+    std::fs::write(
+        path.with_extension("pub"),
+        format!("{}\n", key.public_key().to_openssh()?),
+    )?;
+    Ok(path)
+}
+
+/// Forget decrypted keys in the running agent (`ssh-add -D`).
+pub fn forget() -> bool {
+    let Ok(sock) = socket_path() else {
+        return false;
+    };
+    sock.exists()
+        && std::process::Command::new("ssh-add")
+            .arg("-D")
+            .env("SSH_AUTH_SOCK", &sock)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+}
+
+struct Unlocked {
+    key: PrivateKey,
+    since: Instant,
+    used: Instant,
+}
+
+/// Decrypted keys, by fingerprint.
+struct SoftKeys {
+    limits: crate::agent::Limits,
+    keys: HashMap<String, Unlocked>,
+}
+
+impl SoftKeys {
+    fn prune(&mut self) {
+        let l = self.limits;
+        self.keys
+            .retain(|_, u| u.used.elapsed() < l.idle && u.since.elapsed() < l.max_life);
+    }
+}
 
 pub const AGENT_LABEL: &str = "io.github.oleksiyp.sealctl.ssh-agent";
 
@@ -85,26 +220,101 @@ fn worker(ctx: Ctx, rx: mpsc::Receiver<(Vec<u8>, Reply)>) {
 
 #[derive(Clone)]
 struct Agent {
-    key: Ed25519PublicKey,
+    key: Option<Ed25519PublicKey>,
     comment: String,
     tx: mpsc::Sender<(Vec<u8>, Reply)>,
+    ctx: Ctx,
+    soft: Arc<Mutex<SoftKeys>>,
+}
+
+fn agent_err(msg: impl std::fmt::Display) -> AgentError {
+    AgentError::other(std::io::Error::other(msg.to_string()))
+}
+
+impl Agent {
+    /// Sign with an encrypted key file, decrypting it first if needed (Ledger, once a session).
+    async fn sign_soft(&self, path: PathBuf, fp: String, data: Vec<u8>) -> Result<Signature, AgentError> {
+        use signature::Signer;
+        {
+            let mut soft = self.soft.lock().unwrap_or_else(|e| e.into_inner());
+            soft.prune();
+            if let Some(u) = soft.keys.get_mut(&fp) {
+                u.used = Instant::now();
+                return u.key.try_sign(&data).map_err(agent_err);
+            }
+        }
+        let ctx = self.ctx;
+        let key = tokio::task::spawn_blocking(move || -> Result<PrivateKey> {
+            let mut oracle = crate::agent::oracle(&ctx)?;
+            unlock_file(oracle.as_mut(), &path)
+        })
+        .await
+        .map_err(agent_err)?
+        .map_err(|e| {
+            eprintln!("unlocking key failed: {e:#}");
+            agent_err(format!("{e:#}"))
+        })?;
+        log::info!("unlocked {fp} for this session");
+        let sig = key.try_sign(&data).map_err(agent_err)?;
+        let now = Instant::now();
+        let mut soft = self.soft.lock().unwrap_or_else(|e| e.into_inner());
+        soft.keys.insert(
+            fp,
+            Unlocked {
+                key,
+                since: now,
+                used: now,
+            },
+        );
+        Ok(sig)
+    }
 }
 
 #[ssh_agent_lib::async_trait]
 impl Session for Agent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        Ok(vec![Identity {
-            credential: PublicCredential::Key(KeyData::Ed25519(self.key)),
-            comment: self.comment.clone(),
-        }])
+        let mut ids: Vec<Identity> = key_files()
+            .iter()
+            .filter_map(|p| read_public(p).ok())
+            .map(|k| Identity {
+                credential: PublicCredential::Key(k.key_data().clone()),
+                comment: k.comment().to_string(),
+            })
+            .collect();
+        if let Some(key) = self.key {
+            ids.push(Identity {
+                credential: PublicCredential::Key(KeyData::Ed25519(key)),
+                comment: self.comment.clone(),
+            });
+        }
+        Ok(ids)
+    }
+
+    async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
+        // the key files stay; only the decrypted copies are forgotten
+        self.soft.lock().unwrap_or_else(|e| e.into_inner()).keys.clear();
+        log::info!("forgot all decrypted keys");
+        Ok(())
     }
 
     async fn sign(&mut self, req: SignRequest) -> Result<Signature, AgentError> {
-        let PublicCredential::Key(KeyData::Ed25519(k)) = &req.credential else {
-            return Err(AgentError::other(std::io::Error::other("unknown key")));
+        let PublicCredential::Key(wanted) = &req.credential else {
+            return Err(agent_err("unknown key"));
         };
-        if *k != self.key {
-            return Err(AgentError::other(std::io::Error::other("unknown key")));
+        for path in key_files() {
+            if let Ok(public) = read_public(&path) {
+                if public.key_data() == wanted {
+                    let fp = public.fingerprint(HashAlg::Sha256).to_string();
+                    log::info!("sign request with {fp} ({} bytes)", req.data.len());
+                    return self.sign_soft(path, fp, req.data.clone()).await;
+                }
+            }
+        }
+        let KeyData::Ed25519(k) = wanted else {
+            return Err(agent_err("unknown key"));
+        };
+        if Some(*k) != self.key {
+            return Err(agent_err("unknown key"));
         }
         log::info!("sign request ({} bytes)", req.data.len());
         let (rtx, rrx) = tokio::sync::oneshot::channel();
@@ -128,8 +338,9 @@ pub fn socket_path() -> Result<PathBuf> {
 
 /// Run the agent in the foreground.
 pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
-    let cert = cert::own()?;
-    let key = auth_key(&cert)?;
+    // The Ledger key is optional: encrypted key files work without a certificate.
+    let cert = cert::own().ok();
+    let key = cert.as_ref().and_then(|c| auth_key(c).ok());
     let socket = match socket {
         // A caller-chosen location: only make sure the folder exists (it may be /tmp).
         Some(s) => {
@@ -148,10 +359,19 @@ pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || worker(ctx, rx));
 
+    let soft = Arc::new(Mutex::new(SoftKeys {
+        limits: crate::agent::Limits::from_env(),
+        keys: HashMap::new(),
+    }));
     let agent = Agent {
         key,
-        comment: format!("sealctl {}", cert::primary_user_id(&cert)),
+        comment: cert
+            .as_ref()
+            .map(|c| format!("sealctl ledger {}", cert::primary_user_id(c)))
+            .unwrap_or_default(),
         tx,
+        ctx,
+        soft: soft.clone(),
     };
     eprintln!("sealctl ssh-agent listening on {}", socket.display());
     let rt = tokio::runtime::Runtime::new()?;
@@ -162,6 +382,14 @@ pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         }
+        // forget decrypted keys when they expire, even if nobody asks
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                soft.lock().unwrap_or_else(|e| e.into_inner()).prune();
+            }
+        });
         tokio::select! {
             r = listen(listener, agent) => r.map_err(|e| anyhow::anyhow!("{e}")),
             _ = tokio::signal::ctrl_c() => Ok(()),

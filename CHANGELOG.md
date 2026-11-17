@@ -6,7 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-17
+
 ### Added
+
+- Encrypted SSH key files: `sealctl ssh keygen` makes a random Ed25519 key in standard OpenSSH
+  format, encrypted with a passphrase derived on the Ledger from the key's own fingerprint
+  (purpose `ssh`). The SSH agent unlocks it on first use and keeps it for the session (1 h idle,
+  24 h max), so signatures don't need the device each time; `ssh-add -D` / `sealctl lock` forget
+  it. `sealctl ssh pubkey <name>`, `sealctl ssh passphrase <name>`,
+  `sealctl git setup --key <name>`, `sealctl git setup --undo`.
 
 - `sealctl recover`: disaster recovery without a Ledger. Recomputes the OpenPGP app's
   seed-derived decryption key from the 24 words in software (BIP39 → BIP32 secp256k1

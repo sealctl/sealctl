@@ -84,3 +84,11 @@ pub fn write_private(p: &std::path::Path, data: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, p).with_context(|| format!("writing {}", p.display()))?;
     Ok(())
 }
+
+/// `~/.ssh` (or `$SEALCTL_SSH_DIR`): where `sealctl ssh keygen` puts encrypted key files.
+pub fn ssh_dir() -> Result<PathBuf> {
+    match std::env::var_os("SEALCTL_SSH_DIR") {
+        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => Ok(home()?.join(".ssh")),
+    }
+}
