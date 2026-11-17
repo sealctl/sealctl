@@ -23,8 +23,33 @@ impl Ctx {
         }
     }
 
-    /// Connect, check that the OpenPGP app is running, and open it as an OpenPGP card.
+    /// Connect to the OpenPGP app, telling the user what to do on the Ledger (stderr + desktop
+    /// notification) and waiting while it is off, locked or on another app — up to
+    /// `SEALCTL_WAIT` seconds (default 90).
     pub fn open_card(&self) -> Result<Card<Open>> {
+        let wait = std::env::var("SEALCTL_WAIT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(90);
+        let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        loop {
+            let e = match self.try_open_card() {
+                Ok(card) => return Ok(card),
+                Err(e) => e,
+            };
+            let Some(todo) = needs_user(&e) else {
+                return Err(e);
+            };
+            if std::time::Instant::now() >= deadline {
+                return Err(e);
+            }
+            crate::util::notify(todo);
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// One connection attempt.
+    fn try_open_card(&self) -> Result<Card<Open>> {
         let mut t = sealctl_ledger::open(self.select, self.scan)?;
         let mut kind = t.kind();
         let (mut app, mut version) = sealctl_ledger::running_app(t.as_mut()).map_err(explain)?;
@@ -32,7 +57,7 @@ impl Ctx {
         // On the dashboard: ask the device to open OpenPGP (confirmed on the Ledger), then
         // reconnect — launching an app resets the USB/Bluetooth link.
         if app == "BOLOS" && std::env::var_os("SEALCTL_NO_AUTO_OPEN").is_none() {
-            eprintln!("👉 Opening the OpenPGP app — confirm on the Ledger if asked");
+            crate::util::notify("Opening the OpenPGP app — confirm on the Ledger if asked");
             match sealctl_ledger::open_app(t.as_mut(), "OpenPGP") {
                 Ok(()) => {
                     drop(t);
@@ -85,6 +110,20 @@ impl Ctx {
     }
 }
 
+/// What the user has to do on the Ledger for this error to go away, if anything.
+fn needs_user(e: &anyhow::Error) -> Option<&'static str> {
+    let s = format!("{e:#}");
+    if s.contains("5515") || s.contains("is locked") {
+        Some("Unlock your Ledger")
+    } else if s.contains("no Ledger found") {
+        Some("Turn on and unlock your Ledger (Bluetooth on, or USB connected)")
+    } else if s.contains("the Ledger is on") || s.contains("6e00") || s.contains("6d00") {
+        Some("Open the OpenPGP app on your Ledger")
+    } else {
+        None
+    }
+}
+
 /// Turn Ledger status words into actionable messages.
 pub fn explain(e: anyhow::Error) -> anyhow::Error {
     let s = format!("{e:#}");
@@ -104,7 +143,7 @@ pub fn explain(e: anyhow::Error) -> anyhow::Error {
 }
 
 pub fn prompt(msg: &str) -> impl Fn() + '_ {
-    move || eprintln!("👉 {msg}")
+    move || crate::util::notify(msg)
 }
 
 /// Make sure the user PIN (PW1, decrypt/authenticate) is verified; the Ledger keeps it

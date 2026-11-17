@@ -148,6 +148,21 @@ enum Cmd {
     #[command(subcommand)]
     Kit(KitCmd),
 
+    /// Disaster recovery without a Ledger: recompute your decryption key from the 24 words and
+    /// serve it through the agent, so unlock / backup restore / secrets work. Verified against
+    /// your certificate. Exposes the phrase to this computer — use only to recover, offline.
+    Recover {
+        /// OpenPGP app key slot (1–3).
+        #[arg(long, default_value_t = 1)]
+        slot: u32,
+        /// Ask for a BIP39 passphrase (only if you set one up on the Ledger).
+        #[arg(long)]
+        passphrase: bool,
+        /// Stop after this many idle minutes.
+        #[arg(long, default_value_t = 60)]
+        idle: u64,
+    },
+
     /// List Ledger devices on USB and Bluetooth.
     Devices,
     /// Show the OpenPGP card state on the device.
@@ -209,6 +224,16 @@ enum BackupCmd {
         /// Extra environment for restic, KEY=VALUE (credentials are asked for if missing).
         #[arg(long = "env", short = 'e')]
         env: Vec<String>,
+        /// Id the repository password is derived from (default: the volume name).
+        #[arg(long)]
+        key_id: Option<String>,
+    },
+    /// Switch an existing repository to the password derived from a key id (default: the
+    /// volume name) — e.g. repositories created by sealctl 0.2.0, which used the URL.
+    Rekey {
+        volume: String,
+        #[arg(long)]
+        key_id: Option<String>,
     },
     /// Back up volumes now.
     Run {
@@ -359,7 +384,8 @@ fn main() {
     let cli = Cli::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(match cli.verbose {
         // btleplug logs a spurious error on macOS disconnect; hide it unless verbose
-        0 => "warn,btleplug=off",
+        // ssh_agent_lib logs every unsupported optional request (e.g. OpenSSH's extension query)
+        0 => "warn,btleplug=off,ssh_agent_lib=off",
         1 => "debug",
         _ => "trace",
     }))
@@ -415,6 +441,35 @@ fn real_main(cli: Cli) -> Result<()> {
                 println!("🔒 agent stopped — the Ledger is needed again next time");
             }
             Ok(())
+        }
+        Cmd::Recover {
+            slot,
+            passphrase,
+            idle,
+        } => {
+            if !(1..=3).contains(&slot) {
+                anyhow::bail!("slot must be 1, 2 or 3");
+            }
+            let expected = sealctl::recover::expected_public()?;
+            let words = sealctl::recover::read_phrase()?;
+            let pass = if passphrase {
+                sealctl::util::read_hidden("BIP39 passphrase: ")?
+            } else {
+                zeroize::Zeroizing::new(String::new())
+            };
+            let key = sealctl::recover::recover_key(&words, &pass, slot - 1, &expected)?;
+            drop((words, pass));
+            println!("✅ recovered the decryption key — it matches your certificate");
+            println!("   Recovery agent running. In another terminal: sealctl unlock <name>,");
+            println!("   sealctl backup restore …, sealctl secret get …   (Ctrl-C to stop)");
+            agent::run_with(
+                ctx,
+                agent::Limits {
+                    idle: Duration::from_secs(idle.max(1) * 60),
+                    max_life: Duration::from_secs(24 * 3600),
+                },
+                Some(Box::new(sealctl::recover::SeedOracle(key))),
+            )
         }
         Cmd::Agent(AgentCmd::Run { idle, max_hours }) => agent::run(
             ctx,
@@ -516,8 +571,20 @@ fn real_main(cli: Cli) -> Result<()> {
         }
 
         Cmd::Backup(b) => match b {
-            BackupCmd::Init { volume, repo, env } => {
-                backup::init(agent::oracle(&ctx)?.as_mut(), &volume, &repo, &env)
+            BackupCmd::Init {
+                volume,
+                repo,
+                env,
+                key_id,
+            } => backup::init(
+                agent::oracle(&ctx)?.as_mut(),
+                &volume,
+                &repo,
+                key_id.as_deref(),
+                &env,
+            ),
+            BackupCmd::Rekey { volume, key_id } => {
+                backup::rekey(agent::oracle(&ctx)?.as_mut(), &volume, key_id.as_deref())
             }
             BackupCmd::Run {
                 volumes,

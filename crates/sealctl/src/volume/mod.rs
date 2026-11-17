@@ -41,9 +41,14 @@ impl Kind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupPolicy {
-    /// restic repository URL — also the input for deriving the repository password.
+    /// restic repository URL.
     #[serde(default)]
     pub repository: String,
+    /// Id the repository password is derived from (with the Ledger seed). New repositories use
+    /// the volume name, so the repository can move to another URL/provider and is recovered
+    /// with only the seed and the name. Absent (repositories from 0.2.0): the URL is the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
     /// Back up before `sealctl lock`.
     #[serde(default = "yes")]
     pub on_lock: bool,
@@ -72,15 +77,21 @@ fn d12() -> u32 {
 }
 
 impl BackupPolicy {
-    pub fn new(repository: &str) -> Self {
+    pub fn new(repository: &str, key_id: &str) -> Self {
         Self {
             repository: repository.to_string(),
+            key_id: Some(key_id.to_string()),
             on_lock: true,
             scheduled: true,
             keep_daily: 7,
             keep_weekly: 4,
             keep_monthly: 12,
         }
+    }
+
+    /// The id the repository password is derived from.
+    pub fn password_id(&self) -> &str {
+        self.key_id.as_deref().unwrap_or(&self.repository)
     }
 }
 

@@ -89,7 +89,21 @@ fn inner_password_file(vol: &Volume) -> PathBuf {
 }
 
 fn write_inner(vol: &Volume, s: &RepoSecrets) -> Result<()> {
-    paths::ensure_private_dir(&vol.inner_dir())?;
+    if let Err(e) = paths::ensure_private_dir(&vol.inner_dir()) {
+        let denied = e
+            .chain()
+            .filter_map(|c| c.downcast_ref::<std::io::Error>())
+            .any(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
+        if denied {
+            // New APFS volumes have a root-owned top directory.
+            anyhow::bail!(
+                "{e:#}\n   The top folder of the volume is not yours. Fix it once (it stays on the volume):\n   \
+                 sudo chown \"$USER\" {}",
+                vol.mountpoint.display()
+            );
+        }
+        return Err(e);
+    }
     paths::write_private(&inner_secrets_file(vol), toml::to_string(s)?.as_bytes())?;
     paths::write_private(&inner_password_file(vol), s.password.as_bytes())?;
     Ok(())
@@ -103,6 +117,12 @@ fn read_inner(vol: &Volume) -> Result<RepoSecrets> {
         )
     })?);
     Ok(toml::from_str(&text)?)
+}
+
+enum Probe {
+    Exists,
+    Missing,
+    WrongPassword,
 }
 
 /// How restic gets its password: a file inside the unlocked volume, or our stdin pipe.
@@ -125,22 +145,21 @@ impl Repo {
     }
 
     /// Works while locked or lost too: the password is derived on the Ledger from the
-    /// repository URL; storage credentials come from the environment or a prompt.
+    /// repository's key id; storage credentials come from the environment or a prompt.
     fn open(oracle: &mut dyn Oracle, vol: &Volume) -> Result<Repo> {
         if vol.is_unlocked().unwrap_or(false) && inner_secrets_file(vol).exists() {
             return Self::from_unlocked(vol);
         }
-        let repository = vol
+        let policy = vol
             .backup
             .as_ref()
-            .map(|b| b.repository.clone())
-            .filter(|r| !r.is_empty())
+            .filter(|b| !b.repository.is_empty())
             .context("no backup configured for this volume")?;
-        Self::from_url(oracle, &repository)
+        Self::derived(oracle, &policy.repository, policy.password_id())
     }
 
-    fn from_url(oracle: &mut dyn Oracle, repository: &str) -> Result<Repo> {
-        let password = derive::passphrase(oracle, Purpose::Restic, repository)?;
+    fn derived(oracle: &mut dyn Oracle, repository: &str, key_id: &str) -> Result<Repo> {
+        let password = derive::passphrase(oracle, Purpose::Restic, key_id)?;
         let env = collect_env(repository, &[])?;
         Ok(Repo {
             secrets: RepoSecrets {
@@ -150,6 +169,53 @@ impl Repo {
             },
             password: Password::Pipe(password),
         })
+    }
+
+    /// Does a repository exist at the URL, and does our password open it? (No output.)
+    fn probe(&self) -> Result<Probe> {
+        let mut c = self.command();
+        c.args(["cat", "config"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let out = c.output().context("starting restic")?;
+        if out.status.success() {
+            return Ok(Probe::Exists);
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("does not exist") || err.contains("unable to open config file") {
+            Ok(Probe::Missing)
+        } else if err.contains("wrong password") || err.contains("no key found") {
+            Ok(Probe::WrongPassword)
+        } else {
+            bail!("restic could not open the repository:\n{}", err.trim())
+        }
+    }
+
+    /// The id of the restic key our password opens.
+    fn current_key(&self) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct Key {
+            current: bool,
+            id: String,
+        }
+        let out = self
+            .command()
+            .args(["key", "list", "--json"])
+            .stdin(Stdio::null())
+            .output()
+            .context("starting restic")?;
+        if !out.status.success() {
+            bail!(
+                "restic key list failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let keys: Vec<Key> = serde_json::from_slice(&out.stdout).context("parsing restic key list")?;
+        keys.into_iter()
+            .find(|k| k.current)
+            .map(|k| k.id)
+            .context("restic did not mark a current key")
     }
 
     fn command(&self) -> Command {
@@ -239,7 +305,13 @@ fn collect_env(repository: &str, env_pairs: &[String]) -> Result<BTreeMap<String
 /// Configure backups for an unlocked volume. The repository password is derived from the
 /// Ledger seed and the repository URL; re-running `init` with the same URL reconnects to an
 /// existing repository.
-pub fn init(oracle: &mut dyn Oracle, vol_name: &str, repository: &str, env_pairs: &[String]) -> Result<()> {
+pub fn init(
+    oracle: &mut dyn Oracle,
+    vol_name: &str,
+    repository: &str,
+    key_id: Option<&str>,
+    env_pairs: &[String],
+) -> Result<()> {
     let mut vol = Volume::load(vol_name)?;
     if !vol.is_unlocked()? {
         bail!("unlock '{vol_name}' first (`sealctl unlock {vol_name}`)");
@@ -247,8 +319,9 @@ pub fn init(oracle: &mut dyn Oracle, vol_name: &str, repository: &str, env_pairs
     if !util::which(&restic_bin()) && std::env::var_os("SEALCTL_RESTIC").is_none() {
         bail!("restic not found — install it (brew install restic / apt install restic)");
     }
+    let key_id = key_id.unwrap_or(vol_name);
     let env = collect_env(repository, env_pairs)?;
-    let password = derive::passphrase(oracle, Purpose::Restic, repository)?;
+    let password = derive::passphrase(oracle, Purpose::Restic, key_id)?;
     let secrets = RepoSecrets {
         repository: repository.to_string(),
         password: password.to_string(),
@@ -256,14 +329,20 @@ pub fn init(oracle: &mut dyn Oracle, vol_name: &str, repository: &str, env_pairs
     };
     write_inner(&vol, &secrets)?;
     let repo = Repo::from_unlocked(&vol)?;
-    if repo.run(&["cat", "config"], true).is_ok() {
-        println!("existing repository found — reconnected (same seed, same URL ⇒ same password)");
-    } else {
-        repo.run(&["init"], false)?;
+    match repo.probe()? {
+        Probe::Exists => {
+            println!("existing repository found — reconnected (same seed, same key id ⇒ same password)")
+        }
+        Probe::Missing => repo.run(&["init"], false)?,
+        Probe::WrongPassword => bail!(
+            "a repository exists at {repository}, but not for key id '{key_id}'.\n   \
+             Repositories created by sealctl 0.2.0 use the URL as key id: add --key-id '{repository}'"
+        ),
     }
-    vol.backup = Some(BackupPolicy::new(repository));
+    vol.backup = Some(BackupPolicy::new(repository, key_id));
     vol.save()?;
     println!("✅ backups configured for '{vol_name}' → {repository}");
+    println!("   password derived from your seed and key id '{key_id}'");
     println!("   first backup:      sealctl backup run {vol_name}");
     println!("   hourly schedule:   sealctl backup schedule install");
     Ok(())
@@ -448,6 +527,45 @@ pub fn set_policy(vol: &str, f: impl FnOnce(&mut BackupPolicy)) -> Result<()> {
 // ---- scheduling ----
 
 pub const SCHEDULE_LABEL: &str = "io.github.oleksiyp.sealctl.backup";
+
+/// Switch an existing repository to the password derived from `key_id` (default: the volume
+/// name), using restic's own key management: the new key is added, then the old one removed.
+/// The data and the repository's master key stay the same.
+pub fn rekey(oracle: &mut dyn Oracle, vol_name: &str, key_id: Option<&str>) -> Result<()> {
+    let mut vol = Volume::load(vol_name)?;
+    if !vol.is_unlocked()? {
+        bail!("unlock '{vol_name}' first (`sealctl unlock {vol_name}`)");
+    }
+    let mut policy = vol
+        .backup
+        .clone()
+        .context("no backup configured for this volume")?;
+    let new_id = key_id.unwrap_or(vol_name);
+    if policy.key_id.as_deref() == Some(new_id) {
+        println!("'{vol_name}' backups already use key id '{new_id}'");
+        return Ok(());
+    }
+    let repo = Repo::from_unlocked(&vol)?;
+    let old_key = repo.current_key()?;
+    let new_password = derive::passphrase(oracle, Purpose::Restic, new_id)?;
+    let staged = vol.inner_dir().join("restic-password.new");
+    paths::write_private(&staged, new_password.as_bytes())?;
+    let added = repo.run(
+        &["key", "add", "--new-password-file", &staged.to_string_lossy()],
+        true,
+    );
+    let _ = fs::remove_file(&staged);
+    added?;
+    let mut secrets = repo.secrets;
+    secrets.password = new_password.to_string();
+    write_inner(&vol, &secrets)?;
+    Repo::from_unlocked(&vol)?.run(&["key", "remove", &old_key], true)?;
+    policy.key_id = Some(new_id.to_string());
+    vol.backup = Some(policy);
+    vol.save()?;
+    println!("✅ '{vol_name}' backups now use a password derived from key id '{new_id}'");
+    Ok(())
+}
 
 pub fn schedule_install(every_minutes: u64) -> Result<()> {
     let exe = std::env::current_exe()?;

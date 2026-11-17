@@ -75,7 +75,7 @@ Bluetooth therefore never carry `S`, and an eavesdropper cannot tell which id is
 | purpose | id | where the id comes from |
 |---|---|---|
 | `volume` | volume UUID | APFS volume UUID (`diskutil info`, readable while locked); LUKS UUID (`cryptsetup luksUUID`, chosen by sealctl); sparse bundle: `sealctl.id` file inside the bundle (chosen by sealctl) |
-| `restic` | repository URL exactly as given to `backup init` | you (e.g. `s3:https://…/bucket/path`) |
+| `restic` | key id: the volume name (default), or `--key-id`; repositories from 0.2.0 used the URL | you |
 | `secrets` | `store` | constant |
 
 The ids are not secret. The volume id travels with the disk, so a disk can be unlocked on any
@@ -87,10 +87,26 @@ machine with the seed: `sealctl volume import` + `sealctl unlock`.
   `sealctl setup --force` (regenerates the identical seed-derived key).
 * Keys cannot be rotated per volume; to change a volume's key, copy the data to a new volume
   (new UUID ⇒ new key).
-* Changing the restic repository URL string changes the password; use the URL exactly as
-  configured.
+* A restic repository's password depends on its key id (the volume name by default), not on
+  where it is stored: it can be copied to another bucket or provider.
 * While the OpenPGP app is open with the PIN verified (and while the sealctl agent session
   lives), local processes running as you can request derivations. See the threat model.
+
+## Recovery without a Ledger
+
+`k` itself is reproducible from the 24 words in software (`sealctl recover`), following the
+OpenPGP app's seed mode "v2" (`app-openpgp/src/gpg_gen.c`):
+
+```
+seed = BIP39(words, passphrase)
+Sn   = BIP32-secp256k1(seed, m/0x80475047'/(slot+1)')            # private key, 32 bytes
+h    = SHA-256("kdf2" ‖ Sn ‖ "dec " ‖ 00 01 ‖ len(A) ‖ A)          # A = 12 2B060104019755010501
+d    = SHAKE-256(h, 64) mod ℓ (big-endian), clamped; k = d little-endian
+```
+
+The result is accepted only if `X25519(k, 9)` equals the certificate's decryption subkey.
+`scripts/speculos-recover-check.sh` proves the equivalence against the real app in Ledger's
+emulator. Typing the phrase into a computer exposes it: recovery only, ideally offline.
 
 ## Test vectors
 

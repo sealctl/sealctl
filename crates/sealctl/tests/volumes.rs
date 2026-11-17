@@ -55,12 +55,17 @@ fn lifecycle(kind: Kind, mount_in_tmp: bool) {
     assert!(leftovers.is_empty(), "no key files: {leftovers:?}");
     fs::write(vol.mountpoint.join("hello.txt"), b"hello from sealctl").unwrap();
 
-    // backups: restic password derived from the repository URL
+    // backups: a repository as sealctl 0.2.0 made it (password derived from the URL) ...
     let have_restic = common::have("restic");
     let repo = tmp.path().join("repo").to_string_lossy().into_owned();
     if have_restic {
-        sealctl::backup::init(&mut ledger, &name, &repo, &[]).expect("backup init");
+        sealctl::backup::init(&mut ledger, &name, &repo, Some(&repo), &[]).expect("backup init");
         sealctl::backup::run(std::slice::from_ref(&name), false, false, true).expect("backup run");
+        // ... moved to the portable key id (the volume name) by restic key add/remove
+        sealctl::backup::rekey(&mut ledger, &name, None).expect("backup rekey");
+        let policy = Volume::load(&name).unwrap().backup.unwrap();
+        assert_eq!(policy.password_id(), name, "key id is the volume name");
+        sealctl::backup::run(std::slice::from_ref(&name), false, false, true).expect("backup after rekey");
         let st = sealctl::backup::load_state(&name);
         assert!(st.last_success.is_some() && st.last_error.is_none());
     } else {
@@ -85,10 +90,15 @@ fn lifecycle(kind: Kind, mount_in_tmp: bool) {
         b"hello from sealctl"
     );
 
-    // re-init backups with the same URL reconnects to the same repository (same derived password)
+    // re-init with only the seed and the volume name reconnects to the same repository; the old
+    // URL-derived password no longer opens it
     if have_restic {
         fs::remove_dir_all(vol.inner_dir()).unwrap();
-        sealctl::backup::init(&mut ledger, &name, &repo, &[]).expect("reconnect to existing repo");
+        let err = sealctl::backup::init(&mut ledger, &name, &repo, Some(&repo), &[])
+            .expect_err("URL key was removed by rekey");
+        assert!(format!("{err:#}").contains("not for key id"), "{err:#}");
+        fs::remove_dir_all(vol.inner_dir()).unwrap();
+        sealctl::backup::init(&mut ledger, &name, &repo, None, &[]).expect("reconnect to existing repo");
         sealctl::backup::run(std::slice::from_ref(&name), false, false, true)
             .expect("backup after reconnect");
     }

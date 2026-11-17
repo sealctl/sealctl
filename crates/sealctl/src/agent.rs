@@ -73,6 +73,8 @@ impl Limits {
 struct Server {
     ctx: Ctx,
     card: Option<CardOracle>,
+    /// A key recovered from the seed phrase (`sealctl recover`), used instead of a device.
+    soft: Option<Box<dyn Oracle + Send>>,
     cache: HashMap<[u8; 32], Zeroizing<[u8; 32]>>,
 }
 
@@ -80,6 +82,9 @@ impl Server {
     fn x25519(&mut self, u: [u8; 32]) -> Result<[u8; 32]> {
         if let Some(s) = self.cache.get(&u) {
             return Ok(**s);
+        }
+        if let Some(soft) = self.soft.as_mut() {
+            return soft.x25519(&u);
         }
         let attempt = |card: &mut Option<CardOracle>| -> Result<[u8; 32]> {
             if card.is_none() {
@@ -102,6 +107,11 @@ impl Server {
 
 /// Run the agent in the foreground until idle, too old, or told to stop.
 pub fn run(ctx: Ctx, limits: Limits) -> Result<()> {
+    run_with(ctx, limits, None)
+}
+
+/// Like [`run`], answering from a recovered key instead of a device.
+pub fn run_with(ctx: Ctx, limits: Limits, soft: Option<Box<dyn Oracle + Send>>) -> Result<()> {
     let sock = socket_path()?;
     paths::ensure_private_dir(sock.parent().context("socket dir")?)?;
     if UnixStream::connect(&sock).is_ok() {
@@ -125,6 +135,7 @@ pub fn run(ctx: Ctx, limits: Limits) -> Result<()> {
         server: Mutex::new(Server {
             ctx,
             card: None,
+            soft,
             cache: HashMap::new(),
         }),
         last: Mutex::new(Instant::now()),

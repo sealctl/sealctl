@@ -6,12 +6,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- `sealctl recover`: disaster recovery without a Ledger. Recomputes the OpenPGP app's
+  seed-derived decryption key from the 24 words in software (BIP39 → BIP32 secp256k1
+  `m/0x80475047'/(slot+1)'` → app "v2" key derivation), verifies it against the certificate,
+  and serves it through the agent so unlock / restore / secrets work. Checked against the real
+  app in Speculos (`scripts/speculos-recover-check.sh`).
+- Backup repositories derive their password from a **key id** (default: the volume name)
+  instead of the repository URL, so a repository can move and is recovered with only the seed
+  and the name. `sealctl backup init --key-id`, and `sealctl backup rekey <volume>` to move a
+  0.2.0 repository (restic key add/remove; data unchanged).
+- When the Ledger is needed, sealctl (including the SSH agent and git signing) says what to do
+  — unlock, open OpenPGP, enter the PIN — on stderr and as a desktop notification, and waits up
+  to `SEALCTL_WAIT` seconds (default 90) instead of failing.
+
 ### Fixed
 
 - macOS: `diskutil`, `hdiutil` and `launchctl` (and `cryptsetup`/`systemctl` on Linux) are found
   in `/usr/sbin`, `/sbin`, … even when those are not on `PATH`. Previously `volume ls` showed a
   mounted volume as locked, and unlock/lock failed, in shells without `/usr/sbin`.
 - `volume ls` shows ❓ with the error instead of 🔒 when the state cannot be determined.
+- `backup init` no longer prints restic's "repository does not exist" while probing, and
+  explains a permission error on a root-owned APFS volume (`sudo chown "$USER" <mountpoint>`).
+- SSH agent: no more log noise for OpenSSH's optional extension requests.
 
 ## [0.2.0] - 2026-11-17
 

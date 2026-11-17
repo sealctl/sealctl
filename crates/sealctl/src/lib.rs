@@ -18,6 +18,7 @@ pub mod kit;
 pub mod paths;
 pub mod pin;
 pub mod project;
+pub mod recover;
 pub mod secrets;
 pub mod service;
 pub mod setup;

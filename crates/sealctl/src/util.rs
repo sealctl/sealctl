@@ -134,3 +134,43 @@ pub fn confirm(question: &str) -> Result<bool> {
 pub fn read_hidden(prompt: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
+
+/// Tell the user what to do on the Ledger: on stderr, and as a desktop notification (useful when
+/// sealctl runs in the background — SSH agent, git signing, scheduled backups). The same
+/// message is repeated at most once a minute.
+pub fn notify(msg: &str) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static SHOWN: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+    {
+        let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        shown.retain(|(_, t)| t.elapsed() < Duration::from_secs(60));
+        if shown.iter().any(|(m, _)| m == msg) {
+            return;
+        }
+        shown.push((msg.to_string(), Instant::now()));
+    }
+    eprintln!("👉 {msg}");
+    if std::env::var_os("SEALCTL_NO_NOTIFY").is_some() {
+        return;
+    }
+    let quoted = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = if cfg!(target_os = "macos") {
+        Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                &format!("display notification \"{quoted}\" with title \"sealctl\" sound name \"Ping\""),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    } else if which("notify-send") {
+        Command::new("notify-send")
+            .args(["sealctl", msg])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    } else {
+        return;
+    };
+}
