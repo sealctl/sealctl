@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-17
+
+### Changed
+
+- **Breaking:** the SSH agent no longer offers the Ledger's OpenPGP authentication key. Signing
+  every login on the device made SSH depend on the Ledger being awake and unlocked. The agent
+  now serves only encrypted key files (`~/.ssh/sealctl_<name>`), unlocked once per session by a
+  passphrase derived on the Ledger. To migrate: `sealctl ssh keygen`, then put
+  `~/.ssh/sealctl_ed25519.pub` on your servers (`ssh-copy-id -i ~/.ssh/sealctl_ed25519.pub host`)
+  and GitHub, and remove the old `sealctl ledger …` key there.
+- **Breaking:** `sealctl git setup` signs with the key file `~/.ssh/sealctl_ed25519` by default
+  (`--key NAME` for another one) and fails if it doesn't exist. Re-run `sealctl git setup`;
+  add the new public key to GitHub as a signing key.
+- `sealctl ssh pubkey [NAME]` prints a key file's public key (default `ed25519`).
+- `sealctl ssh install` suggests `sealctl ssh keygen` when there is no key file yet.
+
 ## [0.4.0] - 2026-11-17
 
 ### Added
@@ -150,6 +166,9 @@ key files anymore. Volumes from 0.1.0 convert with `sealctl volume rekey <name>`
 - Minimum supported Rust version is 1.89 (required by dependencies).
 - `sealctl status` is now the local overview; card details moved to `sealctl card`.
 
-[Unreleased]: https://github.com/oleksiyp/sealctl/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/oleksiyp/sealctl/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.5.0
+[0.4.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.4.0
+[0.3.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.3.0
 [0.2.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.1.0

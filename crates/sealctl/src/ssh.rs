@@ -1,33 +1,29 @@
-//! SSH agent with two kinds of keys:
+//! SSH agent for encrypted key files (`~/.ssh/sealctl_<name>`, made by `sealctl ssh keygen`):
+//! standard OpenSSH private keys whose passphrase is derived on the Ledger from the key's own
+//! public fingerprint. The agent decrypts a key on first use and keeps it for the sealctl
+//! session (`sealctl agent`): signing counts as activity, and the key is forgotten when the
+//! session ends — 1 h without use, 24 h at most (`SEALCTL_AGENT_IDLE_MIN`,
+//! `SEALCTL_AGENT_MAX_HOURS`), `sealctl lock`, or `ssh-add -D`.
 //!
-//! * **Encrypted key files** (`~/.ssh/sealctl_<name>`, made by `sealctl ssh keygen`): standard
-//!   OpenSSH private keys whose passphrase is derived on the Ledger from the key's own public
-//!   fingerprint. The agent decrypts a key on first use and keeps it for the sealctl session
-//!   (`sealctl agent`): signing counts as activity, and the key is forgotten when the session
-//!   ends — 1 h without use, 24 h at most (`SEALCTL_AGENT_IDLE_MIN`, `SEALCTL_AGENT_MAX_HOURS`),
-//!   `sealctl lock`, or `ssh-add -D`.
-//! * **The Ledger's OpenPGP authentication key** (Ed25519): every signature is made on the device
-//!   with INTERNAL AUTHENTICATE, exactly like gpg-agent's SSH support. One worker thread owns the
-//!   device connection and keeps it open between requests, reconnecting when needed.
+//! (Until 0.4 the agent also offered the Ledger's OpenPGP authentication key, signing every
+//! login on the device. That made each connection depend on the device being awake and
+//! unlocked, so it was removed in 0.5.)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use pgp::composed::SignedPublicKey;
-use pgp::types::{EddsaLegacyPublicParams, KeyDetails, PublicParams};
 use ssh_agent_lib::agent::{listen, Session};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
-use ssh_key::public::{Ed25519PublicKey, KeyData};
 use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
 use zeroize::Zeroizing;
 
 use crate::derive::{self, Oracle, Purpose};
-use crate::device::{ensure_user_pin, Ctx};
-use crate::{cert, paths};
+use crate::device::Ctx;
+use crate::paths;
 
 // ---- encrypted key files ----
 
@@ -159,81 +155,8 @@ impl SoftKeys {
 
 pub const AGENT_LABEL: &str = "io.github.oleksiyp.sealctl.ssh-agent";
 
-/// The Ed25519 authentication subkey of a certificate.
-pub fn auth_key(cert: &SignedPublicKey) -> Result<Ed25519PublicKey> {
-    for sub in &cert.public_subkeys {
-        let is_auth = sub.signatures.iter().any(|s| s.key_flags().authentication());
-        if !is_auth {
-            continue;
-        }
-        if let PublicParams::EdDSALegacy(EddsaLegacyPublicParams::Ed25519 { key }) = sub.key.public_params() {
-            return Ok(Ed25519PublicKey(key.to_bytes()));
-        }
-        if let PublicParams::Ed25519(p) = sub.key.public_params() {
-            return Ok(Ed25519PublicKey(p.key.to_bytes()));
-        }
-    }
-    bail!("the certificate has no Ed25519 authentication subkey — run `sealctl setup`")
-}
-
-pub fn public_key_line(cert: &SignedPublicKey) -> Result<String> {
-    let key = ssh_key::PublicKey::new(KeyData::Ed25519(auth_key(cert)?), cert::primary_user_id(cert));
-    Ok(key.to_openssh()?)
-}
-
-// ---- device worker ----
-
-type Reply = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
-
-fn worker(ctx: Ctx, rx: mpsc::Receiver<(Vec<u8>, Reply)>) {
-    let mut card: Option<openpgp_card::Card<openpgp_card::state::Open>> = None;
-    let mut last_used = Instant::now();
-    loop {
-        // Drop an idle connection so the device can sleep / be used elsewhere.
-        let job = match rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(j) => j,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if card.is_some() && last_used.elapsed() > Duration::from_secs(120) {
-                    card = None;
-                }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        };
-        let (data, reply) = job;
-        let attempt = |card: &mut Option<openpgp_card::Card<openpgp_card::state::Open>>| -> Result<Vec<u8>> {
-            if card.is_none() {
-                *card = Some(ctx.open_card()?);
-            }
-            let c = card.as_mut().expect("connected");
-            let mut tx = c.transaction()?;
-            ensure_user_pin(&mut tx)?;
-            Ok(tx.card().internal_authenticate(data.clone())?)
-        };
-        // a malformed device reply must not kill this thread (the agent would stay up but
-        // never sign with the Ledger key again)
-        let guarded = |card: &mut Option<openpgp_card::Card<openpgp_card::state::Open>>| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attempt(card)))
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("the device sent a malformed reply")))
-        };
-        let res = guarded(&mut card).or_else(|e| {
-            if crate::device::is_user_refusal(&e) {
-                return Err(e);
-            }
-            log::info!("retrying with a fresh connection after: {e:#}");
-            card = None;
-            guarded(&mut card)
-        });
-        last_used = Instant::now();
-        let _ = reply.send(res.map_err(|e| format!("{:#}", crate::device::explain(e))));
-    }
-}
-
 #[derive(Clone)]
 struct Agent {
-    key: Option<Ed25519PublicKey>,
-    comment: String,
-    tx: mpsc::Sender<(Vec<u8>, Reply)>,
     ctx: Ctx,
     soft: Arc<Mutex<SoftKeys>>,
 }
@@ -294,21 +217,14 @@ impl Agent {
 #[ssh_agent_lib::async_trait]
 impl Session for Agent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        let mut ids: Vec<Identity> = key_files()
+        Ok(key_files()
             .iter()
             .filter_map(|p| read_public(p).ok())
             .map(|k| Identity {
                 credential: PublicCredential::Key(k.key_data().clone()),
                 comment: k.comment().to_string(),
             })
-            .collect();
-        if let Some(key) = self.key {
-            ids.push(Identity {
-                credential: PublicCredential::Key(KeyData::Ed25519(key)),
-                comment: self.comment.clone(),
-            });
-        }
-        Ok(ids)
+            .collect())
     }
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
@@ -333,25 +249,7 @@ impl Session for Agent {
                 }
             }
         }
-        let KeyData::Ed25519(k) = wanted else {
-            return Err(agent_err("unknown key"));
-        };
-        if Some(*k) != self.key {
-            return Err(agent_err("unknown key"));
-        }
-        log::info!("sign request ({} bytes)", req.data.len());
-        let (rtx, rrx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send((req.data.clone(), rtx))
-            .map_err(|_| AgentError::other(std::io::Error::other("device worker stopped")))?;
-        let sig = rrx
-            .await
-            .map_err(|_| AgentError::other(std::io::Error::other("device worker stopped")))?
-            .map_err(|e| {
-                eprintln!("sign failed: {e}");
-                AgentError::other(std::io::Error::other(e))
-            })?;
-        Signature::new(Algorithm::Ed25519, sig).map_err(AgentError::other)
+        Err(agent_err("unknown key"))
     }
 }
 
@@ -361,9 +259,6 @@ pub fn socket_path() -> Result<PathBuf> {
 
 /// Run the agent in the foreground.
 pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
-    // The Ledger key is optional: encrypted key files work without a certificate.
-    let cert = cert::own().ok();
-    let key = cert.as_ref().and_then(|c| auth_key(c).ok());
     let socket = match socket {
         // A caller-chosen location: only make sure the folder exists (it may be /tmp).
         Some(s) => {
@@ -398,21 +293,12 @@ pub fn run_agent(ctx: Ctx, socket: Option<PathBuf>) -> Result<()> {
     };
     let _ = std::fs::remove_file(&socket);
 
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || worker(ctx, rx));
-
     let soft = Arc::new(Mutex::new(SoftKeys {
         limits: crate::agent::Limits::from_env(),
         keys: HashMap::new(),
         generation: 0,
     }));
     let agent = Agent {
-        key,
-        comment: cert
-            .as_ref()
-            .map(|c| format!("sealctl ledger {}", cert::primary_user_id(c)))
-            .unwrap_or_default(),
-        tx,
         ctx,
         soft: soft.clone(),
     };
@@ -461,13 +347,16 @@ pub fn install(ctx_args: Vec<String>) -> Result<()> {
         label: AGENT_LABEL,
         args,
         every_secs: None,
-        description: "sealctl SSH agent (Ledger OpenPGP authentication key)",
+        description: "sealctl SSH agent (key files unlocked by the Ledger)",
     })?;
     let sock = socket_path()?;
     println!("✅ ssh-agent installed, socket: {}", sock.display());
     println!("\nUse it for all SSH connections — add to ~/.ssh/config:\n");
     println!("    Host *\n        IdentityAgent {}\n", sock.display());
     println!("or per shell:  export SSH_AUTH_SOCK={}", sock.display());
+    if key_files().is_empty() {
+        println!("\nNo SSH key yet — create one: sealctl ssh keygen");
+    }
     Ok(())
 }
 

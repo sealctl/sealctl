@@ -375,8 +375,11 @@ enum SshCmd {
         #[arg(long)]
         comment: Option<String>,
     },
-    /// Print a public key: an encrypted key file's by name, or the Ledger key's.
-    Pubkey { name: Option<String> },
+    /// Print the public key of an encrypted key file (authorized_keys / GitHub format).
+    Pubkey {
+        #[arg(default_value = "ed25519")]
+        name: String,
+    },
     /// Copy the passphrase of an encrypted key file (for ssh-keygen -p / other agents) to the
     /// clipboard, cleared after 30 s; --show prints it, or pipe it.
     Passphrase {
@@ -408,12 +411,12 @@ enum AiCmd {
 
 #[derive(Subcommand)]
 enum GitCmd {
-    /// Configure git to sign commits and tags (Ledger key, or an encrypted key file).
+    /// Configure git to sign commits and tags with an SSH key file (default: ed25519).
     Setup {
         /// Only for the current repository.
         #[arg(long)]
         local: bool,
-        /// Sign with the encrypted key file ~/.ssh/sealctl_<NAME> instead of the Ledger key.
+        /// Sign with the encrypted key file ~/.ssh/sealctl_<NAME> (default: ed25519).
         #[arg(long)]
         key: Option<String>,
         /// Remove the signing settings sealctl made.
@@ -820,12 +823,8 @@ fn real_main(cli: Cli) -> Result<()> {
                 println!("   {}", public.to_openssh()?);
                 Ok(())
             }
-            SshCmd::Pubkey { name: Some(name) } => {
+            SshCmd::Pubkey { name } => {
                 println!("{}", ssh::read_public(&ssh::key_path(&name)?)?.to_openssh()?);
-                Ok(())
-            }
-            SshCmd::Pubkey { name: None } => {
-                println!("{}", ssh::public_key_line(&cert::own()?)?);
                 Ok(())
             }
             SshCmd::Passphrase { name, show } => {

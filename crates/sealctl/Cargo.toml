@@ -12,7 +12,7 @@ keywords = ["openpgp", "ledger", "encryption", "smartcard", "cli"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
-sealctl-ledger = { path = "../sealctl-ledger", version = "0.4.0" }
+sealctl-ledger = { path = "../sealctl-ledger", version = "0.5.0" }
 anyhow.workspace = true
 log.workspace = true
 openpgp-card.workspace = true

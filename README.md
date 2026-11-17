@@ -2,9 +2,10 @@
 
 **Your hardware wallet as an everyday developer key.**
 `sealctl` uses the OpenPGP application on a Ledger device — over **USB** or **Bluetooth** — to
-unlock encrypted volumes, back them up with restic, keep API keys out of `.env` files, and sign
-SSH logins and git commits. Private keys never leave the device, and **the 24-word recovery
-phrase is the only thing you ever need to back up**.
+unlock encrypted volumes, back them up with restic, keep API keys out of `.env` files, and unlock
+SSH keys for logins and signed git commits. The OpenPGP keys never leave the device, and **the
+24-word recovery phrase is the only thing you need to back up** (plus SSH key files, if you make
+them).
 
 > ⚠️ **Early project.** It works end-to-end on macOS with a Ledger Flex; Linux support (LUKS) is
 > tested in CI but young. Keep an independent backup of anything important.
@@ -113,21 +114,17 @@ All secrets for one command are decrypted in a single device session.
 ### SSH and signed git commits
 ```sh
 sealctl ssh install        # agent as a login service; prints the ~/.ssh/config line
-
-# Everyday key: a normal encrypted OpenSSH key file whose passphrase comes from the Ledger.
-sealctl ssh keygen         # ~/.ssh/sealctl_ed25519 (+ .pub) — back the file up
-sealctl ssh pubkey ed25519 # add to servers / GitHub
-sealctl git setup --key ed25519   # sign commits & tags with it
-
-# Or the key that never leaves the Ledger (a device round trip per signature):
-sealctl ssh pubkey
-sealctl git setup
+sealctl ssh keygen         # ~/.ssh/sealctl_ed25519 (+ .pub), passphrase from the Ledger — back it up
+sealctl ssh pubkey         # add to servers / GitHub (or: ssh-copy-id -i ~/.ssh/sealctl_ed25519.pub host)
+sealctl git setup          # sign commits & tags with it
 sealctl git setup --undo   # stop signing
 ```
-The agent unlocks an encrypted key on its first use (PIN on the Ledger) and keeps it for the
-session — 1 h without use, 24 h at most — so `ssh`, `git push` and commit signing don't wait for
-the device. `sealctl lock` or `ssh-add -D` forget it. Both kinds of key are offered; pick one per
-host with `IdentityFile ~/.ssh/sealctl_ed25519.pub` + `IdentitiesOnly yes`.
+The key is a normal encrypted OpenSSH key file whose passphrase is derived on the Ledger. The
+agent unlocks it on its first use (PIN on the Ledger) and keeps it for the session — 1 h without
+use, 24 h at most — so `ssh`, `git push` and commit signing don't wait for the device.
+`sealctl lock` or `ssh-add -D` forget it. More keys: `sealctl ssh keygen <name>`, then
+`ssh pubkey <name>` / `git setup --key <name>`; pick one per host with
+`IdentityFile ~/.ssh/sealctl_<name>.pub` + `IdentitiesOnly yes`.
 
 ### Files
 ```sh
@@ -166,7 +163,7 @@ enter it about once per session.
 | `volume create\|ls\|rm`, `unlock`, `lock` | encrypted volumes |
 | `backup init\|run\|snapshots\|restore\|check\|policy\|schedule` | restic backups |
 | `secret set\|get\|ls\|rm\|import-env`, `run` | API keys and project environments |
-| `ssh pubkey\|agent\|install\|uninstall`, `git setup` | SSH and commit signing |
+| `ssh keygen\|pubkey\|passphrase\|agent\|install\|uninstall`, `git setup` | SSH and commit signing |
 | `encrypt`, `decrypt` | OpenPGP files |
 | `completions <shell>` | shell completions |
 

@@ -70,10 +70,13 @@ key derivation and `exec`s the command with them in its environment only.
 
 ## SSH
 
-`sealctl ssh agent` implements the ssh-agent protocol (ssh-agent-lib). Signing requests go to a
-worker thread that owns the device connection (kept for 2 minutes of inactivity, then
-released) and calls INTERNAL AUTHENTICATE with the Ed25519 authentication key. Git uses it via
-`gpg.format=ssh` and a `gpg.ssh.program` shim that sets `SSH_AUTH_SOCK`.
+`sealctl ssh agent` implements the ssh-agent protocol (ssh-agent-lib) and offers the encrypted
+key files `~/.ssh/sealctl_<name>` (standard OpenSSH format). A key's passphrase is derived on
+the Ledger from its public fingerprint (docs/derived-keys.md); the agent decrypts the key on
+first use and keeps it in memory for the sealctl agent session, so signing needs no device
+round trip. Git uses it via `gpg.format=ssh` and a `gpg.ssh.program` shim that sets
+`SSH_AUTH_SOCK`. (Until 0.4 the agent also signed with the Ledger's OpenPGP authentication key
+via INTERNAL AUTHENTICATE; that made every login depend on the device and was removed.)
 
 ## Recovery
 

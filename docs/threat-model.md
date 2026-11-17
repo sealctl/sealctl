@@ -20,9 +20,9 @@
 - **A compromised computer while a volume is unlocked** — plaintext is accessible to anything
   running as you. Hardware keys protect keys, not unlocked data.
 - **Malware asking for keys while a session is open** — the OpenPGP app keeps the PIN verified
-  until the app closes or the device locks, and the sealctl agent keeps derived keys in memory
-  for up to 1 hour idle / 24 hours total. Anything running as you can query the agent socket
-  (0600) or the card during that window. Run `sealctl lock` (stops the agent) when you step
+  until the app closes or the device locks, and the sealctl agent keeps derived keys (the SSH
+  agent: decrypted SSH keys) in memory for up to 1 hour idle / 24 hours total. Anything running
+  as you can query the agent sockets (0600) or the card during that window. Run `sealctl lock` (stops the agent) when you step
   away, keep a short auto-lock on the Ledger, and treat "agent running" like "logged in".
 - **A weakness in the key derivation** — sealctl's one custom construction (2HashDH over
   X25519, docs/derived-keys.md). It follows a well-studied pattern, but it has not been

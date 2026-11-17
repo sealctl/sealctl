@@ -1,4 +1,4 @@
-//! Git commit/tag signing with the Ledger authentication key via SSH signatures.
+//! Git commit/tag signing with an SSH key file unlocked by the Ledger (SSH signatures).
 //!
 //! Git calls `gpg.ssh.program` (normally `ssh-keygen -Y sign`). We point it at
 //! `sealctl git ssh-keygen`, which runs the real `ssh-keygen` with `SSH_AUTH_SOCK` set to the
@@ -72,10 +72,15 @@ pub fn undo(local: bool) -> Result<()> {
 
 pub fn setup(local: bool, key: Option<&str>) -> Result<()> {
     let cert = cert::own()?;
-    let line = match key {
-        Some(name) => ssh::read_public(&ssh::key_path(name)?)?.to_openssh()?,
-        None => ssh::public_key_line(&cert)?,
-    };
+    let name = key.unwrap_or("ed25519");
+    let path = ssh::key_path(name)?;
+    if !path.exists() {
+        bail!(
+            "no SSH key {} — create it first: `sealctl ssh keygen {name}`",
+            path.display()
+        );
+    }
+    let line = ssh::read_public(&path)?.to_openssh()?;
     let uid = cert::primary_user_id(&cert);
     let email = uid
         .split_once('<')
@@ -98,7 +103,7 @@ pub fn setup(local: bool, key: Option<&str>) -> Result<()> {
     git_config(scope, "commit.gpgsign", "true")?;
     git_config(scope, "tag.gpgsign", "true")?;
     println!(
-        "✅ git ({}) signs commits and tags with your Ledger key",
+        "✅ git ({}) signs commits and tags with ~/.ssh/sealctl_{name}",
         scope.trim_start_matches("--")
     );
     println!("   Requires the agent: `sealctl ssh install` (once).");
