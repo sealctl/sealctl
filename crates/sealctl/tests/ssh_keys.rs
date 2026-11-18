@@ -95,6 +95,26 @@ fn encrypted_key_files_are_cached_by_the_agent() {
     let mut other = common::SoftOracle(x25519_dalek::StaticSecret::from([9u8; 32]));
     assert!(sealctl::ssh::unlock_file(&mut other, &path).is_err());
 
+    // importing an existing unencrypted key keeps the key pair and encrypts it
+    let plain = ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let src = tmp.path().join("id_plain");
+    std::fs::write(
+        &src,
+        plain.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    let imported = sealctl::ssh::import(&mut oracle, &src, "plain").unwrap();
+    assert_eq!(
+        sealctl::ssh::read_public(&imported).unwrap().key_data(),
+        plain.public_key().key_data()
+    );
+    assert!(
+        ssh_key::PrivateKey::from_openssh(std::fs::read_to_string(&imported).unwrap())
+            .unwrap()
+            .is_encrypted()
+    );
+    assert!(src.exists(), "original left in place");
+
     // the SSH agent lists it and signs with it
     let sock = tmp.path().join("ssh-agent.sock");
     let s2 = sock.clone();

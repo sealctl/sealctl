@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-11-17
+## [0.5.0] - 2026-11-18
 
 ### Changed
 
@@ -21,6 +21,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   add the new public key to GitHub as a signing key.
 - `sealctl ssh pubkey [NAME]` prints a key file's public key (default `ed25519`).
 - `sealctl ssh install` suggests `sealctl ssh keygen` when there is no key file yet.
+
+### Added
+
+- `sealctl ssh import <file>`: re-encrypt an existing unencrypted SSH key (e.g.
+  `~/.ssh/id_ed25519`) with a Ledger-derived passphrase; same key pair, so servers need no
+  change. The original is left in place.
 
 ## [0.4.0] - 2026-11-17
 

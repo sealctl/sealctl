@@ -375,6 +375,14 @@ enum SshCmd {
         #[arg(long)]
         comment: Option<String>,
     },
+    /// Re-encrypt an existing unencrypted SSH key (e.g. ~/.ssh/id_ed25519) with a passphrase
+    /// derived on the Ledger; saved as ~/.ssh/sealctl_<name>. Same key — no server changes.
+    Import {
+        file: PathBuf,
+        /// Name for ~/.ssh/sealctl_<NAME> (default: the file name).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Print the public key of an encrypted key file (authorized_keys / GitHub format).
     Pubkey {
         #[arg(default_value = "ed25519")]
@@ -821,6 +829,27 @@ fn real_main(cli: Cli) -> Result<()> {
                     path.display()
                 );
                 println!("   {}", public.to_openssh()?);
+                Ok(())
+            }
+            SshCmd::Import { file, name } => {
+                let name = match name {
+                    Some(n) => n,
+                    None => file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("imported")
+                        .trim_start_matches('.')
+                        .to_string(),
+                };
+                let path = ssh::import(agent::oracle(&ctx)?.as_mut(), &file, &name)?;
+                let public = ssh::read_public(&path)?;
+                println!(
+                    "✅ {} (encrypted; passphrase derived from your Ledger seed)",
+                    path.display()
+                );
+                println!("   {}", public.fingerprint(ssh_key::HashAlg::Sha256));
+                println!("   The agent offers it now. Once logins work, delete the unencrypted original:");
+                println!("   rm {}", file.display());
                 Ok(())
             }
             SshCmd::Pubkey { name } => {

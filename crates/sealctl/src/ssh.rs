@@ -116,6 +116,40 @@ pub fn keygen(oracle: &mut dyn Oracle, name: &str, comment: &str) -> Result<Path
     Ok(path)
 }
 
+/// `sealctl ssh import`: re-encrypt an existing (unencrypted) OpenSSH key with the passphrase
+/// derived from its fingerprint, as `~/.ssh/sealctl_<name>`. Same key pair — servers need no
+/// change. The original file is left untouched (delete it yourself once the import works).
+pub fn import(oracle: &mut dyn Oracle, src: &Path, name: &str) -> Result<PathBuf> {
+    let path = key_path(name)?;
+    if path.exists() {
+        bail!("{} already exists", path.display());
+    }
+    let text =
+        Zeroizing::new(std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?);
+    let key = PrivateKey::from_openssh(&*text)
+        .with_context(|| format!("{} is not an OpenSSH private key", src.display()))?;
+    if key.is_encrypted() {
+        bail!(
+            "{} has a passphrase — remove it first (ssh-keygen -p -f {}) or import a copy",
+            src.display(),
+            src.display()
+        );
+    }
+    let pass = passphrase_for(oracle, key.public_key())?;
+    let mut rng = rand::rngs::OsRng;
+    let enc = key.encrypt(&mut rng, pass.as_bytes())?;
+    if enc.decrypt(pass.as_bytes())?.public_key() != key.public_key() {
+        bail!("encrypted key does not round-trip");
+    }
+    std::fs::create_dir_all(path.parent().context("ssh dir")?)?;
+    paths::write_private(&path, enc.to_openssh(LineEnding::LF)?.as_bytes())?;
+    std::fs::write(
+        path.with_extension("pub"),
+        format!("{}\n", key.public_key().to_openssh()?),
+    )?;
+    Ok(path)
+}
+
 /// Forget decrypted keys in the running agent (`ssh-add -D`).
 pub fn forget() -> bool {
     let Ok(sock) = socket_path() else {
