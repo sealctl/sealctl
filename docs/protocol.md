@@ -293,7 +293,7 @@ enc, ct   = HPKE-Seal(pkR = X, info = "sealctl/v1/request", aad, pt = sig ‖ bo
 sealed    = b64u(enc ‖ ct)                                # at most 4,096 characters
 ```
 
-The machine sends `{"type": "request", "id", "sealed", "ttl"}` on the wait socket (Relay API). 2,960 bytes is the largest body that fits: 4,096 characters are 3,072 bytes, less 32 for `enc`, 16 for the tag and 64 for `sig`.
+For a request with `match`, both sides also export the [number match](#number-match) from this HPKE context; single-shot sealing is then done as `SetupBaseS`, `Seal`, `Export` on one context. The machine sends `{"type": "request", "id", "sealed", "ttl"}` on the wait socket (Relay API). 2,960 bytes is the largest body that fits: 4,096 characters are 3,072 bytes, less 32 for `enc`, 16 for the tag and 64 for `sig`.
 
 The phone gets `id`, `machine` (= `M`) and `sealed` from the relay. It:
 
@@ -331,6 +331,10 @@ A reply that fails any check is dropped and the request fails with `bad_reply`; 
 | `work` | number | Minutes worked today on this machine |
 | `old` | string | `old_words` only: the retired words fingerprint the listed objects are sealed with |
 | `seq`, `state`, `log`, `inv`, `migrate` | | `report` only: the fields of a [status message](#machine-status-and-messages) |
+| `lvl` | number | The [confirmation level](#confirmation-levels) the machine asks for: `1`, `2` or `3`; `1` when absent. The phone never applies a lower level than its own |
+| `match` | bool | `true` when a person at this machine's terminal is shown the [number match](#number-match) for this request |
+| `plan` | object | `unseal` only: the [plan](#plan-and-plan-signature) `{"all", "h", "items", "n", "i"}` |
+| `handback` | object | `report` only: what a finished `unseal` handed back and where (below) |
 
 `ctx`:
 
@@ -356,19 +360,20 @@ Each item of `keys`:
 
 Request kinds (`why`):
 
-| `why` | Sent when | Level on the phone |
-| --- | --- | --- |
-| `open` | The session is Locked and something needs a key, or `sealctl open` | Automatic or One tap, by the levels of asking |
-| `keys` | The session is Open and needs a key it does not hold: a new object, a volume opened later | Automatic while the phone is unlocked and this machine's session is Open by its last status; otherwise One tap |
-| `agent` | The session is Open and an agent uses a secret for the first time in a repository | Automatic when the answer is remembered; otherwise One tap |
-| `own` | An `--own-approval` secret is used | One tap, every time |
-| `rewrap` | The phone key changed: the machine asks for old and new keys of everything it holds | Automatic while a change of words runs and the phone is unlocked |
-| `old_words` | An object is sealed with retired words | In the app: the user types those words |
-| `report` | No machine channel on the relay yet (below), or `sealctl migrate` | Never shown |
+| `why` | Sent when | Level of asking | Confirmation level |
+| --- | --- | --- | --- |
+| `open` | The session is Locked and something needs a key, or `sealctl open` | Automatic or One tap, by the levels of asking | 1 |
+| `keys` | The session is Open and needs a key it does not hold: a new object, a volume opened later | Automatic while the phone is unlocked and this machine's session is Open by its last status; otherwise One tap | 1; 2 with `ctx.subject` `{"k": "machine", "n": "seal"}` (`sealctl seal` taking over an object the user already has) |
+| `agent` | The session is Open and an agent uses a secret for the first time in a repository | Automatic when the answer is remembered; otherwise One tap | 1 |
+| `own` | An `--own-approval` secret is used | One tap, every time | 1 |
+| `rewrap` | The phone key changed: the machine asks for old and new keys of everything it holds | In the app, one machine at a time | 2 |
+| `old_words` | An object is sealed with retired words | In the app: the user types those words | The typed words are the confirmation |
+| `unseal` | `sealctl unseal` hands objects back under the user's own passwords | In the app | 2; 3 with `plan.all`, or a plan that holds a `pairing` item |
+| `report` | No machine channel on the relay yet (below), or `sealctl migrate`, or a finished `unseal` | Never shown | |
 
 A request may carry `keys` and `uses` together, so one tap covers opening the session, an agent's first use and an `--own-approval` secret. An app that gets an unknown `why` shows it with Deny only.
 
-`sealctl unseal` asks with `keys`, listing every object it hands back, and `ctx.subject` `{"k": "machine", "n": "unseal"}`. The phone shows it as a hand-back of that machine and never answers it automatically.
+`sealctl unseal` asks with `unseal`, never with `keys`. The phone never answers it automatically.
 
 The machine says nothing about where it is. For the Automatic level the phone uses the relay's `near` flag on the request (planned, see Relay API) and its own place.
 
@@ -379,9 +384,13 @@ The machine says nothing about where it is. For the Automatic level the phone us
 | `v` | number | `1` |
 | `rq` | string | `b64u(SHA256(request body))` |
 | `ok` | bool | `false` when denied or failed |
-| `err` | string | When `ok` is `false`: `declined`, `bad_label`, `wrong_key`, `retired_words`, `unsupported`, `phone_locked` |
+| `err` | string | When `ok` is `false`: `declined`, `bad_label`, `wrong_key`, `retired_words`, `unsupported`, `phone_locked`; for levels 2 and 3 also `no_match` (the wrong number was picked), `not_near` (no proximity, below), `no_biometrics` (biometrics unavailable or locked out), `held` (this machine picked a wrong number within the last hour), `outside_plan` (a key not in the approved plan), `plan_expired` |
+| `lvl` | number | The confirmation level the phone applied |
 | `w` | string | The phone's current words fingerprint |
-| `grant` | string | `once`: the keys and uses are for the command that asked, then wiped; `session`: kept until the session locks |
+| `grant` | string | `once`: the keys and uses are for the command that asked, then wiped; `session`: kept until the session locks; `plan`: for the approved `unseal` plan only |
+| `plan` | object | `unseal` only: `{"h", "nb", "sig"}`, the [plan signature](#plan-and-plan-signature) |
+| `part` | number | `unseal` plan sent in parts: the part acknowledged, for every part but the last |
+| `more` | bool | `unseal`: `true` when keys of the plan remain to be asked for |
 | `remember` | bool | The phone stored the answer for the agent uses in the request |
 | `place` | string | `trusted`, `other` or `none` (no location permission) |
 | `cap`, `base`, `rate` | numbers | Allowance: cap in seconds, base in seconds, seconds added per minute worked |
@@ -390,6 +399,93 @@ The machine says nothing about where it is. For the Automatic level the phone us
 | `msgs` | array | `report` only: [machine message](#machine-status-and-messages) bodies waiting for this machine |
 
 The core fills `cap`, `base` and `rate` from the place: `trusted` 14,400 / 1,800 / 120, `other` 600 / 600 / 0, `none` 3,600 / 1,800 / 120. The machine computes its idle allowance as `min(cap, base + rate × minutes worked today)` and does not hard-code these numbers. The machine computes the hard stop itself: 02:00 local time, or 14 hours after the first `open` granted today, whichever comes first.
+
+### Confirmation levels
+
+Every approval has a confirmation level. The level of asking (Automatic, One tap, In the app) says when the phone is asked; the confirmation level says how hard the approval is.
+
+| Level | Operations | On the phone |
+| --- | --- | --- |
+| 1 Routine | `open`, `keys`, `agent`, `own`: `sealctl run` with a secret, SSH signing, opening a volume | One tap; Face ID by policy; the trusted-place allowance applies |
+| 2 Sensitive | Pairing a machine, `unseal <object>`, `sealctl seal` of an existing object, `rewrap` | Biometrics every time, no passcode fallback, no allowance; the exact objects listed; proximity (below) |
+| 3 Leaving | `unseal --all`, Leave sealctl, showing the 24 words, deleting the phone's relay data | Level 2, plus: number match, plan signature, delay away from trusted places, the card check (Leave sealctl), a report |
+
+Rules:
+
+- **The phone decides.** It computes the level from `why`, `ctx.subject` and `plan` as in the kinds table and applies `max(that, lvl)`. A machine can raise the level of its own request, never lower it. A request the phone cannot classify is level 3.
+- **Levels do not change which keys a machine can get.** `open` can ask for any object key at level 1. Levels make deliberate the steps that remove sealctl's protection or are hard to undo: handing objects back under plain passwords, unpairing, showing or erasing the words.
+- **Proximity** (level 2 and above) means the person approving can see the machine. It holds when either: the relay's `near` flag is true and the phone is on Wi-Fi or Ethernet; or the request has `match` and the number match passes. For pairing, scanning the QR code with the app's own camera counts as proximity. A level 2 request with neither is answered `not_near`; the CLI then says to run the command at the machine's terminal.
+- **Level 3 from a machine** always needs `match`. A level 3 request without it is answered `no_match`.
+- **Biometrics.** Levels 2 and 3 need a fresh biometric match: iOS `LAPolicy.deviceOwnerAuthenticationWithBiometrics`, Android `BIOMETRIC_STRONG` without device credential. When biometrics are unavailable or locked out, level 3 is refused (`no_biometrics`) until they work again; the 24 words on the CLI (`--words`) still work. The app spec says how level 2 falls back.
+- **The 24 words** typed into the CLI (`recover`, `seal` and `unseal` with `--words`) need no phone and no level: the card is the stronger proof.
+
+### Number match
+
+The terminal shows a two-digit number. The phone offers three numbers; only someone looking at the terminal knows which is right. Picking a wrong one rejects the request.
+
+```text
+x       = HPKE-Export(request context, exporter_context = "sealctl/v1/match", L = 4), read as an unsigned 32-bit big-endian integer
+N       = 10 + (x mod 90)                                  # 10 to 99
+```
+
+The request context is the HPKE context of that one sealed request (RFC 9180 section 5.3): the machine exports from its sender context when it seals, the phone from its receiver context when it opens. Both get the same `N`; no byte string carries it, so it is in no request body, log, notification or stored request. A machine sets `match: true` in the body only when a person at its terminal is shown `N`: `On your phone, pick 47.`
+
+On the phone:
+
+1. The core keeps `N` inside the `Request` object and never hands it to Swift or Kotlin. It offers `N` and two other numbers from 10 to 99, distinct, drawn by the phone at random, in random order, and checks the pick.
+2. The number screen comes before anything the machine wrote: it shows only the machine's name from the phone's own pairing record and the three numbers. Command, paths and plan item names, all written by the machine, appear only after a right pick, so a machine cannot spell out the answer.
+3. A wrong pick answers `no_match`. For one hour after it, every level 2 or 3 request from that machine is answered `held` without being shown.
+
+**What it guards against.** The request is already sealed to the phone, so the relay never sees `N` either way. Number match is not about the relay. It addresses approval fatigue and requests triggered from afar: malware on a paired machine, or a copied pairing key, sending `unseal` while the owner is elsewhere, hoping for a reflexive tap. Without the terminal in sight the chance of a right pick is one in three, and a wrong pick holds that machine for an hour.
+
+### Plan and plan signature
+
+`unseal` sends the plan the user confirmed at the terminal. The phone shows it, signs its hash, and hands out keys only for objects in it. The CLI refuses to act on any object outside it.
+
+```text
+plan text = "sealctl-plan-v1\n" ‖ b64u(M) ‖ "\n" ‖ one line per item, in plan order
+line      = k ‖ "\t" ‖ n ‖ "\t" ‖ p ‖ "\t" ‖ i ‖ "\n"        # p and i empty for a step with no key
+ph        = SHA256(plan text)                               # "h" = b64u(ph)
+psig      = Ed25519-Sign(phone identity, "sealctl/v1/plan" ‖ 0x00 ‖ id ‖ 0x00 ‖ M ‖ ph ‖ nb)
+            id = the request id that carried the last part; nb = not-before time, Unix ms, unsigned 64-bit big-endian
+```
+
+`plan` in the request:
+
+| Field | Meaning |
+| --- | --- |
+| `all` | `true` for `unseal --all` |
+| `h` | `b64u(ph)` over the whole plan |
+| `items` | `[{"k", "n", "p"?, "i"?}]`: kind (`secrets`, `secret`, `volume`, `backup`, `ssh`, `git`, `ai`, `services`, `local`, `pairing`), name as the terminal shows it, and the purpose and id of the key that step needs. Several items may name the same key (an SSH key needs the store key). Fields are at most 200 characters with no control characters; the phone refuses a plan that breaks this |
+| `n`, `i` | A plan that does not fit in one body is sent in `n` parts, `i` from 1. Every part carries `h`; the phone answers each part but the last at once with `{"ok": true, "part": i}`, rebuilds the plan text and checks `h` when the last part arrives. Only the last part carries `match` |
+
+The phone answers the last part, after the number match, the plan view and the biometric match, with `grant: "plan"`, `plan: {"h", "nb", "sig"}`, and keys for as many plan items as fit; `more: true` says keys remain. The machine asks for the rest with further `unseal` requests holding `plan: {"h"}` and `keys`, without `match`; the phone answers them without showing anything while the approval is valid: same machine, same `h`, from `nb` to `nb` + 30 minutes, every key named by a plan item (`outside_plan` otherwise, `plan_expired` after).
+
+The machine checks `sig` with `P` against its own `ph`, the request id and `nb`, refuses to start before `nb` by its own clock, and writes `h`, `nb` and `sig` into the run's `plan.json`. `nb` is the approval time, or one hour later when the phone is away from a trusted place (below).
+
+### Delayed approvals
+
+A level 3 approval away from a trusted place takes effect one hour later. At a trusted place there is no delay.
+
+- **From a machine (`unseal --all`).** The phone seals the reply as usual, with `nb` = now + 1 hour, and posts it with `"delay": 3600`. The relay holds it and tells the machine `{"type": "delayed", "id", "releaseAt"}`. The machine keeps its one-time key in memory, shows the time left, and fetches the reply once `releaseAt` passes. If the CLI stops during the hour, the approval is lost; running it again starts a new one.
+- **On the phone (Leave sealctl, showing the words, deleting the relay data).** The phone registers a delayed action with the relay and finishes it after `releaseAt`, only when the relay confirms it was not cancelled. Finishing asks for biometrics again.
+- **Announced** on every install of the phone (push) and on every paired machine: the relay's own `delayed` note, so an offline phone cannot hide it, and the phone's sealed `notice` message saying what and where.
+- **Cancellable** from the phone or any paired machine until it finishes (`sealctl cancel`). A cancelled `unseal --all` ends with `Cancelled from <where>.`; nothing was handed back.
+- A malicious relay could release a held reply early; the machine still refuses to act before `nb`, which the phone signed.
+
+The relay endpoints are in [Delayed approvals (planned)](#delayed-approvals-planned).
+
+### Hand-back report
+
+After `unseal`, before its pairing step, the machine sends a `report` with `handback`:
+
+| Field | Meaning |
+| --- | --- |
+| `h` | The plan hash it ran |
+| `items` | `[{"k", "n", "to", "s"}]`: the plan item, where its password or value went (`macOS Keychain, service sealctl-unsealed`, `1Password vault Private`, `~/.ssh/ed25519`, `shown once`), and `s` = `done`, `failed` or `skipped` |
+| `run` | The run folder, `~/.sealctl-unseal/2026-11-21T10-12-03` |
+
+The phone shows it and sends every other paired machine a `notice` with the counts and the stores. A report that does not fit is split as status reports are.
 
 ### Air-gapped variant (reserved)
 
@@ -436,10 +532,11 @@ Message body:
 | --- | --- |
 | `v`, `t` | Version, time |
 | `seq` | Increases by one with every message to this machine; the machine ignores a `seq` it has seen |
-| `type` | `lock`, `answers` or `ack` |
+| `type` | `lock`, `answers`, `ack` or `notice` |
 | `reason` | `lock`: `phone` (Lock tapped), `place` (the phone left the place), `words` (the words changed) |
 | `answers` | `answers`: this machine's remembered answers, at most 40 per message, `[{"a", "r", "n", "last"}]`; `"more": true` when another `answers` message follows. The machine replaces its list when the last part arrives |
 | `ack` | `ack`: the status `seq` the phone stored |
+| `notice` | `notice`: a level 3 action, for the machine to show: `{"what": "unseal_all" \| "leave" \| "words" \| "delete", "state": "pending" \| "cancelled" \| "done", "machine": <name of the machine it concerns, or null>, "delay": <delayed id, or null>, "at": <releaseAt, or null>, "report": {"done", "failed", "skipped", "to": [<stores>]} or null}` |
 
 A machine ignores a `lock` whose `t` is earlier than the start of its current session, so a lock held for an offline machine does not close tomorrow's session.
 
@@ -553,6 +650,11 @@ Errors always have the shape `{"error": "<code>", ...}`.
 | `GET /v1/phones/{phone}/status` **(planned)** | Phone | | `200 {"status": [{"machine", "sealed", "updated"}]}` |
 | `POST /v1/phones/{phone}/machines/{machine}/messages` **(planned)** | Phone | `{"sealed"}` | `200 {"delivered": <bool>}` |
 | `GET /v1/phones/{phone}/machines/{machine}/socket` **(planned)** | That machine, WebSocket | | `101`, see Machine channel |
+| `POST /v1/phones/{phone}/delayed` **(planned)** | Phone | `{"id", "delay"}` | `201 {"id", "releaseAt", "expires"}`, see Delayed approvals |
+| `GET /v1/phones/{phone}/delayed` **(planned)** | Phone or machine | | `200 {"delayed": [...]}` |
+| `GET /v1/phones/{phone}/delayed/{id}` **(planned)** | Phone or machine | | `200`, see Delayed approvals |
+| `POST /v1/phones/{phone}/delayed/{id}/cancel` **(planned)** | Phone or machine | | `200 {"cancelled": true}` |
+| `POST /v1/phones/{phone}/delayed/{id}/finish` **(planned)** | Phone | | `200 {"finished": true}` |
 
 Times (`created`, `expires`, `pairedAt`, `since`, `updated`) are Unix milliseconds.
 
@@ -585,6 +687,7 @@ Other messages to the machine, each followed by the socket closing:
 | Message | When |
 | --- | --- |
 | `{"type": "expired", "id"}` | The request passed its `expires` time |
+| `{"type": "delayed", "id", "releaseAt"}` **(planned)** | The phone approved with a delay; the machine fetches the reply from `GET .../delayed/{id}` after `releaseAt` (closes normally) |
 | `{"type": "error", "error": "bad_json"}` | The message was not JSON (close code 1007) |
 | `{"type": "error", "error": "bad_request"}` | Wrong type, id or sealed (1008) |
 | `{"type": "error", "error": "duplicate_id"}` | Another pending request has this id (1008) |
@@ -607,7 +710,9 @@ The phone learns about requests in two ways:
 
 The phone replies with `POST /v1/phones/{phone}/requests/{id}/reply` and `{"sealed"}` (at most 4,096 characters). Errors: `400 bad_id`, `400 bad_sealed`, `404 gone` when the request expired, was answered, or its machine disconnected. A delivered reply counts the current UTC day as a day with use.
 
-The approval path writes nothing to storage: a pending request lives in its WebSocket's attachment, which Cloudflare keeps through hibernation up to 16,384 bytes. The 4,096-character cap keeps it well inside that. If the machine disconnects, its request is gone and it asks again.
+**(planned)** The body may add `"delay": <seconds, 1 to 3,600>` for a level 3 approval away from a trusted place. The relay then stores the sealed reply as a delayed approval (below), sends the machine `{"type": "delayed", "id", "releaseAt"}` instead of the reply, closes its socket normally, and answers `200 {"delivered": true, "releaseAt"}`. Errors add `400 bad_delay` and `429 too_many_delayed`.
+
+The approval path writes nothing to storage: a pending request lives in its WebSocket's attachment, which Cloudflare keeps through hibernation up to 16,384 bytes. The 4,096-character cap keeps it well inside that. If the machine disconnects, its request is gone and it asks again. The one exception is a delayed approval, which must outlive any socket for up to an hour.
 
 ### Encrypted state
 
@@ -675,7 +780,7 @@ What a purchase grants:
 - `PUT /v1/phones/{phone}/push/{device}` registers or updates a token: `{"platform": "apns", "token": <hex>, "sandbox"?: <bool>}` or `{"platform": "fcm", "token": <string>}`. Errors: `400 bad_device`, `400 bad_platform`, `400 bad_token`.
 - `DELETE /v1/phones/{phone}/push/{device}` answers `404 unknown_device` for a device it does not know.
 - `POST /v1/phones/{phone}/push/{device}/test` sends a test push. Errors: `502 push_failed` with `{"reason", "removed"}` (`removed` is true when the provider said the token is dead and the relay dropped it), `503 push_not_configured`.
-- A push carries only the type, the request id and its expiry. The app fetches and opens the sealed request itself.
+- A push carries only the type, the request id and its expiry. The app fetches and opens the sealed request itself. Types: `request`, `test`, and `delayed` and `cancelled` for [delayed approvals](#delayed-approvals-planned), where the id is the delayed id and the expiry is `releaseAt`.
 
 ### Machine channel (planned)
 
@@ -687,9 +792,29 @@ Proposed by the phone app and needed for Open time left, the usage log and locki
 - The machine opens `GET /v1/phones/{phone}/machines/{machine}/socket` while its session is Open. The relay sends each held message as `{"type": "message", "sealed", "created"}`, then each new one as it arrives, and drops it once sent. The machine sends nothing but `ping`. The socket hibernates while idle. An unpaired or moved machine's socket closes with `unpaired` or `moved`.
 - A status update also wakes the phone's socket with `{"type": "status", "machine"}`; no push is sent for status.
 
+### Delayed approvals (planned)
+
+A level 3 approval away from a trusted place waits one hour (see [Delayed approvals](#delayed-approvals)). The relay holds it, announces it and lets anyone paired cancel it.
+
+**Why storage.** Normal approvals live only in a socket's attachment. A delayed one cannot: the machine's socket would have to survive an hour of sleep and network changes, a delay on the phone alone has no machine socket, and a cancel must work while the machine that asked is offline. So the Phone object stores one record per delayed approval, `delayed:<id>`, and deletes it when it is fetched, finished, cancelled-and-expired, or expired. The record holds `{machine or null, sealed or null, created, releaseAt, expires, cancelled?: {by, at}}`. `sealed` is the reply sealed to the machine's one-time key, which the relay cannot open. These are rare: a few in a person's use of sealctl.
+
+| Call | Who | Does |
+| --- | --- | --- |
+| Reply with `delay` | Phone | Creates the record with the request's `id` and `machine` and the sealed reply |
+| `POST .../delayed` with `{"id", "delay"}` | Phone | Creates a record with no machine and no sealed reply, for an action on the phone. `id` is 22 base64url characters made by the phone. `201 {"id", "releaseAt", "expires"}` |
+| `GET .../delayed` | Phone or any paired machine | `200 {"delayed": [{"id", "machine", "created", "releaseAt", "expires", "state"}]}`, `state` `waiting`, `released` or `cancelled` |
+| `GET .../delayed/{id}` | Phone or any paired machine | The same fields for one record. For the machine that asked, once `releaseAt` has passed and it is not cancelled, also `"sealed"`, and the record is then deleted. `404 gone` when there is no such record |
+| `POST .../delayed/{id}/cancel` | Phone or any paired machine | Drops `sealed`, sets `cancelled` `{by: "phone" or the machine key, at}`; the record stays as a tombstone until `expires`, so the machine that asked learns why. `200 {"cancelled": true}`; `404 gone`; `409 finished` |
+| `POST .../delayed/{id}/finish` | Phone | For a record with no machine: once `releaseAt` has passed and it is not cancelled, deletes it and answers `200 {"finished": true}`. `425 too_early` with `{"releaseAt"}`; `409 cancelled` with `{"by"}`; `404 gone` |
+
+- `delay` is 1 to 3,600 seconds; `releaseAt` = now + `delay`; `expires` = `releaseAt` + 900 seconds. A record past `expires` is deleted and answers `404 gone`.
+- At most 4 records per phone; a fifth answers `429 too_many_delayed`.
+- **Notes.** On create, the relay sends `{"type": "delayed", "id", "machine", "releaseAt"}` on every open phone socket and machine socket, and pushes `{"type": "delayed", "id", "expires": <releaseAt>}` to every push device. On cancel, `{"type": "cancelled", "id", "by"}` on the same sockets and a push with `"type": "cancelled"`. A machine socket that opens while records are pending gets one `delayed` note per record. The phone also sends each paired machine a sealed `notice` message.
+- Deleting the phone deletes its records.
+
 ### Deleting a phone (planned)
 
-- `DELETE /v1/phones/{phone}`, signed by the phone, deletes its machines, state, push devices, machine status and held messages, and pending requests, and answers `{"deleted": true, "machines": <count>}`. A licence record that is paid, moved or refunded stays (licence, Paddle transaction ids, seat codes), so a later restore from the words is still paid and a refund still finds the licence. Nothing else stays.
+- `DELETE /v1/phones/{phone}`, signed by the phone, deletes its machines, state, push devices, machine status and held messages, delayed approvals, and pending requests, and answers `{"deleted": true, "machines": <count>}`. A licence record that is paid, moved or refunded stays (licence, Paddle transaction ids, seat codes), so a later restore from the words is still paid and a refund still finds the licence. Nothing else stays.
 - A phone with no signed call for 730 days has its data deleted the same way.
 
 ### Changing words on the relay (planned)
@@ -723,6 +848,7 @@ The phone runs these steps in order, while it still holds the old root:
 | Data kept without a signed call from the phone **(planned)** | 730 days |
 | Sealed status, sealed machine message **(planned)** | 8,192 and 4,096 characters |
 | Machine messages held per machine **(planned)** | 16, for at most 24 hours |
+| Delayed approvals per phone **(planned)** | 4; delay 1 to 3,600 seconds; kept 900 seconds after `releaseAt` |
 
 ## Appendix A: test vectors
 
@@ -883,9 +1009,64 @@ Message body and sealed message:
 kSu_90aNYw5cu9GZEPGDWrc_5q3oVLjtofTLbfTN8DGaEIi_AfEwDUCI8zujYABAC_gTsQ8Hh1aI-6g1uEkEdy_khe2CNPX6W-w7_unQVcDu0VX9kJIUcsBWW7WTuQk6bclG0kSahBjH80qYRlz1rriC0P4D631TMgiV-i2HPBAKP7n7NZ-3J0GE4_tdqfA3FzVp64WTtdFim8C8o30P2DNTVNJJ9CJWCev_JA6trlQ
 ```
 
+### Unseal: number match and plan signature (machine above, phone B)
+
+A level 3 `unseal --all` request with `match`, its number, the plan hash and the plan signature, approved away from a trusted place (`nb` one hour after `t`). Keys as in Object keys above.
+
+| | Value |
+| --- | --- |
+| Request id (bytes `40` to `4f`) | `QEFCQ0RFRkdISUpLTE1OTw` |
+| One-time public key, `DeriveKeyPair(SHA256("sealctl test one-time key unseal"))` | `1xUvEc4lX4VSHgBQzZD2FNQuU94uqDrjxCTwSfbQ1nY` |
+| Request ephemeral input key material | `SHA256("sealctl test ephemeral unseal")` |
+| Request `enc` | `f3b45eb260fd1c2e2faa466a97ca1a20e64e56e91b0eb119c4f29b4e3eef445d` |
+| Request signature | `4b4c724d4fe34a4c5559fdc573095208e1130b4aecb8f101f7dab49ffc40ed2f7e7f4054b216f542848b14b7704fff035723016053377b610283174a8ef82c09` |
+| `HPKE-Export(…, "sealctl/v1/match", 4)` | `63aa18dd` |
+| Number `N` | `59` |
+| Plan hash `h` | `aQflz4JdVBW_hQrHlC9GlH0JOhJ1PSVy7VSUObEo7dE` |
+| `nb` | `1795258800000` (2026-11-21T11:00:00Z) |
+| Plan signature (hex) | `b28c6d717b373abc9561966486ee191538751c36b862a96e5a1e2f2849e8a1bc454d4c228a486bef211055bc6c430aabb01c63002f00bbe01513643a37d2c00f` |
+| Reply ephemeral input key material | `SHA256("sealctl test ephemeral unseal reply")` |
+| Reply signature | `3f3660007e9f2cc448c4cf99a8b33612a00beb326d5ed39ed5022b8e78810fe7ef920b913b752efa2ffdccbe4dd9d0f37705c171e6adba4b5cc27249a55d0405` |
+
+Plan text (exact bytes; `\t` is a tab, `\n` a newline):
+
+```text
+sealctl-plan-v1\n0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8\nsecrets\tstore\tsecrets\t0f8c6d2e-4b1a-4c3d-9e5f-7a6b8c9d0e1f\nvolume\tsafe\tvolume\tfa5a93d5-28d9-4c08-b608-c2b6f344b4d8\nssh\ted25519\tsecrets\t0f8c6d2e-4b1a-4c3d-9e5f-7a6b8c9d0e1f\ngit\tsigning\t\t\nai\tClaude Code\t\t\nservices\tdaemon\t\t\nlocal\t~/.config/sealctl\t\t\npairing\tdev@mbp.example.com\t\t\n
+```
+
+Signed plan message, hex (`"sealctl/v1/plan"`, `0x00`, id, `0x00`, `M`, `ph`, `nb`):
+
+```text
+7365616c63746c2f76312f706c616e005145464351305246526b64495355704c5445314f547700d05d4a10fc8a7664665de2af16df9eaa85a077f2a09596931af4c4dae622289f6907e5cf825d5415bf850ac7942f46947d093a12753d2572ed549439b128edd1000001a1fdc35780
+```
+
+Request body (exact bytes):
+
+```json
+{"v":1,"t":1795255200000,"why":"unseal","lvl":3,"ot":"1xUvEc4lX4VSHgBQzZD2FNQuU94uqDrjxCTwSfbQ1nY","match":true,"ctx":{"agent":null,"repo":null,"cmd":"sealctl unseal --all","cwd":"~","user":"dev@mbp.example.com","subject":{"k":"machine","n":"unseal"}},"plan":{"all":true,"h":"aQflz4JdVBW_hQrHlC9GlH0JOhJ1PSVy7VSUObEo7dE","items":[{"k":"secrets","n":"store","p":"secrets","i":"0f8c6d2e-4b1a-4c3d-9e5f-7a6b8c9d0e1f"},{"k":"volume","n":"safe","p":"volume","i":"fa5a93d5-28d9-4c08-b608-c2b6f344b4d8"},{"k":"ssh","n":"ed25519","p":"secrets","i":"0f8c6d2e-4b1a-4c3d-9e5f-7a6b8c9d0e1f"},{"k":"git","n":"signing"},{"k":"ai","n":"Claude Code"},{"k":"services","n":"daemon"},{"k":"local","n":"~/.config/sealctl"},{"k":"pairing","n":"dev@mbp.example.com"}]},"keys":[{"p":"secrets","i":"0f8c6d2e-4b1a-4c3d-9e5f-7a6b8c9d0e1f","w":"qHWf","c":"Je_Q_YPg3B0","o":{"k":"store","p":"~/.local/share/sealctl/store/0f8c6d2e-4b1a-4c3d-9e5f-7a6b8c9d0e1f","s":4096}},{"p":"volume","i":"fa5a93d5-28d9-4c08-b608-c2b6f344b4d8","w":"qHWf","c":"4lcdvKgJcu4","o":{"k":"volume","p":"/Volumes/safe","s":53687091200}}]}
+```
+
+Sealed request (1,596 characters):
+
+```text
+87ResmD9HC4vqkZql8oaIOZOVukbDrEZxPKbTj7vRF3kaEGSvN_4TMw_Z1hftawnwLsnwFHM40njkwVSEwknqh4gWOyZ2HUU8kWzTYxB8DbUD7Fl1Sk2JLAc-7JXIXMrn2SV30U9VkSxncwjaU4gUqii3tQ3QLSb3n6gzeVPrM7bjVpAXI-pAuCXwLyMAmmmPUtt_AdEyCUrtZP3rnv7_ymsTw2JkqidbyHwQu2H5vPBFHwx8MRzKOqisPssvwZuL2eJmReH_PYEV6t-F_lSJB0Wws6Cwnk502LhNQBpNTSXdTU2lQZBlZZy5V_4RQEgFBIPTybIuJNzvAK6J9WKvmHs5aGGk52zrjrfmWZmuOfKavmbBFggLx5kCcNWNCQcx3GQivlvamQCqHwbabItPbWIg_UxpKHdCBaW1zpsYmcmOmLEOZ6Tc-RobOkgVYMxgkSjsIEQhpZvNf38mtF-cBUGqwDZpx2Nv3j5OAj6U-h_zf1FTTcfIJ85NZfG7t514Wng4vgE5zmpXSCE_l02zYSfAVS56GH2z-jUxNZaChzvwdJNkPpE-AsOIr4zgaOG8NgV_JxNhWN0fsDi8pfSSwDOukG23Ghfv1sgpjVxtqBts3hgRd0C_9so13NOeo5Fef4Ix7BRFBjUtVoXRLNITMPSnTT0pssDhsuq67fCmVGq0hoMEzy0w2rB606v6nz3UTKLVG-mzKCf-59C1hWR1hBslLONrr-Q68wL3ATsH58sJu0Lh2Ro2RjqCoR94aWC1TggVh8BD9bKaRl5ZBTGhmc7hNYdlCsxrP1pPAEkUxbE5mpVmMHirv_BSGsluaE9WMhI5P20r3LNM6043GJMgEW1PX7R4xY00BpFDCzTgY8it90dW1Vki8xaRK2rF9mgrc-PwWUizpGM1lQcZZXgg0a-tBtj7Duk4Dsosg-VJrC4v6YwRuwXTIcte6ZX1KUs5DhEf_rehtdcCHb05hX0tIjVp1qZccC32jqojbB5TBnyqShd5cjOoVenH4ba5kKB1__mca25KRu2P3bJaKzGA4Ifp1T-C_21Y8fPX8r-IJzdde4lQpK7P4A0rbqOCOFQ4WnHdWphQXcebjam6UMFXA3MeU2m-O0X1Lya61lxGZYjbQEIT3aN2qrv5mRdGykTqPQaDSHjeNa3e6JMaVKRNsSmkguJ5x72_Ch07veR1rbmRda9mG7fPQJIfUAtBu4vABu1VvzMNEbO2Sh2_TMeM8HohTUO77od_XrLsKkHpr1DnAcfmqB6GsIRRoNDGJtousLonzkaX0kSwDMw6ya5h6EwyFmQUae1qZ8obAEPqALnmjn-ZE3RROfeAbS_lYqTe_J3CBCd1ESXjXWseJHjPvfhYGq07KbFOIqNSCP_gIV9OrI6FEpgFKV3bxAxoYiRKUBluYQBiVAtPXo5hG5DXr7_0eHmNxi9dibjaf7hXqhdc3AhktAo3zYXZfHFRcrsWf82rQmEKupeiG82kd0z6p04ONa-zT9ek7qAhNOzG9H7nvPjVeDZ6bwxyx0-bHhH7LIqEsjoGLWy3HC1ciCvVHA-StD_uA3-okmu6TY6gbVOc5wRQ8zRhfDTOjfk
+```
+
+Reply body (exact bytes):
+
+```json
+{"v":1,"rq":"yR1uZeiOV1x-Q9d78x3EG-iSHIYXlaxM095uVX8Onew","ok":true,"lvl":3,"w":"qHWf","grant":"plan","place":"other","plan":{"h":"aQflz4JdVBW_hQrHlC9GlH0JOhJ1PSVy7VSUObEo7dE","nb":1795258800000,"sig":"soxtcXs3OryVYZZkhu4ZFTh1HDa4YqluWh4vKEnoobxFTUwiikhr7yEQVbxsQwqrsBxjAC8Au-AVE2Q6N9LADw"},"keys":[{"p":"secrets","i":"0f8c6d2e-4b1a-4c3d-9e5f-7a6b8c9d0e1f","k":"Vnf7GRsE154BBQuSvXKQGQ"},{"p":"volume","i":"fa5a93d5-28d9-4c08-b608-c2b6f344b4d8","k":"Hl31XW79j8muie4UNL2b-g"}]}
+```
+
+Sealed reply (783 characters):
+
+```text
+bCPTCAyDny7lBfAus8xBlNL9nP75XyKxaLF6B2ITW0UuXD141Ko5av6SsOwBkFbhwYFsfvS7mOdXAlseoKnyD37RzBQfcwInlJHEveRnkPoyTAQATdd6jOUeLqAn-8q7oEJQ8QojoAxdn-iGgZ_28vhEMB7QwBsfAeH9bqfz1NIdsqw0VK72-2-ZqKow2-84oflZU2Tq2zmT8JwUe_61UOU_ub8rdzgbRnuu50ZMtuSNBNQu253cxtY2CG-xgoe0BkMdrc8uk0cR4Cn4ZCWv3wPql84M6AZLvj9Qu7VE0X3ZS9_0QNrvkPNly2s1Ob8ii_pP5liEM_2eppcOf7gXKSzX_MyiOsdbbVb5vOJg-NUpRhpkC9FXtUyiozt2e-pMO_V1wqZBVhjpnIlvQsf8muJiLwp7QXOSGjwKfj9EjGUyM-xK6Zb_0QNgOy--NC2FK_doySU-_LSZpY5OhVVNTVTV9qeCujKoTNoAlddcqVQsDyanTmO-4CiyqX-h5QyYR40M57GAiz23mFSRPtCTbcxgaNLnUAUcg8TXxupXP30cA77LsSeESX77kJlX-ecdaPq3MRzFh6OjViY3_VhSvVs8umaip7otFYfXjVNi1zxMyOMNXpQjTEzuuRfzSL_Ia4RAI1nz_DpU0t6ntBTQQVXa6uzpgG9sU6klWNd_5jYAmVUTxSvEWPtidPftQdp4ZmRNTixdx51XN231wg3JjnltflkFFXzKxNBiEsBHV-xRBZwSqeQiIy_gERlC-IHpxb2_5-W8LUOZUms
+```
+
 ## Appendix B: how the vectors were computed
 
-The vectors come from one Node.js script with no dependencies (Node 20 or later; run here with Node 24.22.1). It uses Node's `crypto` for SHA-256, HMAC, PBKDF2, Ed25519, X25519 and ChaCha20-Poly1305, and implements HKDF and HPKE in a few lines on top. Before computing anything it checks its HKDF against Node's `hkdfSync` and its HPKE against RFC 9180 Appendix A.2.1 (the ChaCha20Poly1305 suite, sequence 0). It checks the word list's SHA-256 against the published BIP39 English list, and every signature it makes is verified again. The relay signing vectors were also checked with WebCrypto (`crypto.subtle.verify` with Ed25519), as the relay verifies them.
+The vectors come from one Node.js script with no dependencies (Node 20 or later; run here with Node 24.22.1). It uses Node's `crypto` for SHA-256, HMAC, PBKDF2, Ed25519, X25519 and ChaCha20-Poly1305, and implements HKDF and HPKE in a few lines on top. Before computing anything it checks its HKDF against Node's `hkdfSync` and its HPKE against RFC 9180 Appendix A.2.1 (the ChaCha20Poly1305 suite, sequence 0, and its exported values, which the number match uses). It checks the word list's SHA-256 against the published BIP39 English list, and every signature it makes is verified again. The relay signing vectors were also checked with WebCrypto (`crypto.subtle.verify` with Ed25519), as the relay verifies them.
 
 Commands used:
 
@@ -962,18 +1143,26 @@ function keySchedule(ss, info) {
   const infoHash = lExtract(HPKE_ID, Buffer.alloc(0), "info_hash", info);
   const ksc = cat([0], pskId, infoHash);
   const secret = lExtract(HPKE_ID, ss, "secret", Buffer.alloc(0));
-  return { key: lExpand(HPKE_ID, secret, "key", ksc, 32), nonce: lExpand(HPKE_ID, secret, "base_nonce", ksc, 12) };
+  return {
+    key: lExpand(HPKE_ID, secret, "key", ksc, 32), nonce: lExpand(HPKE_ID, secret, "base_nonce", ksc, 12),
+    exp: lExpand(HPKE_ID, secret, "exp", ksc, 32),
+  };
 }
+// RFC 9180 section 5.3, secret export from a context
+const hpkeExport = (exp, ctx, L) => lExpand(HPKE_ID, exp, "sec", ctx, L);
 function hpkeSeal(pkR, info, aad, pt, ikmE) {
   const e = deriveKeyPair(ikmE); // fixed ephemeral for test vectors only; real senders use GenerateKeyPair
   const ss = eae(xDH(e.sk, pkR), cat(e.pk, pkR));
-  const { key, nonce } = keySchedule(ss, info);
-  return { enc: e.pk, ct: chachaSeal(key, nonce, aad, pt), ss };
+  const { key, nonce, exp } = keySchedule(ss, info);
+  return { enc: e.pk, ct: chachaSeal(key, nonce, aad, pt), ss, exp };
 }
 function hpkeOpen(skR, info, aad, enc, ct) {
   const ss = eae(xDH(skR, enc), cat(enc, xPub(skR)));
   const { key, nonce } = keySchedule(ss, info);
   return chachaOpen(key, nonce, aad, ct);
+}
+function hpkeOpenExport(skR, info, enc) {
+  return keySchedule(eae(xDH(skR, enc), cat(enc, xPub(skR))), info).exp;
 }
 // RFC 9180 A.2.1 check
 {
@@ -985,7 +1174,12 @@ function hpkeOpen(skR, info, aad, enc, ct) {
   if (H(s.enc) !== "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a") throw new Error("A.2.1 enc");
   if (H(s.ss) !== "0bbe78490412b4bbea4812666f7916932b828bba79942424abb65244930d69a7") throw new Error("A.2.1 shared_secret");
   if (H(s.ct) !== "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28") throw new Error("A.2.1 ct");
-  console.log("RFC 9180 A.2.1 sequence 0: OK");
+  if (H(s.exp) !== "a3b010d4994890e2c6968a36f64470d3c824c8f5029942feb11e7a74b2921922") throw new Error("A.2.1 exporter_secret");
+  const exported = [["", "4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e"],
+    ["00", "8c1df14732580e5501b00f82b10a1647b40713191b7c1240ac80e2b68808ba69"],
+    ["54657374436f6e74657874", "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53"]];
+  for (const [ctx, want] of exported) if (H(hpkeExport(s.exp, B(ctx), 32)) !== want) throw new Error("A.2.1 export " + ctx);
+  console.log("RFC 9180 A.2.1 sequence 0 and exported values: OK");
 }
 
 // ---------- BIP39 ----------
@@ -1203,6 +1397,78 @@ put("pair.link", link);
   const mraw = Buffer.from(sealedMsg, "base64url");
   const mpt = hpkeOpen(mBoxSk, U("sealctl/v1/message"), M, mraw.subarray(0, 32), mraw.subarray(32));
   if (!edVerify(pk.P, cat(U("sealctl/v1/message"), Z, M, mpt.subarray(64)), mpt.subarray(0, 64))) throw new Error("message verify");
+}
+
+// unseal --all: level 3 request with number match, plan hash, plan signature (machine above, phone B)
+{
+  const pk = phoneKeys(root);
+  const id = b64u(B("404142434445464748494a4b4c4d4e4f"));
+  const ot = deriveKeyPair(sha256(U("sealctl test one-time key unseal")));
+  const t = Date.UTC(2026, 10, 21, 10, 0, 0);
+  put("unseal.request.id", id);
+  put("unseal.onetime.public_b64u", b64u(ot.pk));
+  const items = [
+    { k: "secrets", n: "store", p: "secrets", i: STORE },
+    { k: "volume", n: "safe", p: "volume", i: VOL },
+    { k: "ssh", n: "ed25519", p: "secrets", i: STORE },
+    { k: "git", n: "signing" },
+    { k: "ai", n: "Claude Code" },
+    { k: "services", n: "daemon" },
+    { k: "local", n: "~/.config/sealctl" },
+    { k: "pairing", n: "dev@mbp.example.com" },
+  ];
+  for (const it of items) for (const f of [it.k, it.n, it.p ?? "", it.i ?? ""]) if (/[\x00-\x1f\x7f]/.test(f)) throw new Error("plan field");
+  const planText = "sealctl-plan-v1\n" + b64u(M) + "\n" + items.map((it) => `${it.k}\t${it.n}\t${it.p ?? ""}\t${it.i ?? ""}\n`).join("");
+  const ph = sha256(U(planText));
+  put("plan.text", JSON.stringify(planText));
+  put("plan.hash_b64u", b64u(ph));
+  const body = U(JSON.stringify({
+    v: 1, t, why: "unseal", lvl: 3, ot: b64u(ot.pk), match: true,
+    ctx: { agent: null, repo: null, cmd: "sealctl unseal --all", cwd: "~", user: "dev@mbp.example.com", subject: { k: "machine", n: "unseal" } },
+    plan: { all: true, h: b64u(ph), items },
+    keys: [
+      { p: "secrets", i: STORE, w: fingerprint(root), c: check(keys[`secrets:${STORE}`]), o: { k: "store", p: "~/.local/share/sealctl/store/" + STORE, s: 4096 } },
+      { p: "volume", i: VOL, w: fingerprint(root), c: check(keys[`volume:${VOL}`]), o: { k: "volume", p: "/Volumes/safe", s: 53687091200 } },
+    ],
+  }));
+  put("unseal.request.body", body.toString("utf8"));
+  const reqSig = edSign(mSeed, cat(U("sealctl/v1/request"), Z, U(id), Z, pk.P, body));
+  put("unseal.request.signature", H(reqSig));
+  const aad = cat(U(id), Z, M);
+  const r = hpkeSeal(pk.BX, U("sealctl/v1/request"), aad, cat(reqSig, body), sha256(U("sealctl test ephemeral unseal")));
+  const sealedReq = b64u(cat(r.enc, r.ct));
+  put("unseal.request.enc", H(r.enc));
+  put("unseal.request.sealed", sealedReq);
+  put("unseal.request.sealed_length", sealedReq.length);
+  // number match: both ends export the same 4 bytes from the request's HPKE context
+  const x = hpkeExport(r.exp, U("sealctl/v1/match"), 4);
+  if (!hpkeExport(hpkeOpenExport(pk.boxSk, U("sealctl/v1/request"), r.enc), U("sealctl/v1/match"), 4).equals(x)) throw new Error("match export");
+  put("match.export", H(x));
+  put("match.number", 10 + (x.readUInt32BE(0) % 90));
+  // plan signature: approved away from a trusted place, so not before t + 1 h
+  const nb = t + 3600000;
+  const nbBytes = Buffer.alloc(8); nbBytes.writeBigUInt64BE(BigInt(nb));
+  const planMsg = cat(U("sealctl/v1/plan"), Z, U(id), Z, M, ph, nbBytes);
+  const psig = edSign(pk.idSeed, planMsg);
+  if (!edVerify(pk.P, planMsg, psig)) throw new Error("plan sig");
+  put("plan.not_before", nb);
+  put("plan.message_hex", H(planMsg));
+  put("plan.signature", H(psig));
+  const rbody = U(JSON.stringify({
+    v: 1, rq: b64u(sha256(body)), ok: true, lvl: 3, w: fingerprint(root), grant: "plan", place: "other",
+    plan: { h: b64u(ph), nb, sig: b64u(psig) },
+    keys: [{ p: "secrets", i: STORE, k: b64u(keys[`secrets:${STORE}`]) }, { p: "volume", i: VOL, k: b64u(keys[`volume:${VOL}`]) }],
+  }));
+  put("unseal.reply.body", rbody.toString("utf8"));
+  const repSig = edSign(pk.idSeed, cat(U("sealctl/v1/reply"), Z, U(id), Z, M, rbody));
+  put("unseal.reply.signature", H(repSig));
+  const rr = hpkeSeal(ot.pk, U("sealctl/v1/reply"), aad, cat(repSig, rbody), sha256(U("sealctl test ephemeral unseal reply")));
+  const sealedRep = b64u(cat(rr.enc, rr.ct));
+  put("unseal.reply.sealed", sealedRep);
+  put("unseal.reply.sealed_length", sealedRep.length);
+  const rraw = Buffer.from(sealedRep, "base64url");
+  const rpt = hpkeOpen(ot.sk, U("sealctl/v1/reply"), aad, rraw.subarray(0, 32), rraw.subarray(32));
+  if (!edVerify(pk.P, cat(U("sealctl/v1/reply"), Z, U(id), Z, M, rpt.subarray(64)), rpt.subarray(0, 64))) throw new Error("unseal reply verify");
 }
 
 // root backup item (iCloud Keychain / Block Store), words B
