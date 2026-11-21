@@ -29,7 +29,7 @@
           '';
           meta = with pkgs.lib; {
             description = "Hardware-wallet backed encryption: volumes, backups, secrets, SSH";
-            homepage = "https://github.com/oleksiyp/sealctl";
+            homepage = "https://github.com/sealctl/sealctl";
             license = licenses.mit;
             mainProgram = "sealctl";
             platforms = platforms.unix;
