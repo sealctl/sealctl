@@ -28,13 +28,13 @@ them).
 
 | | |
 |---|---|
-| macOS / Linuxbrew | `brew install oleksiyp/tap/sealctl` |
-| Debian / Ubuntu | `sudo apt install ./sealctl_<version>_<arch>.deb` from [Releases](https://github.com/oleksiyp/sealctl/releases) |
+| macOS / Linuxbrew | `brew install sealctl/tap/sealctl` |
+| Debian / Ubuntu | `sudo apt install ./sealctl_<version>_<arch>.deb` from [Releases](https://github.com/sealctl/sealctl/releases) |
 | Fedora / RHEL 9 / Rocky | `sudo dnf install ./sealctl-<version>.<arch>.rpm` |
 | openSUSE | `sudo zypper install --allow-unsigned-rpm ./sealctl-<version>.<arch>.rpm` |
 | Arch Linux | `PKGBUILD` in each release (AUR: `sealctl-bin`) |
-| Nix | `nix run github:oleksiyp/sealctl` / `nix profile install github:oleksiyp/sealctl` |
-| From source | `cargo install --git https://github.com/oleksiyp/sealctl sealctl` |
+| Nix | `nix run github:sealctl/sealctl` / `nix profile install github:sealctl/sealctl` |
+| From source | `cargo install --git https://github.com/sealctl/sealctl sealctl` |
 
 Linux binaries are built on Rocky Linux 9 (glibc 2.34) for x86_64 and aarch64 and are
 install-tested on Debian 12/13, Ubuntu 22.04/24.04, Fedora, Rocky 9, openSUSE Tumbleweed and

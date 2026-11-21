@@ -8,7 +8,7 @@ sha() { cut -d' ' -f1 "$DIST/sealctl-$VERSION-$1.tar.gz.sha256"; }
 cat <<EOF
 class Sealctl < Formula
   desc "Hardware-wallet backed encryption: volumes, backups, secrets, SSH (Ledger OpenPGP)"
-  homepage "https://github.com/oleksiyp/sealctl"
+  homepage "https://github.com/sealctl/sealctl"
   version "$VERSION"
   license "MIT"
 
@@ -46,7 +46,7 @@ class Sealctl < Formula
   def caveats
     <<~EOS
       sealctl needs the OpenPGP app on your Ledger (Ledger Live → developer mode).
-      For Bluetooth, see https://github.com/oleksiyp/sealctl/blob/main/docs/bluetooth-app.md
+      For Bluetooth, see https://github.com/sealctl/sealctl/blob/main/docs/bluetooth-app.md
       Get started: sealctl setup --uid "Your Name <you@example.org>"
     EOS
   end

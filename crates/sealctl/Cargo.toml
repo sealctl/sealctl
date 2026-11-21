@@ -74,7 +74,7 @@ assets = [
 [package.metadata.generate-rpm]
 summary = "Hardware-wallet backed encryption: volumes, backups, secrets, SSH"
 license = "MIT"
-url = "https://github.com/oleksiyp/sealctl"
+url = "https://github.com/sealctl/sealctl"
 assets = [
     { source = "target/release/sealctl", dest = "/usr/bin/sealctl", mode = "755" },
     { source = "../../LICENSE", dest = "/usr/share/licenses/sealctl/LICENSE", mode = "644", doc = true },

@@ -172,9 +172,9 @@ key files anymore. Volumes from 0.1.0 convert with `sealctl volume rekey <name>`
 - Minimum supported Rust version is 1.89 (required by dependencies).
 - `sealctl status` is now the local overview; card details moved to `sealctl card`.
 
-[Unreleased]: https://github.com/oleksiyp/sealctl/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.5.0
-[0.4.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.4.0
-[0.3.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.3.0
-[0.2.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.2.0
-[0.1.0]: https://github.com/oleksiyp/sealctl/releases/tag/v0.1.0
+[Unreleased]: https://github.com/sealctl/sealctl/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sealctl/sealctl/releases/tag/v0.5.0
+[0.4.0]: https://github.com/sealctl/sealctl/releases/tag/v0.4.0
+[0.3.0]: https://github.com/sealctl/sealctl/releases/tag/v0.3.0
+[0.2.0]: https://github.com/sealctl/sealctl/releases/tag/v0.2.0
+[0.1.0]: https://github.com/sealctl/sealctl/releases/tag/v0.1.0
