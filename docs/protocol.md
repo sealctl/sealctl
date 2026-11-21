@@ -801,11 +801,11 @@ A level 3 approval away from a trusted place waits one hour (see [Delayed approv
 | Call | Who | Does |
 | --- | --- | --- |
 | Reply with `delay` | Phone | Creates the record with the request's `id` and `machine` and the sealed reply |
-| `POST .../delayed` with `{"id", "delay"}` | Phone | Creates a record with no machine and no sealed reply, for an action on the phone. `id` is 22 base64url characters made by the phone. `201 {"id", "releaseAt", "expires"}` |
+| `POST .../delayed` with `{"id", "delay"}` | Phone | Creates a record with no machine and no sealed reply, for an action on the phone. `id` is 22 base64url characters made by the phone (`400 bad_id`, `409 duplicate_id`). `201 {"id", "releaseAt", "expires"}`; `400 bad_delay`, `429 too_many_delayed` |
 | `GET .../delayed` | Phone or any paired machine | `200 {"delayed": [{"id", "machine", "created", "releaseAt", "expires", "state"}]}`, `state` `waiting`, `released` or `cancelled` |
 | `GET .../delayed/{id}` | Phone or any paired machine | The same fields for one record. For the machine that asked, once `releaseAt` has passed and it is not cancelled, also `"sealed"`, and the record is then deleted. `404 gone` when there is no such record |
-| `POST .../delayed/{id}/cancel` | Phone or any paired machine | Drops `sealed`, sets `cancelled` `{by: "phone" or the machine key, at}`; the record stays as a tombstone until `expires`, so the machine that asked learns why. `200 {"cancelled": true}`; `404 gone`; `409 finished` |
-| `POST .../delayed/{id}/finish` | Phone | For a record with no machine: once `releaseAt` has passed and it is not cancelled, deletes it and answers `200 {"finished": true}`. `425 too_early` with `{"releaseAt"}`; `409 cancelled` with `{"by"}`; `404 gone` |
+| `POST .../delayed/{id}/cancel` | Phone or any paired machine | Drops `sealed`, sets `cancelled` `{by: "phone" or the machine key, at}`; the record stays as a tombstone until `expires`, so the machine that asked learns why. `200 {"cancelled": true}`, also when already cancelled; `404 gone` when fetched, finished or expired |
+| `POST .../delayed/{id}/finish` | Phone | For a record with no machine: once `releaseAt` has passed and it is not cancelled, deletes it and answers `200 {"finished": true}`. `425 too_early` with `{"releaseAt"}`; `409 cancelled` with `{"by"}`; `400 bad_id` for a record that has a machine; `404 gone` |
 
 - `delay` is 1 to 3,600 seconds; `releaseAt` = now + `delay`; `expires` = `releaseAt` + 900 seconds. A record past `expires` is deleted and answers `404 gone`.
 - At most 4 records per phone; a fifth answers `429 too_many_delayed`.
