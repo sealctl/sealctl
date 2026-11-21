@@ -38,7 +38,7 @@ hkdf = "0.12"
 num-bigint = "0.4"
 curve25519-dalek = "4"
 bip39 = { version = "2", features = ["std", "zeroize"] }
-hmac = "0.12"
+hmac = "0.13"
 sha3 = "0.10"
 regex = "1"
 
