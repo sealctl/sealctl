@@ -35,7 +35,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config restic cryptsetup
+          sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config restic cryptsetup dbus gnome-keyring
       - name: macOS dependencies (restic)
         if: runner.os == 'macOS'
         run: brew install restic
@@ -45,10 +45,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked
       # Integration tests drive the real OS tools (hdiutil/diskutil, cryptsetup via sudo, restic)
-      # with a software OpenPGP key standing in for the Ledger.
+      # with a software OpenPGP key standing in for the Ledger. On the runners (never on a
+      # developer's machine) they may also install and remove sealctl's launchd / systemd
+      # services and use the login keychain.
       - run: cargo test --locked
         env:
           SEALCTL_TEST_SUDO: ${{ runner.os == 'Linux' && '1' || '' }}
+          SEALCTL_TEST_SERVICES: '1'
+          SEALCTL_TEST_KEYCHAIN: ${{ runner.os == 'macOS' && '1' || '' }}
+      # `sealctl unseal --to keychain` on Linux: the Secret Service of gnome-keyring in a
+      # private D-Bus session.
+      - name: Secret Service store (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dbus-run-session -- bash -c 'echo -n ci-keyring | gnome-keyring-daemon --unlock --components=secrets >/dev/null && cargo test --locked --test unseal_stores keychain'
+        env:
+          SEALCTL_TEST_KEYCHAIN: '1'
 
   msrv:
     runs-on: ubuntu-latest

@@ -30,3 +30,8 @@ env_logger = "0.11"
 lto = true
 codegen-units = 1
 strip = true
+
+# Crypto in dependencies (OpenPGP S2K, Argon2, scrypt) is very slow unoptimised; the
+# integration tests run it hundreds of times.
+[profile.dev.package."*"]
+opt-level = 2
