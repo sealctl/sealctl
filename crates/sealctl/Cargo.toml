@@ -34,7 +34,7 @@ signature = "2"
 hex = "0.4"
 serde_json = { version = "1", features = ["preserve_order"] }
 rpassword = "7"
-hkdf = "0.12"
+hkdf = "0.13"
 num-bigint = "0.4"
 curve25519-dalek = "4"
 bip39 = { version = "2", features = ["std", "zeroize"] }
