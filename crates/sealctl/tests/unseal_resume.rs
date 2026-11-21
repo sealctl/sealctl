@@ -264,6 +264,11 @@ fn full_run_hands_everything_back_and_leaks_nothing() {
             .arg(&repo)
             .args(args)
             .env_remove("SSH_AUTH_SOCK")
+            // a CI runner has no git identity of its own
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.org")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.org")
             .output()
             .unwrap()
     };
