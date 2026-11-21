@@ -67,34 +67,10 @@ fn backup_path(path: &Path) -> PathBuf {
 /// Atomic write that follows symlinks (dotfiles setups keep the link and update the real file)
 /// and keeps the file's permissions (new files: 0600 — settings may hold tokens).
 pub(crate) fn write_raw(path: &Path, v: &Value) -> Result<()> {
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mode = std::fs::metadata(&real).ok().map(|m| {
-        use std::os::unix::fs::PermissionsExt;
-        m.permissions().mode() & 0o7777
-    });
-    let tmp = real.with_file_name(format!(
-        ".{}.sealctl-tmp",
-        real.file_name().and_then(|n| n.to_str()).unwrap_or("settings")
-    ));
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode.unwrap_or(0o600))
-            .open(&tmp)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.write_all(format!("{}\n", serde_json::to_string_pretty(v)?).as_bytes())?;
-        f.sync_all()?;
-    }
-    if let Some(m) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m))?;
-    }
-    std::fs::rename(&tmp, &real)?;
-    Ok(())
+    // follows symlinks (dotfile setups), keeps the mode, durable (see crate::durable)
+    let text = format!("{}\n", serde_json::to_string_pretty(v)?);
+    crate::durable::replace_keeping_mode(path, text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Write JSON after removing our entries (uninstall). If nothing else is left in a file that
@@ -434,6 +410,54 @@ pub fn write_env_rules(id: &str, extra: &[String]) -> Result<Option<PathBuf>> {
             Ok(Some(path))
         }
         "gemini" => Ok(Some(tools::write_gemini_env_policy(extra)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Deny rules that keep agents out of `~/sealctl-unsealed-*`, where `sealctl unseal` writes
+/// passwords, secrets and keys in plain text. They stay after sealctl is gone.
+pub const UNSEALED_DENY: &[&str] = &["Read(~/sealctl-unsealed-*/**)", "Bash(*sealctl-unsealed-*)"];
+
+/// Tools on this machine that take [`UNSEALED_DENY`] (those with deny rules or policies),
+/// whether or not sealctl was installed in them.
+pub fn unsealed_rule_tools() -> Vec<&'static str> {
+    let mut v = vec![];
+    if claude::home().is_ok_and(|h| h.exists()) || crate::util::which("claude") {
+        v.push("claude");
+    }
+    if tools::qwen_detected() {
+        v.push("qwen");
+    }
+    if tools::gemini_detected() {
+        v.push("gemini");
+    }
+    v
+}
+
+/// The file `write_unsealed_rules` edits for a tool.
+pub fn unsealed_rules_file(id: &str) -> Option<PathBuf> {
+    match id {
+        "claude" | "qwen" => env_rules_file(id),
+        "gemini" => tools::gemini_unsealed_policy().ok(),
+        _ => None,
+    }
+}
+
+/// Add the rules that keep one tool's agents out of `~/sealctl-unsealed-*`.
+pub fn write_unsealed_rules(id: &str) -> Result<Option<PathBuf>> {
+    match id {
+        "claude" | "qwen" => {
+            let path = unsealed_rules_file(id).context("settings path")?;
+            let mut v = read_json(&path)?;
+            nested::strip_list(&mut v, &["permissions", "deny"], UNSEALED_DENY);
+            nested::add_list(&mut v, &["permissions", "deny"], UNSEALED_DENY);
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            write_raw(&path, &v)?;
+            Ok(Some(path))
+        }
+        "gemini" => Ok(Some(tools::write_gemini_unsealed_policy()?)),
         _ => Ok(None),
     }
 }

@@ -73,7 +73,8 @@ these inside an AI agent anyway; if the user needs a value themselves, they run
 
 ## Leaving sealctl
 
-`sealctl unseal` hands volumes, backups, SSH keys and secrets back under the user's own
-passwords and removes sealctl's settings. Never run it, not even with `--dry-run`: tell the
-user to run `sealctl unseal --all --dry-run` and then `sealctl unseal --all` in their own
-terminal.
+`sealctl unseal` hands volumes, backups, SSH keys and secrets back in plain form, into
+`~/sealctl-unsealed-<date>`, and removes sealctl's settings. Never run it, not even with
+`--dry-run`: tell the user to run `sealctl unseal --all --dry-run` and then `sealctl unseal --all`
+in their own terminal. Never read, list or search `~/sealctl-unsealed-*`: it holds passwords,
+secrets and keys in plain text.

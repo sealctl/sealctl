@@ -501,7 +501,6 @@ pub fn gemini_env_policy() -> Result<PathBuf> {
 /// Write [`gemini_env_policy`]; `extra` are more file paths to deny (the `--env-file`).
 pub fn write_gemini_env_policy(extra: &[String]) -> Result<PathBuf> {
     let path = gemini_env_policy()?;
-    std::fs::create_dir_all(path.parent().context("policies dir")?)?;
     // argsPattern is a regular expression over the tool call's JSON arguments
     let mut alts: Vec<String> = vec![
         r#"\.env(\.[A-Za-z0-9_-]+)?""#.into(),
@@ -511,21 +510,63 @@ pub fn write_gemini_env_policy(extra: &[String]) -> Result<PathBuf> {
         r"\.npmrc".into(),
     ];
     alts.extend(extra.iter().map(|e| regex::escape(e)));
-    let pattern = alts.join("|");
-    let toml_str = |s: &str| serde_json::to_string(s).expect("string");
-    let mut text = String::from(
+    write_gemini_policy(
+        &path,
         "# Written by `sealctl unseal` when sealctl was removed: keeps Gemini CLI from reading\n\
          # .env files and credential files. It does not need sealctl; delete it if you don't want it.\n",
-    );
-    for tool in ["read_file", "read_many_files"] {
+        &["read_file", "read_many_files"],
+        &format!("({})", alts.join("|")),
+        "This file holds credentials; it must not be read into the conversation.",
+    )?;
+    Ok(path)
+}
+
+/// Gemini CLI's policy that keeps it out of `~/sealctl-unsealed-*`.
+pub fn gemini_unsealed_policy() -> Result<PathBuf> {
+    Ok(gemini_home()?.join("policies").join("deny-sealctl-unsealed.toml"))
+}
+
+/// Write [`gemini_unsealed_policy`].
+pub fn write_gemini_unsealed_policy() -> Result<PathBuf> {
+    let path = gemini_unsealed_policy()?;
+    write_gemini_policy(
+        &path,
+        "# Written by `sealctl unseal`: ~/sealctl-unsealed-* holds passwords, secrets and keys in\n\
+         # plain text, which must not enter a conversation. Delete this file with that folder.\n",
+        &[
+            "read_file",
+            "read_many_files",
+            "glob",
+            "search_file_content",
+            "run_shell_command",
+        ],
+        "sealctl-unsealed-",
+        "This folder holds passwords and keys in plain text; it must not be read into the conversation.",
+    )?;
+    Ok(path)
+}
+
+/// A policy file of deny rules: each tool's calls whose JSON arguments match `pattern`.
+fn write_gemini_policy(
+    path: &std::path::Path,
+    header: &str,
+    tools: &[&str],
+    pattern: &str,
+    message: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(path.parent().context("policies dir")?)?;
+    let toml_str = |s: &str| serde_json::to_string(s).expect("string");
+    let mut text = String::from(header);
+    for tool in tools {
         text.push_str(&format!(
             "\n[[rule]]\ntoolName = \"{tool}\"\nargsPattern = {}\ndecision = \"deny\"\npriority = 900\n\
-             denyMessage = \"This file holds credentials; it must not be read into the conversation.\"\n",
-            toml_str(&format!("({pattern})"))
+             denyMessage = {}\n",
+            toml_str(pattern),
+            toml_str(message)
         ));
     }
-    std::fs::write(&path, text)?;
-    Ok(path)
+    std::fs::write(path, text)?;
+    Ok(())
 }
 
 // ---- skill-only tools with their own folders ----
