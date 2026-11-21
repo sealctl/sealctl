@@ -66,7 +66,7 @@ fn backup_path(path: &Path) -> PathBuf {
 
 /// Atomic write that follows symlinks (dotfiles setups keep the link and update the real file)
 /// and keeps the file's permissions (new files: 0600 — settings may hold tokens).
-fn write_raw(path: &Path, v: &Value) -> Result<()> {
+pub(crate) fn write_raw(path: &Path, v: &Value) -> Result<()> {
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mode = std::fs::metadata(&real).ok().map(|m| {
         use std::os::unix::fs::PermissionsExt;
@@ -208,6 +208,38 @@ fn claude_status() -> Result<Vec<String>> {
     ])
 }
 
+fn claude_installed() -> bool {
+    let Ok(home) = claude::home() else {
+        return false;
+    };
+    let settings = read_json(&home.join("settings.json")).unwrap_or(Value::Null);
+    let text = settings.to_string();
+    skill_installed(&home.join("skills"))
+        || text.contains(" hook claude")
+        || claude::DENY.iter().any(|d| {
+            settings["permissions"]["deny"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(*d)))
+        })
+}
+
+fn claude_files() -> Vec<PathBuf> {
+    claude::home()
+        .map(|h| {
+            vec![
+                h.join("settings.json"),
+                h.join("skills").join(SKILL_NAME).join("SKILL.md"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+fn skill_files(dir: fn() -> Result<PathBuf>) -> Vec<PathBuf> {
+    dir()
+        .map(|d| vec![d.join(SKILL_NAME).join("SKILL.md")])
+        .unwrap_or_default()
+}
+
 type Action = fn() -> Result<Vec<String>>;
 
 struct Tool {
@@ -217,6 +249,10 @@ struct Tool {
     install: Action,
     uninstall: Action,
     status: Action,
+    /// Something of ours is in place (skill, hooks, rules).
+    installed: fn() -> bool,
+    /// Files `uninstall` edits or removes.
+    files: fn() -> Vec<PathBuf>,
 }
 
 fn skill_only_install(dir: fn() -> Result<PathBuf>) -> Result<Vec<String>> {
@@ -248,6 +284,8 @@ fn tools() -> Vec<Tool> {
             install: claude_install,
             uninstall: claude_uninstall,
             status: claude_status,
+            installed: claude_installed,
+            files: claude_files,
         },
         Tool {
             name: "Shared skills folder ~/.agents/skills",
@@ -256,6 +294,8 @@ fn tools() -> Vec<Tool> {
             install: t::agents_install,
             uninstall: t::agents_uninstall,
             status: t::agents_status,
+            installed: || t::agents_skills().is_ok_and(|d| skill_installed(&d)),
+            files: || skill_files(t::agents_skills),
         },
         Tool {
             name: "Codex",
@@ -264,6 +304,8 @@ fn tools() -> Vec<Tool> {
             install: t::codex_install,
             uninstall: t::codex_uninstall,
             status: t::codex_status,
+            installed: t::codex_installed,
+            files: t::codex_files,
         },
         Tool {
             name: "Gemini CLI",
@@ -272,6 +314,8 @@ fn tools() -> Vec<Tool> {
             install: t::gemini_install,
             uninstall: t::gemini_uninstall,
             status: t::gemini_status,
+            installed: t::gemini_installed,
+            files: t::gemini_files,
         },
         Tool {
             name: "Qwen Code",
@@ -280,6 +324,8 @@ fn tools() -> Vec<Tool> {
             install: t::qwen_install,
             uninstall: t::qwen_uninstall,
             status: t::qwen_status,
+            installed: t::qwen_installed,
+            files: || t::qwen_settings().map(|p| vec![p]).unwrap_or_default(),
         },
         Tool {
             name: "GitHub Copilot CLI",
@@ -288,6 +334,8 @@ fn tools() -> Vec<Tool> {
             install: t::copilot_install,
             uninstall: t::copilot_uninstall,
             status: t::copilot_status,
+            installed: t::copilot_installed,
+            files: t::copilot_files,
         },
         Tool {
             name: "Cursor",
@@ -296,6 +344,8 @@ fn tools() -> Vec<Tool> {
             install: t::cursor_install,
             uninstall: t::cursor_uninstall,
             status: t::cursor_status,
+            installed: t::cursor_installed,
+            files: t::cursor_files,
         },
         Tool {
             name: "Antigravity CLI",
@@ -304,6 +354,8 @@ fn tools() -> Vec<Tool> {
             install: || skill_only_install(t::antigravity_skills),
             uninstall: || skill_only_uninstall(t::antigravity_skills),
             status: || skill_only_status(t::antigravity_skills),
+            installed: || t::antigravity_skills().is_ok_and(|d| skill_installed(&d)),
+            files: || skill_files(t::antigravity_skills),
         },
         Tool {
             name: "Kiro",
@@ -315,8 +367,97 @@ fn tools() -> Vec<Tool> {
             install: || skill_only_install(t::kiro_skills),
             uninstall: || skill_only_uninstall(t::kiro_skills),
             status: || skill_only_status(t::kiro_skills),
+            installed: || t::kiro_skills().is_ok_and(|d| skill_installed(&d)),
+            files: || skill_files(t::kiro_skills),
         },
     ]
+}
+
+/// Tools with something of sealctl's installed: `(id, name)`.
+pub fn installed() -> Vec<(&'static str, &'static str)> {
+    tools()
+        .into_iter()
+        .filter(|t| (t.installed)())
+        .map(|t| (t.id, t.name))
+        .collect()
+}
+
+/// The files `uninstall` edits or removes for these tools (existing ones only).
+pub fn files_of(ids: &[String]) -> Vec<PathBuf> {
+    tools()
+        .into_iter()
+        .filter(|t| ids.iter().any(|i| i == t.id))
+        .flat_map(|t| (t.files)())
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Deny rules that keep `.env` and credential files away from an agent, without sealctl.
+pub const ENV_DENY: &[&str] = &[
+    "Read(**/.env)",
+    "Read(**/.env.*)",
+    "Read(~/.aws/credentials)",
+    "Read(~/.netrc)",
+    "Read(~/.git-credentials)",
+    "Read(~/.npmrc)",
+];
+
+/// The file `write_env_rules` edits for a tool, or `None` when the tool has no such setting.
+pub fn env_rules_file(id: &str) -> Option<PathBuf> {
+    match id {
+        "claude" => claude::home().ok().map(|h| h.join("settings.json")),
+        "qwen" => tools::qwen_settings().ok(),
+        "gemini" => tools::gemini_env_policy().ok(),
+        _ => None,
+    }
+}
+
+/// Add the `.env` deny rules for one tool (`extra`: more files to deny, e.g. the `--env-file`
+/// of `sealctl unseal`). Returns the file written, or `None` when the tool has no such setting.
+pub fn write_env_rules(id: &str, extra: &[String]) -> Result<Option<PathBuf>> {
+    let rules: Vec<String> = ENV_DENY
+        .iter()
+        .map(|s| s.to_string())
+        .chain(extra.iter().map(|e| format!("Read({e})")))
+        .collect();
+    let refs: Vec<&str> = rules.iter().map(String::as_str).collect();
+    match id {
+        "claude" | "qwen" => {
+            let path = env_rules_file(id).context("settings path")?;
+            let mut v = read_json(&path)?;
+            nested::strip_list(&mut v, &["permissions", "deny"], &refs);
+            nested::add_list(&mut v, &["permissions", "deny"], &refs);
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            write_raw(&path, &v)?;
+            Ok(Some(path))
+        }
+        "gemini" => Ok(Some(tools::write_gemini_env_policy(extra)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Does an edited settings file still parse (JSON; TOML for `.toml`)?
+pub fn still_parses(path: &Path) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if path.extension().is_some_and(|e| e == "toml") {
+        toml::from_str::<toml::Value>(&text)
+            .with_context(|| format!("{} no longer parses", path.display()))?;
+    } else if path.extension().is_some_and(|e| e == "json") && !text.trim().is_empty() {
+        serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("{} no longer parses", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `(id, name)` of every tool sealctl knows.
+pub fn tool_names() -> Vec<(&'static str, &'static str)> {
+    tools().iter().map(|t| (t.id, t.name)).collect()
 }
 
 pub fn tool_ids() -> Vec<&'static str> {

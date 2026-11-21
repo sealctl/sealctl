@@ -128,6 +128,7 @@ pub fn codex_install() -> Result<Vec<String>> {
         r#"["sealctl", "secret", "get"]"#,
         r#"["sealctl", "ssh", "passphrase"]"#,
         r#"["sealctl", "recover"]"#,
+        r#"["sealctl", "unseal"]"#,
     ] {
         text.push_str(&format!(
             "prefix_rule(pattern={p}, decision=\"forbidden\", justification=\"sealctl: {WHY}\")\n"
@@ -211,7 +212,7 @@ pub fn gemini_install() -> Result<Vec<String>> {
             "# Added by sealctl — `sealctl ai uninstall gemini` removes this file.\n\
              [[rule]]\n\
              toolName = \"run_shell_command\"\n\
-             commandRegex = \"sealctl\\\\b.*\\\\b(secret\\\\s+get|ssh\\\\s+passphrase|recover)\\\\b\"\n\
+             commandRegex = \"sealctl\\\\b.*\\\\b(secret\\\\s+get|ssh\\\\s+passphrase|recover|unseal)\\\\b\"\n\
              decision = \"deny\"\n\
              priority = 900\n\
              denyMessage = \"sealctl: {WHY}\"\n"
@@ -439,6 +440,92 @@ pub fn cursor_status() -> Result<Vec<String>> {
         "hooks {}",
         yes(contains(&cursor_hooks()?, " hook cursor"))
     )])
+}
+
+// ---- what `sealctl unseal` needs: installed?, files touched, .env rules ----
+
+pub fn codex_installed() -> bool {
+    codex_home().is_ok_and(|d| {
+        contains(&d.join("hooks.json"), " hook codex") || d.join("rules").join("sealctl.rules").exists()
+    })
+}
+
+pub fn codex_files() -> Vec<PathBuf> {
+    codex_home()
+        .map(|d| vec![d.join("hooks.json"), d.join("rules").join("sealctl.rules")])
+        .unwrap_or_default()
+}
+
+pub fn gemini_installed() -> bool {
+    gemini_home().is_ok_and(|d| {
+        contains(&d.join("settings.json"), " hook gemini") || d.join("policies").join("sealctl.toml").exists()
+    })
+}
+
+pub fn gemini_files() -> Vec<PathBuf> {
+    gemini_home()
+        .map(|d| vec![d.join("settings.json"), d.join("policies").join("sealctl.toml")])
+        .unwrap_or_default()
+}
+
+pub fn qwen_settings() -> Result<PathBuf> {
+    Ok(qwen_home()?.join("settings.json"))
+}
+
+pub fn qwen_installed() -> bool {
+    qwen_settings().is_ok_and(|p| contains(&p, " hook qwen"))
+}
+
+pub fn copilot_installed() -> bool {
+    copilot_file().is_ok_and(|p| p.exists())
+}
+
+pub fn copilot_files() -> Vec<PathBuf> {
+    copilot_file().map(|p| vec![p]).unwrap_or_default()
+}
+
+pub fn cursor_installed() -> bool {
+    cursor_hooks().is_ok_and(|p| contains(&p, " hook cursor"))
+}
+
+pub fn cursor_files() -> Vec<PathBuf> {
+    cursor_hooks().map(|p| vec![p]).unwrap_or_default()
+}
+
+/// Gemini CLI: a policy file of its own that keeps `.env` and credential files out of reach.
+/// Written by `sealctl unseal`; it does not need sealctl.
+pub fn gemini_env_policy() -> Result<PathBuf> {
+    Ok(gemini_home()?.join("policies").join("deny-env-files.toml"))
+}
+
+/// Write [`gemini_env_policy`]; `extra` are more file paths to deny (the `--env-file`).
+pub fn write_gemini_env_policy(extra: &[String]) -> Result<PathBuf> {
+    let path = gemini_env_policy()?;
+    std::fs::create_dir_all(path.parent().context("policies dir")?)?;
+    // argsPattern is a regular expression over the tool call's JSON arguments
+    let mut alts: Vec<String> = vec![
+        r#"\.env(\.[A-Za-z0-9_-]+)?""#.into(),
+        r"\.aws/credentials".into(),
+        r"\.netrc".into(),
+        r"\.git-credentials".into(),
+        r"\.npmrc".into(),
+    ];
+    alts.extend(extra.iter().map(|e| regex::escape(e)));
+    let pattern = alts.join("|");
+    let toml_str = |s: &str| serde_json::to_string(s).expect("string");
+    let mut text = String::from(
+        "# Written by `sealctl unseal` when sealctl was removed: keeps Gemini CLI from reading\n\
+         # .env files and credential files. It does not need sealctl; delete it if you don't want it.\n",
+    );
+    for tool in ["read_file", "read_many_files"] {
+        text.push_str(&format!(
+            "\n[[rule]]\ntoolName = \"{tool}\"\nargsPattern = {}\ndecision = \"deny\"\npriority = 900\n\
+             denyMessage = \"This file holds credentials; it must not be read into the conversation.\"\n",
+            toml_str(&format!("({pattern})"))
+        ));
+    }
+    std::fs::write(&path, text)?;
+    Ok(path)
 }
 
 // ---- skill-only tools with their own folders ----

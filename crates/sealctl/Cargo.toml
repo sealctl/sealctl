@@ -12,7 +12,7 @@ keywords = ["openpgp", "ledger", "encryption", "smartcard", "cli"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
-sealctl-ledger = { path = "../sealctl-ledger", version = "0.5.0" }
+sealctl-ledger = { path = "../sealctl-ledger", version = "0.6.0" }
 anyhow.workspace = true
 log.workspace = true
 openpgp-card.workspace = true
@@ -41,8 +41,19 @@ bip39 = { version = "2", features = ["std", "zeroize"] }
 hmac = "0.12"
 sha3 = "0.10"
 regex = "1"
+# `sealctl unseal`: new passwords and secrets go to the OS keychain (macOS Keychain, Secret Service)
+keyring = { version = "3", features = ["apple-native", "sync-secret-service", "crypto-rust"] }
+# two passphrases on two file descriptors (cryptsetup luksAddKey, restic key add); FIFOs, signals
+libc = "0.2"
+
+[features]
+# Test-only switches for the `unseal` integration tests (kill at a step, no terminal needed).
+# Never enabled in release builds.
+test-hooks = []
 
 [dev-dependencies]
+# the integration tests drive the binary built with the test hooks
+sealctl = { path = ".", features = ["test-hooks"] }
 tempfile = "3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 

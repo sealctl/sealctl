@@ -131,13 +131,15 @@ enum Password {
     Pipe(Zeroizing<String>),
 }
 
-struct Repo {
+/// A restic repository with the password and storage credentials that open it.
+pub struct Repo {
     secrets: RepoSecrets,
     password: Password,
 }
 
 impl Repo {
-    fn from_unlocked(vol: &Volume) -> Result<Repo> {
+    /// Password and credentials from `<mount>/.sealctl/` of an unlocked volume.
+    pub fn from_unlocked(vol: &Volume) -> Result<Repo> {
         Ok(Repo {
             secrets: read_inner(vol)?,
             password: Password::File(inner_password_file(vol)),
@@ -146,7 +148,7 @@ impl Repo {
 
     /// Works while locked or lost too: the password is derived on the Ledger from the
     /// repository's key id; storage credentials come from the environment or a prompt.
-    fn open(oracle: &mut dyn Oracle, vol: &Volume) -> Result<Repo> {
+    pub fn open(oracle: &mut dyn Oracle, vol: &Volume) -> Result<Repo> {
         if vol.is_unlocked().unwrap_or(false) && inner_secrets_file(vol).exists() {
             return Self::from_unlocked(vol);
         }
@@ -158,7 +160,7 @@ impl Repo {
         Self::derived(oracle, &policy.repository, policy.password_id())
     }
 
-    fn derived(oracle: &mut dyn Oracle, repository: &str, key_id: &str) -> Result<Repo> {
+    pub fn derived(oracle: &mut dyn Oracle, repository: &str, key_id: &str) -> Result<Repo> {
         let password = derive::passphrase(oracle, Purpose::Restic, key_id)?;
         let env = collect_env(repository, &[])?;
         Ok(Repo {
@@ -171,25 +173,69 @@ impl Repo {
         })
     }
 
+    /// A repository from its URL, password and restic environment (storage credentials).
+    pub fn from_parts(repository: &str, password: &[u8], env: BTreeMap<String, String>) -> Result<Repo> {
+        let pw = Zeroizing::new(String::from_utf8(password.to_vec()).context("restic passwords are text")?);
+        Ok(Repo {
+            secrets: RepoSecrets {
+                repository: repository.to_string(),
+                password: pw.to_string(),
+                env,
+            },
+            password: Password::Pipe(pw),
+        })
+    }
+
+    /// The same repository and credentials, opened with another password.
+    pub fn with_password(&self, password: &[u8]) -> Result<Repo> {
+        let pw = Zeroizing::new(String::from_utf8(password.to_vec()).context("restic passwords are text")?);
+        Ok(Repo {
+            secrets: RepoSecrets {
+                repository: self.secrets.repository.clone(),
+                password: pw.to_string(),
+                env: self.secrets.env.clone(),
+            },
+            password: Password::Pipe(pw),
+        })
+    }
+
+    pub fn repository(&self) -> &str {
+        &self.secrets.repository
+    }
+
+    /// Storage credentials and other restic environment (values are secret).
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.secrets.env
+    }
+
+    /// The password this handle opens the repository with (secret).
+    pub fn password(&self) -> &str {
+        &self.secrets.password
+    }
+
+    /// Does this password open the repository? (`restic cat config`; no output.)
+    pub fn opens(&self) -> Result<bool> {
+        match self.probe()? {
+            Probe::Exists => Ok(true),
+            Probe::WrongPassword => Ok(false),
+            Probe::Missing => bail!("no restic repository at {}", self.secrets.repository),
+        }
+    }
+
+    /// Run restic with captured output, feeding the password and extra descriptors.
+    fn output(&self, args: &[&str], fds: &[(i32, &[u8])]) -> Result<std::process::Output> {
+        let mut c = self.command();
+        c.args(args);
+        let stdin: &[u8] = match &self.password {
+            Password::File(_) => b"",
+            Password::Pipe(pw) => pw.as_bytes(),
+        };
+        util::run_with_fds(&mut c, stdin, fds).context("starting restic")
+    }
+
     /// Does a repository exist at the URL, and does our password open it? (No output.)
     fn probe(&self) -> Result<Probe> {
-        let mut c = self.command();
-        c.args(["cat", "config"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let out = match &self.password {
-            Password::File(_) => c.stdin(Stdio::null()).output(),
-            Password::Pipe(pw) => {
-                let mut child = c.stdin(Stdio::piped()).spawn().context("starting restic")?;
-                {
-                    use std::io::Write;
-                    let mut i = child.stdin.take().context("stdin")?;
-                    i.write_all(pw.as_bytes())?;
-                }
-                child.wait_with_output()
-            }
-        }
-        .context("starting restic")?;
+        let out = self.output(&["cat", "config"], &[])?;
         if out.status.success() {
             return Ok(Probe::Exists);
         }
@@ -203,19 +249,14 @@ impl Repo {
         }
     }
 
-    /// The id of the restic key our password opens.
-    fn current_key(&self) -> Result<String> {
+    /// Ids of the repository's keys, and which one this password opens.
+    pub fn keys(&self) -> Result<Vec<(String, bool)>> {
         #[derive(serde::Deserialize)]
         struct Key {
             current: bool,
             id: String,
         }
-        let out = self
-            .command()
-            .args(["key", "list", "--json"])
-            .stdin(Stdio::null())
-            .output()
-            .context("starting restic")?;
+        let out = self.output(&["key", "list", "--json"], &[])?;
         if !out.status.success() {
             bail!(
                 "restic key list failed: {}",
@@ -223,10 +264,51 @@ impl Repo {
             );
         }
         let keys: Vec<Key> = serde_json::from_slice(&out.stdout).context("parsing restic key list")?;
-        keys.into_iter()
-            .find(|k| k.current)
-            .map(|k| k.id)
+        Ok(keys.into_iter().map(|k| (k.id, k.current)).collect())
+    }
+
+    /// The id of the restic key our password opens.
+    pub fn current_key(&self) -> Result<String> {
+        self.keys()?
+            .into_iter()
+            .find(|(_, current)| *current)
+            .map(|(id, _)| id)
             .context("restic did not mark a current key")
+    }
+
+    /// `restic key add` with the new password on descriptor 4 (no file); returns the new key's
+    /// id. `user`/`host` label the key in `restic key list`.
+    pub fn key_add(&self, new: &[u8], user: Option<&str>, host: Option<&str>) -> Result<String> {
+        let mut args = vec!["key", "add", "--new-password-file", "/dev/fd/4"];
+        if let Some(u) = user {
+            args.extend(["--user", u]);
+        }
+        if let Some(h) = host {
+            args.extend(["--host", h]);
+        }
+        let out = self.output(&args, &[(4, new)])?;
+        if !out.status.success() {
+            bail!(
+                "restic key add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        self.with_password(new)?.current_key()
+    }
+
+    /// `restic key remove <id>` (never the key this password opens).
+    pub fn key_remove(&self, id: &str) -> Result<()> {
+        if self.current_key()? == id {
+            bail!("refusing to remove the key this password opens");
+        }
+        let out = self.output(&["key", "remove", id], &[])?;
+        if !out.status.success() {
+            bail!(
+                "restic key remove failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     fn command(&self) -> Command {
@@ -274,6 +356,23 @@ impl Repo {
     }
 }
 
+/// Whether the volume holds backup settings in `<mount>/.sealctl/` (read while unlocked).
+pub fn has_inner(vol: &Volume) -> bool {
+    inner_secrets_file(vol).exists()
+}
+
+/// Remove `<mount>/.sealctl/` (the cached restic password and storage credentials) from an
+/// unlocked volume.
+pub fn forget_inner(vol: &Volume) -> Result<()> {
+    let dir = vol.inner_dir();
+    match fs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", dir.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Credentials restic needs for common backends, asked for when not given.
 fn needed_env(repo: &str) -> Vec<&'static str> {
     if repo.starts_with("s3:") {
@@ -288,7 +387,7 @@ fn needed_env(repo: &str) -> Vec<&'static str> {
 }
 
 /// Storage credentials: `--env` pairs, then the process environment, then a hidden prompt.
-fn collect_env(repository: &str, env_pairs: &[String]) -> Result<BTreeMap<String, String>> {
+pub(crate) fn collect_env(repository: &str, env_pairs: &[String]) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
     for p in env_pairs {
         let (k, v) = p
@@ -564,14 +663,8 @@ pub fn rekey(oracle: &mut dyn Oracle, vol_name: &str, key_id: Option<&str>) -> R
     let repo = Repo::from_unlocked(&vol)?;
     let old_key = repo.current_key()?;
     let new_password = derive::passphrase(oracle, Purpose::Restic, new_id)?;
-    let staged = vol.inner_dir().join("restic-password.new");
-    paths::write_private(&staged, new_password.as_bytes())?;
-    let added = repo.run(
-        &["key", "add", "--new-password-file", &staged.to_string_lossy()],
-        true,
-    );
-    let _ = fs::remove_file(&staged);
-    added?;
+    // the new password reaches restic on a pipe (descriptor 4), never in a file
+    repo.key_add(new_password.as_bytes(), None, None)?;
     let mut secrets = repo.secrets;
     secrets.password = new_password.to_string();
     write_inner(&vol, &secrets)?;

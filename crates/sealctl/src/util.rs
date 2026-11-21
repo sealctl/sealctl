@@ -261,3 +261,106 @@ impl Since {
         self.mono.elapsed().max(wall)
     }
 }
+
+/// Run `cmd` with `stdin_data` on stdin and each `(fd, data)` on its own pipe at descriptor
+/// `fd` (for example two passphrases: the old one on stdin, the new one on `/dev/fd/4`).
+/// Nothing goes through argv, the environment or a file.
+pub fn run_with_fds(
+    cmd: &mut Command,
+    stdin_data: &[u8],
+    fds: &[(i32, &[u8])],
+) -> Result<std::process::Output> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let name = format!("{:?}", cmd.get_program());
+    let mut readers = Vec::with_capacity(fds.len());
+    let mut writers = Vec::with_capacity(fds.len());
+    for (fd, data) in fds {
+        if *fd <= 2 {
+            bail!("descriptor {fd} is reserved for stdio");
+        }
+        let (r, w) = std::io::pipe().context("creating a pipe")?;
+        readers.push((*fd, r));
+        writers.push((w, *data));
+    }
+    let map: Vec<(i32, i32)> = readers.iter().map(|(fd, r)| (r.as_raw_fd(), *fd)).collect();
+    // SAFETY: only async-signal-safe calls (dup2) between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            for (src, dst) in &map {
+                if libc::dup2(*src, *dst) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting {name}"))?;
+    drop(readers); // the child holds its own copies
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let data: Vec<(std::io::PipeWriter, Zeroizing<Vec<u8>>)> = writers
+        .into_iter()
+        .map(|(w, d)| (w, Zeroizing::new(d.to_vec())))
+        .collect();
+    let feeder = std::thread::spawn(move || {
+        for (mut w, d) in data {
+            let _ = w.write_all(&d); // a program that doesn't read it fails on its own
+        }
+    });
+    let _ = stdin.write_all(stdin_data);
+    drop(stdin);
+    let out = child.wait_with_output()?;
+    let _ = feeder.join();
+    Ok(out)
+}
+
+/// Local date and time as `YYYY-MM-DDTHH-MM-SS` (file names) and RFC 3339 with offset.
+pub fn local_time() -> (String, String) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    // SAFETY: localtime_r writes only into `tm`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = !unsafe { libc::localtime_r(&now, &mut tm) }.is_null();
+    if !ok {
+        return ("1970-01-01T00-00-00".into(), "1970-01-01T00:00:00Z".into());
+    }
+    let (y, mo, d, h, mi, s) = (
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    );
+    let off = tm.tm_gmtoff / 60;
+    let sign = if off < 0 { '-' } else { '+' };
+    (
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}"),
+        format!(
+            "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}{sign}{:02}:{:02}",
+            off.abs() / 60,
+            off.abs() % 60
+        ),
+    )
+}
+
+/// `user@host` for this machine (display only).
+pub fn machine_name() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".into());
+    let host = Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".into());
+    format!("{user}@{}", host.trim_end_matches(".local"))
+}

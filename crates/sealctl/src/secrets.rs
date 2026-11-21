@@ -126,6 +126,32 @@ pub fn get_many(oracle: &mut dyn Oracle, names: &[&str]) -> Result<Vec<Zeroizing
         .collect()
 }
 
+/// Open `names` (every secret when `None`) with one store key: names and raw values, the values
+/// in buffers that are wiped on drop. For `sealctl unseal`.
+pub fn open_all(
+    oracle: &mut dyn Oracle,
+    names: Option<&[String]>,
+) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
+    let names: Vec<String> = match names {
+        Some(n) => n.to_vec(),
+        None => list()?,
+    };
+    if names.is_empty() {
+        return Ok(vec![]);
+    }
+    let dir = store_dir()?;
+    let pw = store_password(oracle)?;
+    names
+        .into_iter()
+        .map(|n| {
+            validate(&n)?;
+            let blob = fs::read(path_of(&dir, &n)).with_context(|| format!("secret {n} not found"))?;
+            let v = open(&pw, &blob).with_context(|| format!("opening secret {n}"))?;
+            Ok((n, v))
+        })
+        .collect()
+}
+
 pub fn get(oracle: &mut dyn Oracle, name: &str) -> Result<Zeroizing<String>> {
     Ok(get_many(oracle, &[name])?.pop().expect("one"))
 }

@@ -66,7 +66,14 @@ sealctl status             # Ledger, volumes, agent session — no secrets
 
 ## Never run
 
-`sealctl secret get`, `sealctl ssh passphrase`, `sealctl recover`, `printenv`/`env` dumps,
-`echo $SOME_KEY`, `cat .env`, `pbpaste`. sealctl refuses most of these inside an AI agent
-anyway; if the user needs a value themselves, they run `sealctl secret get <name> --clip` in
-their own terminal.
+`sealctl secret get`, `sealctl ssh passphrase`, `sealctl recover`, `sealctl unseal`,
+`printenv`/`env` dumps, `echo $SOME_KEY`, `cat .env`, `pbpaste`. sealctl refuses most of
+these inside an AI agent anyway; if the user needs a value themselves, they run
+`sealctl secret get <name> --clip` in their own terminal.
+
+## Leaving sealctl
+
+`sealctl unseal` hands volumes, backups, SSH keys and secrets back under the user's own
+passwords and removes sealctl's settings. Never run it, not even with `--dry-run`: tell the
+user to run `sealctl unseal --all --dry-run` and then `sealctl unseal --all` in their own
+terminal.

@@ -49,6 +49,32 @@ pub fn attached_mounts(path: &std::path::Path) -> Result<Vec<String>> {
     Ok(mounts)
 }
 
+/// Remove `<bundle>/sealctl.id` (when the bundle leaves sealctl).
+pub fn remove_id(v: &Volume) -> Result<()> {
+    let path = v.path.as_ref().context("sparsebundle needs a path")?;
+    match std::fs::remove_file(path.join(ID_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Is the image attached at all (mounted or not)? `hdiutil chpass` refuses an attached image,
+/// and `hdiutil attach` of an attached image succeeds with any passphrase.
+pub fn is_attached(v: &Volume) -> Result<bool> {
+    let path = v.path.as_ref().context("sparsebundle needs a path")?;
+    Ok(!attached_mounts(path)?.is_empty())
+}
+
+/// Devices of the image's `hdiutil attach` output (`/dev/diskN` first).
+fn attached_devices(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|d| d.starts_with("/dev/"))
+        .map(str::to_string)
+        .collect()
+}
+
 impl Backend for Sparsebundle {
     fn create(
         &self,
@@ -143,6 +169,41 @@ impl Backend for Sparsebundle {
             "hdiutil chpass",
         )?;
         Ok(())
+    }
+
+    /// `hdiutil attach -nomount -stdinpass`, then `hdiutil detach`. The image must be detached
+    /// (an attached image accepts any passphrase), so an attached one is an error.
+    fn verify(&self, v: &Volume, passphrase: &[u8]) -> Result<bool> {
+        let path = v.path.as_ref().context("sparsebundle needs a path")?;
+        if is_attached(v)? {
+            bail!("{} is attached; eject it first (hdiutil detach)", path.display());
+        }
+        let out = run_with_stdin(
+            crate::util::system_cmd("hdiutil")
+                .args(["attach", "-nomount", "-noverify", "-noautofsck", "-stdinpass"])
+                .arg(path),
+            passphrase,
+        )?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("Authentication error") || err.contains("authentication") {
+                return Ok(false);
+            }
+            bail!(
+                "hdiutil attach failed: {}",
+                err.trim().lines().last().unwrap_or("")
+            );
+        }
+        let devs = attached_devices(&String::from_utf8_lossy(&out.stdout));
+        if let Some(first) = devs.first() {
+            check(
+                crate::util::system_cmd("hdiutil")
+                    .args(["detach", "-quiet", first])
+                    .output()?,
+                "hdiutil detach",
+            )?;
+        }
+        Ok(true)
     }
 
     fn destroy(&self, v: &Volume) -> Result<()> {

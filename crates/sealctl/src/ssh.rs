@@ -150,6 +150,197 @@ pub fn import(oracle: &mut dyn Oracle, src: &Path, name: &str) -> Result<PathBuf
     Ok(path)
 }
 
+/// Hand an encrypted key file back as a standard OpenSSH key: decrypt `path` with its derived
+/// passphrase and write it to `dest` (0600) and `dest.pub` (0644), encrypted with `passphrase`
+/// (`None`: no passphrase), as `ssh-keygen` would. The written file is read back and must give
+/// the same public key. Returns that public key.
+pub fn export(
+    oracle: &mut dyn Oracle,
+    path: &Path,
+    dest: &Path,
+    passphrase: Option<&[u8]>,
+) -> Result<PublicKey> {
+    let key = unlock_file(oracle, path)?;
+    let public = key.public_key().clone();
+    let text = match passphrase {
+        Some(p) => key
+            .encrypt(&mut rand::rngs::OsRng, p)?
+            .to_openssh(LineEnding::LF)?,
+        None => key.to_openssh(LineEnding::LF)?,
+    };
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    paths::write_private(dest, text.as_bytes())?;
+    let pub_path = public_path(dest);
+    std::fs::write(&pub_path, format!("{}\n", public.to_openssh()?))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    if !opens_with(dest, passphrase, &public)? {
+        bail!("{} does not open again with its new passphrase", dest.display());
+    }
+    Ok(public)
+}
+
+/// `<key>.pub` next to a private key file.
+pub fn public_path(private: &Path) -> PathBuf {
+    let mut s = private.as_os_str().to_owned();
+    s.push(".pub");
+    PathBuf::from(s)
+}
+
+/// Does the OpenSSH key file at `path` open with `passphrase` and give `public`?
+pub fn opens_with(path: &Path, passphrase: Option<&[u8]>, public: &PublicKey) -> Result<bool> {
+    let text = Zeroizing::new(std::fs::read_to_string(path)?);
+    let key = PrivateKey::from_openssh(&*text)?;
+    let key = match (key.is_encrypted(), passphrase) {
+        (true, Some(p)) => match key.decrypt(p) {
+            Ok(k) => k,
+            Err(_) => return Ok(false),
+        },
+        (false, None) => key,
+        _ => return Ok(false),
+    };
+    Ok(key.public_key().key_data() == public.key_data())
+}
+
+/// Open a standard key file with its passphrase (for the checks of `sealctl unseal`).
+pub fn open_file(path: &Path, passphrase: Option<&[u8]>) -> Result<PrivateKey> {
+    let text = Zeroizing::new(std::fs::read_to_string(path)?);
+    let key = PrivateKey::from_openssh(&*text)?;
+    match passphrase {
+        Some(p) if key.is_encrypted() => key
+            .decrypt(p)
+            .with_context(|| format!("{} does not open with its passphrase", path.display())),
+        _ => Ok(key),
+    }
+}
+
+/// macOS: `ssh-add --apple-use-keychain <dest>` against the system agent (`agent_sock`), the
+/// passphrase handed over by the hidden `sealctl askpass` reading the FIFO `fifo` (never an
+/// argument or environment value). Without `keychain` the key is only added to the agent.
+pub fn ssh_add_keychain(
+    dest: &Path,
+    passphrase: Option<&[u8]>,
+    agent_sock: &Path,
+    fifo_dir: &Path,
+    keychain: bool,
+) -> Result<()> {
+    let mut cmd = std::process::Command::new("ssh-add");
+    if keychain {
+        cmd.arg("--apple-use-keychain");
+    }
+    cmd.arg(dest)
+        .env("SSH_AUTH_SOCK", agent_sock)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let feeder = match passphrase {
+        None => None,
+        Some(p) => {
+            let fifo = fifo_dir.join("askpass.fifo");
+            let _ = std::fs::remove_file(&fifo);
+            let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())?;
+            // SAFETY: mkfifo with a valid NUL-terminated path.
+            if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+                bail!("mkfifo {}: {}", fifo.display(), std::io::Error::last_os_error());
+            }
+            // SSH_ASKPASS is one program run as `<program> <prompt>`: a wrapper adds `askpass`
+            let wrapper = fifo_dir.join("askpass.sh");
+            let exe = crate::util::stable_exe()?;
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nexec '{}' askpass \"$@\"\n",
+                    exe.to_string_lossy().replace('\'', r"'\''")
+                ),
+            )?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+            }
+            cmd.env("SSH_ASKPASS", &wrapper)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env(
+                    "DISPLAY",
+                    std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
+                )
+                .env("SEALCTL_ASKPASS_FD", &fifo);
+            let data = Zeroizing::new(p.to_vec());
+            let f2 = fifo.clone();
+            Some((
+                fifo,
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    // blocks until askpass opens the FIFO; ssh-add asks only once
+                    if let Ok(mut w) = std::fs::OpenOptions::new().write(true).open(&f2) {
+                        let _ = w.write_all(&data);
+                    }
+                }),
+            ))
+        }
+    };
+    let out = cmd.output().context("running ssh-add")?;
+    if let Some((fifo, t)) = feeder {
+        if !t.is_finished() {
+            // unblock the writer if askpass never ran
+            let _ = std::fs::OpenOptions::new().read(true).open(&fifo);
+        }
+        let _ = t.join();
+        let _ = std::fs::remove_file(&fifo);
+    }
+    if !out.status.success() {
+        bail!("ssh-add failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// `sealctl askpass`: print the passphrase waiting in the FIFO (or inherited descriptor) named
+/// by `SEALCTL_ASKPASS_FD` to stdout, for `ssh-add`. Reads it once.
+pub fn askpass() -> Result<()> {
+    use std::io::{Read, Write};
+    let src = std::env::var("SEALCTL_ASKPASS_FD").context("SEALCTL_ASKPASS_FD is not set")?;
+    let mut buf = Zeroizing::new(Vec::new());
+    if let Ok(fd) = src.parse::<i32>() {
+        if fd <= 2 {
+            bail!("SEALCTL_ASKPASS_FD must name a pipe");
+        }
+        use std::os::fd::FromRawFd;
+        // SAFETY: the descriptor was inherited for this purpose and is used once.
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        f.read_to_end(&mut buf)?;
+    } else {
+        let p = Path::new(&src);
+        use std::os::unix::fs::FileTypeExt;
+        if !std::fs::metadata(p)?.file_type().is_fifo() {
+            bail!("{} is not a pipe", p.display());
+        }
+        std::fs::File::open(p)?.read_to_end(&mut buf)?;
+    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(&buf)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Fingerprints (SHA256) of the keys an agent holds (`ssh-add -l`).
+pub fn agent_fingerprints(agent_sock: &Path) -> Vec<String> {
+    std::process::Command::new("ssh-add")
+        .arg("-l")
+        .env("SSH_AUTH_SOCK", agent_sock)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Forget decrypted keys in the running agent (`ssh-add -D`).
 pub fn forget() -> bool {
     let Ok(sock) = socket_path() else {

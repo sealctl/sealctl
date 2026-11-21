@@ -49,6 +49,68 @@ fn change(uuid: &str, old: &[u8], new: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The UUID of the volume's "Disk User" (the passphrase user diskutil creates), which
+/// `unlockVolume -verify` needs; the volume UUID when it can't be listed.
+fn disk_user(uuid: &str) -> String {
+    let out = crate::util::system_cmd("diskutil")
+        .args(["apfs", "listCryptoUsers", uuid])
+        .output();
+    let Ok(out) = out else {
+        return uuid.to_string();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut last_uuid: Option<String> = None;
+    for l in text.lines() {
+        let t = l.trim().trim_start_matches(['+', '-', ' ', '|']);
+        if t.len() == 36 && t.chars().filter(|c| *c == '-').count() == 4 {
+            last_uuid = Some(t.to_string());
+        } else if t.starts_with("Type:") && t.contains("Disk User") {
+            if let Some(u) = last_uuid.take() {
+                return u;
+            }
+        }
+    }
+    uuid.to_string()
+}
+
+/// `diskutil apfs unlockVolume <uuid> -user <disk user> -verify -stdinpassphrase`: checks the
+/// passphrase without mounting; works on a locked and on a mounted volume.
+pub fn verify(uuid: &str, passphrase: &[u8]) -> Result<bool> {
+    let user = disk_user(uuid);
+    let out = run_with_stdin(
+        crate::util::system_cmd("diskutil").args([
+            "apfs",
+            "unlockVolume",
+            uuid,
+            "-user",
+            &user,
+            "-verify",
+            "-stdinpassphrase",
+        ]),
+        passphrase,
+    )?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains("not valid") || text.contains("incorrect") || text.contains("-69749") {
+        return Ok(false);
+    }
+    bail!(
+        "diskutil apfs unlockVolume -verify failed: {}",
+        text.trim().lines().last().unwrap_or("")
+    )
+}
+
+/// Switch the passphrase of an APFS volume (one step; locked or mounted).
+pub fn change_passphrase(uuid: &str, old: &[u8], new: &[u8]) -> Result<()> {
+    change(uuid, old, new)
+}
+
 impl Backend for ApfsVolume {
     fn create(
         &self,
@@ -141,6 +203,10 @@ impl Backend for ApfsVolume {
 
     fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()> {
         change(&v.id, old, new)
+    }
+
+    fn verify(&self, v: &Volume, passphrase: &[u8]) -> Result<bool> {
+        verify(&v.id, passphrase)
     }
 
     fn destroy(&self, v: &Volume) -> Result<()> {

@@ -47,6 +47,10 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
                 "the SSH key passphrase must not enter the conversation; the user runs this in their own terminal.",
             ),
             (
+                r"\bsealctl\b[^|;&]*\bunseal\b",
+                "`sealctl unseal` hands keys back under new passwords and removes sealctl; only the user runs it, in their own terminal. Tell the user to run it.",
+            ),
+            (
                 r"\bsealctl\b[^|;&]*\brecover\b",
                 "`sealctl recover` asks for the 24-word recovery phrase — only the user runs it, in their own terminal.",
             ),
@@ -253,6 +257,9 @@ mod tests {
             "cd x && sealctl -t ble secret get k",
             "sealctl ssh passphrase",
             "sealctl recover",
+            "sealctl unseal --all",
+            "sealctl unseal --all --dry-run",
+            "sealctl unseal volume safe",
             "printenv",
             "env | grep KEY",
             "echo $OPENAI_API_KEY",

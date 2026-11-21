@@ -144,6 +144,13 @@ pub fn install(s: &Service) -> Result<()> {
 }
 
 pub fn uninstall(label: &str) -> Result<()> {
+    remove(label)?;
+    println!("removed {label}");
+    Ok(())
+}
+
+/// Stop and remove a service without printing.
+pub fn remove(label: &str) -> Result<()> {
     if cfg!(target_os = "macos") {
         let p = plist_path(label)?;
         let _ = crate::util::system_cmd("launchctl")
@@ -163,8 +170,71 @@ pub fn uninstall(label: &str) -> Result<()> {
             .args(["--user", "daemon-reload"])
             .output();
     }
-    println!("removed {label}");
     Ok(())
+}
+
+/// Prefix of every sealctl service label.
+pub const LABEL_PREFIX: &str = "io.github.oleksiyp.sealctl.";
+
+/// sealctl's services whose files are in this user's home: launchd plists
+/// `~/Library/LaunchAgents/io.github.oleksiyp.sealctl.*.plist` (macOS), systemd user units
+/// `~/.config/systemd/user/sealctl-*.{service,timer}` (Linux). Labels, sorted.
+pub fn installed_labels() -> Result<Vec<String>> {
+    let mut out = vec![];
+    if cfg!(target_os = "macos") {
+        if let Ok(rd) = fs::read_dir(home()?.join("Library/LaunchAgents")) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if let Some(l) = n.strip_suffix(".plist") {
+                    if l.starts_with(LABEL_PREFIX) {
+                        out.push(l.to_string());
+                    }
+                }
+            }
+        }
+    } else if let Ok(rd) = fs::read_dir(home()?.join(".config/systemd/user")) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let stem = n.strip_suffix(".service").or_else(|| n.strip_suffix(".timer"));
+            if let Some(suffix) = stem.and_then(|s| s.strip_prefix("sealctl-")) {
+                out.push(format!("{LABEL_PREFIX}{suffix}"));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Are the service's files still in place (plist or unit files)?
+pub fn files_present(label: &str) -> bool {
+    if cfg!(target_os = "macos") {
+        plist_path(label).is_ok_and(|p| p.exists())
+    } else {
+        let name = unit_name(label);
+        home().is_ok_and(|h| {
+            let d = h.join(".config/systemd/user");
+            d.join(format!("{name}.service")).exists() || d.join(format!("{name}.timer")).exists()
+        })
+    }
+}
+
+/// The service's files (for copies before they are removed).
+pub fn files_of(label: &str) -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        plist_path(label).map(|p| vec![p]).unwrap_or_default()
+    } else {
+        let name = unit_name(label);
+        home()
+            .map(|h| {
+                let d = h.join(".config/systemd/user");
+                vec![d.join(format!("{name}.service")), d.join(format!("{name}.timer"))]
+            })
+            .unwrap_or_default()
+    }
+    .into_iter()
+    .filter(|p| p.exists())
+    .collect()
 }
 
 pub fn is_installed(label: &str) -> bool {

@@ -25,6 +25,7 @@ pub const DENY: &[&str] = &[
     "Bash(sealctl secret get *)",
     "Bash(sealctl ssh passphrase *)",
     "Bash(sealctl recover *)",
+    "Bash(sealctl unseal *)",
 ];
 
 const MARKER: &str = " hook claude";

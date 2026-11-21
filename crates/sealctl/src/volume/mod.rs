@@ -129,6 +129,9 @@ pub trait Backend {
     fn lock(&self, v: &Volume, force: bool) -> Result<()>;
     fn is_unlocked(&self, v: &Volume) -> Result<bool>;
     fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()>;
+    /// Does `passphrase` open the volume? Changes nothing: the volume stays mounted or locked
+    /// as it is. `Ok(false)` means "wrong passphrase"; errors mean the check could not run.
+    fn verify(&self, v: &Volume, passphrase: &[u8]) -> Result<bool>;
     /// Permanently delete the encrypted data.
     fn destroy(&self, v: &Volume) -> Result<()>;
 }

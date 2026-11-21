@@ -142,8 +142,20 @@ impl Backend for Luks {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    fn change_passphrase(&self, _v: &Volume, _old: &[u8], _new: &[u8]) -> Result<()> {
-        bail!("changing a LUKS passphrase in place is not supported yet")
+    /// Add `new` in a free key slot, then remove the slot `old` opens.
+    fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()> {
+        let path = v.path.as_ref().context("luks needs a path")?;
+        let old_slot = slot_of(path, old)?.context("the old passphrase opens no key slot")?;
+        add_key(path, old, new)?;
+        match slot_of(path, new)? {
+            Some(n) if n != old_slot => kill_slot(path, old_slot, new),
+            _ => bail!("the new passphrase does not open its own key slot; nothing removed"),
+        }
+    }
+
+    fn verify(&self, v: &Volume, passphrase: &[u8]) -> Result<bool> {
+        let path = v.path.as_ref().context("luks needs a path")?;
+        Ok(slot_of(path, passphrase)?.is_some())
     }
 
     fn destroy(&self, v: &Volume) -> Result<()> {
@@ -218,6 +230,76 @@ impl Backend for Luks {
     fn is_unlocked(&self, v: &Volume) -> Result<bool> {
         Ok(is_mounted(&v.mountpoint)? || mapper_open(v))
     }
+}
+
+/// `cryptsetup luksAddKey --key-file /dev/fd/3 <file> /dev/fd/4`: `existing` opens a slot,
+/// `new` goes into a free one. Both passphrases travel on pipes.
+pub fn add_key(file: &Path, existing: &[u8], new: &[u8]) -> Result<()> {
+    check(
+        crate::util::run_with_fds(
+            crate::util::system_cmd("cryptsetup")
+                .args(["luksAddKey", "--batch-mode", "--key-file", "/dev/fd/3"])
+                .arg(file)
+                .arg("/dev/fd/4"),
+            b"",
+            &[(3, existing), (4, new)],
+        )?,
+        "cryptsetup luksAddKey",
+    )?;
+    Ok(())
+}
+
+/// The key slot `passphrase` opens (`cryptsetup open --test-passphrase -v`: "Key slot N
+/// unlocked."), or `None` when it opens none.
+pub fn slot_of(file: &Path, passphrase: &[u8]) -> Result<Option<u32>> {
+    let out = run_with_stdin(
+        crate::util::system_cmd("cryptsetup")
+            .args(["open", "--test-passphrase", "-v", "--key-file=-"])
+            .arg(file),
+        passphrase,
+    )?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        let slot = text.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("Key slot ")
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|n| n.parse::<u32>().ok())
+        });
+        return slot
+            .map(Some)
+            .context("cryptsetup did not say which key slot opened");
+    }
+    // exit 2: no key available with this passphrase
+    if out.status.code() == Some(2) || text.contains("No key available") {
+        return Ok(None);
+    }
+    bail!(
+        "cryptsetup open --test-passphrase failed: {}",
+        text.trim().lines().last().unwrap_or("")
+    )
+}
+
+/// `cryptsetup luksKillSlot <file> N`, authorised by a passphrase of another slot on stdin.
+pub fn kill_slot(file: &Path, slot: u32, remaining: &[u8]) -> Result<()> {
+    if slot_of(file, remaining)? == Some(slot) {
+        bail!("refusing to remove key slot {slot}: it is the one that would remain");
+    }
+    check(
+        run_with_stdin(
+            crate::util::system_cmd("cryptsetup")
+                .args(["luksKillSlot", "--key-file=-"])
+                .arg(file)
+                .arg(slot.to_string()),
+            remaining,
+        )?,
+        "cryptsetup luksKillSlot",
+    )?;
+    Ok(())
 }
 
 fn users_uid() -> String {
