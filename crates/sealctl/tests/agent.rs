@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use sealctl::agent::{self, AgentClient, Limits};
+use sealctl::agent::{self, AgentClient, AgentSession, Limits};
 use sealctl::Ctx;
 use sealctl_ledger::Select;
 
@@ -96,4 +96,23 @@ fn agent_session_lifecycle() {
         start.elapsed() < Duration::from_secs(6),
         "exited at max lifetime despite activity"
     );
+
+    // 4. a session whose connection the agent dropped connects again (unseal 0.6.0 failed
+    //    with "Broken pipe" when restic kept it silent past the agent's 30 s client limit)
+    let limits = Limits {
+        idle: Duration::from_secs(60),
+        max_life: Duration::from_secs(3600),
+    };
+    let h = std::thread::spawn(move || agent::run(ctx(), limits));
+    drop(wait_for_agent());
+    let mut session = AgentSession::open(&ctx(), limits).unwrap();
+    session.status().unwrap();
+    assert!(agent::stop().unwrap());
+    h.join().unwrap().unwrap();
+    let h = std::thread::spawn(move || agent::run(ctx(), limits));
+    drop(wait_for_agent());
+    let (cached, _, _) = session.status().expect("reconnected to the new agent");
+    assert_eq!(cached, 0);
+    assert!(agent::stop().unwrap());
+    h.join().unwrap().unwrap();
 }

@@ -323,7 +323,13 @@ impl AgentClient {
         self.writer.write_all(format!("{line}\n").as_bytes())?;
         // replies carry derived values: keep them in buffers that are wiped on drop
         let mut resp = Zeroizing::new(String::new());
-        self.reader.read_line(&mut resp)?;
+        if self.reader.read_line(&mut resp)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the agent closed the connection",
+            )
+            .into());
+        }
         let resp = resp.trim_end();
         match resp.strip_prefix("OK") {
             Some(rest) => Ok(Zeroizing::new(rest.trim().to_string())),
@@ -424,7 +430,65 @@ pub fn oracle(ctx: &Ctx) -> Result<Box<dyn Oracle>> {
             card: None,
         }));
     }
-    Ok(Box::new(connect_or_spawn(ctx, Limits::from_env())?))
+    Ok(Box::new(AgentSession::open(ctx, Limits::from_env())?))
+}
+
+/// A connection to the agent that survives the agent dropping it. The agent closes a client
+/// that stays silent for [`CLIENT_SILENCE`], and a session can end between two requests;
+/// a long command (unseal waiting on restic or diskutil) then connects again (starting an
+/// agent if needed) and repeats the request once. Requests are idempotent.
+pub struct AgentSession {
+    ctx: Ctx,
+    limits: Limits,
+    client: AgentClient,
+}
+
+impl AgentSession {
+    pub fn open(ctx: &Ctx, limits: Limits) -> Result<Self> {
+        Ok(Self {
+            ctx: *ctx,
+            limits,
+            client: connect_or_spawn(ctx, limits)?,
+        })
+    }
+
+    fn with_retry<T>(&mut self, f: impl Fn(&mut AgentClient) -> Result<T>) -> Result<T> {
+        match f(&mut self.client) {
+            Err(e) if disconnected(&e) => {
+                log::info!("agent connection lost ({e:#}); connecting again");
+                self.client = connect_or_spawn(&self.ctx, self.limits)?;
+                f(&mut self.client)
+            }
+            r => r,
+        }
+    }
+
+    /// (cached results, idle seconds left, lifetime seconds left)
+    pub fn status(&mut self) -> Result<(usize, u64, u64)> {
+        self.with_retry(|c| c.status())
+    }
+}
+
+impl Oracle for AgentSession {
+    fn x25519(&mut self, u: &[u8; 32]) -> Result<[u8; 32]> {
+        self.with_retry(|c| c.x25519(u))
+    }
+}
+
+/// Did the request fail because the connection is gone (rather than an answer from the agent)?
+fn disconnected(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    if e.to_string().starts_with("agent session ended") {
+        return true;
+    }
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | UnexpectedEof
+            )
+        })
+    })
 }
 
 /// Direct device access, connecting on first use.

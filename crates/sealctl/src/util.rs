@@ -29,7 +29,12 @@ pub fn run_with_stdin(cmd: &mut Command, stdin_data: &[u8]) -> Result<std::proce
         .with_context(|| format!("starting {name}"))?;
     {
         let mut stdin = child.stdin.take().context("stdin")?;
-        stdin.write_all(stdin_data)?;
+        // a program that exits before reading (bad arguments, refused) says why in its
+        // output: report that rather than the broken pipe
+        match stdin.write_all(stdin_data) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            r => r?,
+        }
     }
     let out = child.wait_with_output()?;
     Ok(out)
@@ -38,14 +43,14 @@ pub fn run_with_stdin(cmd: &mut Command, stdin_data: &[u8]) -> Result<std::proce
 /// Run `cmd` and fail with its stderr when it exits non-zero.
 pub fn check(out: std::process::Output, what: &str) -> Result<std::process::Output> {
     if !out.status.success() {
-        bail!(
-            "{what} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-                .trim()
-                .lines()
-                .last()
-                .unwrap_or("")
-        );
+        // diskutil and others print their errors on stdout
+        let err = String::from_utf8_lossy(&out.stderr);
+        let text = if err.trim().is_empty() {
+            String::from_utf8_lossy(&out.stdout)
+        } else {
+            err
+        };
+        bail!("{what} failed: {}", text.trim().lines().last().unwrap_or(""));
     }
     Ok(out)
 }
