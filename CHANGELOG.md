@@ -6,6 +6,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-21
+
+The last release that reads the Ledger. It adds one command, to leave it.
+
+### Added
+
+- `sealctl unseal <object>` and `sealctl unseal --all`: hand secrets, volumes (APFS, sparse
+  bundle, LUKS), restic backups, SSH keys, git signing and AI integrations back under passwords
+  of your own, then remove sealctl's services and settings. Volumes and backups stay
+  encrypted. The plan is shown first (`--dry-run` only shows it; `--all` starts only when you
+  type `unseal`); each object is opened with the new password, read back from where it was
+  stored, before sealctl's key or key slot is removed; every step is journaled in
+  `~/.sealctl-unseal/<run>/` so a stopped run continues with `--resume`; every edited file is
+  copied there first and the old store and key files are kept there, still encrypted. New
+  passwords go to the macOS Keychain / Secret Service (default), 1Password (`--to op`),
+  Bitwarden (`--to bw`) or are shown once (`--to show`); secrets can also go to a 0600 `.env`
+  file (`--secrets-to env`). `--words` takes the keys from the Ledger's 24 words. The run ends
+  with a hand-back list (`handback.json`, no passwords) for `sealctl seal --from` in 0.7, and
+  names the command that removes the program; it never runs it. Refused inside AI agents and
+  without a terminal. See docs/unseal.md.
+- `sealctl status` says how to leave the Ledger; `status` and `doctor` report an unfinished
+  unseal run.
+
+### Changed
+
+- LUKS volumes can change their passphrase (`luksAddKey`, then the old slot is removed).
+- `sealctl backup rekey` passes the new restic password on a pipe instead of a file inside
+  the volume.
+- AI integrations: agents may not run `sealctl unseal` (deny rule, policy, Codex rule, Gemini
+  policy, skill text). Re-run `sealctl ai install` to update them.
+
 ## [0.5.0] - 2026-11-18
 
 ### Changed
@@ -172,7 +203,8 @@ key files anymore. Volumes from 0.1.0 convert with `sealctl volume rekey <name>`
 - Minimum supported Rust version is 1.89 (required by dependencies).
 - `sealctl status` is now the local overview; card details moved to `sealctl card`.
 
-[Unreleased]: https://github.com/sealctl/sealctl/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/sealctl/sealctl/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/sealctl/sealctl/releases/tag/v0.6.0
 [0.5.0]: https://github.com/sealctl/sealctl/releases/tag/v0.5.0
 [0.4.0]: https://github.com/sealctl/sealctl/releases/tag/v0.4.0
 [0.3.0]: https://github.com/sealctl/sealctl/releases/tag/v0.3.0

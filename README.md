@@ -165,7 +165,25 @@ enter it about once per session.
 | `secret set\|get\|ls\|rm\|import-env`, `run` | API keys and project environments |
 | `ssh keygen\|pubkey\|passphrase\|agent\|install\|uninstall`, `git setup` | SSH and commit signing |
 | `encrypt`, `decrypt` | OpenPGP files |
+| `unseal <object>\|--all\|--resume` | leave sealctl: everything back under your own passwords |
 | `completions <shell>` | shell completions |
+
+## Leaving sealctl
+
+`sealctl unseal` hands everything back under passwords of your own: volumes and backups **stay
+encrypted** and open with your own passphrase, SSH keys become standard key files, secrets go
+to your password manager, and sealctl's services, settings and AI hooks are removed. New
+passwords go to the macOS Keychain (or the Secret Service) by default, or to 1Password,
+Bitwarden, or shown once (`--to op|bw|show`).
+
+```sh
+sealctl unseal --all --dry-run     # the plan; changes nothing
+sealctl unseal --all               # type "unseal" to start; resumable with --resume
+```
+
+Every object is opened with the new password before sealctl's key is removed, every step is
+journaled, and every edited file is copied first. Release 0.6.0 is the last one that reads the
+Ledger: to move to sealctl 0.7, unseal with 0.6.0 first. Details: [docs/unseal.md](docs/unseal.md).
 
 ## Recovery
 
@@ -177,7 +195,7 @@ The derivation is specified in [docs/derived-keys.md](docs/derived-keys.md).
 
 ## Documentation
 
-[Derived keys](docs/derived-keys.md) · [Design](docs/design.md) · [Threat model](docs/threat-model.md) ·
+[Derived keys](docs/derived-keys.md) · [Leaving sealctl](docs/unseal.md) · [Design](docs/design.md) · [Threat model](docs/threat-model.md) ·
 [Bluetooth app](docs/bluetooth-app.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## License

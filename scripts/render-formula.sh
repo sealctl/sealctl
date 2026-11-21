@@ -48,6 +48,7 @@ class Sealctl < Formula
       sealctl needs the OpenPGP app on your Ledger (Ledger Live → developer mode).
       For Bluetooth, see https://github.com/sealctl/sealctl/blob/main/docs/bluetooth-app.md
       Get started: sealctl setup --uid "Your Name <you@example.org>"
+      To leave the Ledger: sealctl unseal --all
     EOS
   end
 
