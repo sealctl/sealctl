@@ -60,29 +60,10 @@ pub fn ensure_private_dir(p: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Write a file readable only by the user (atomic replace).
+/// Write a file readable only by the user: atomic replace, durable (data and directory entry
+/// `fsync`ed), see [`crate::durable`].
 pub fn write_private(p: &std::path::Path, data: &[u8]) -> Result<()> {
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = p.with_extension("tmp~");
-    {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts
-            .open(&tmp)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.write_all(data)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, p).with_context(|| format!("writing {}", p.display()))?;
-    Ok(())
+    crate::durable::write_atomic(p, data, 0o600)
 }
 
 /// `~/.ssh` (or `$SEALCTL_SSH_DIR`): where `sealctl ssh keygen` puts encrypted key files.

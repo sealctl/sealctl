@@ -173,11 +173,7 @@ pub fn export(
     }
     paths::write_private(dest, text.as_bytes())?;
     let pub_path = public_path(dest);
-    std::fs::write(&pub_path, format!("{}\n", public.to_openssh()?))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644))?;
-    }
+    crate::durable::write_atomic(&pub_path, format!("{}\n", public.to_openssh()?).as_bytes(), 0o644)?;
     if !opens_with(dest, passphrase, &public)? {
         bail!("{} does not open again with its new passphrase", dest.display());
     }

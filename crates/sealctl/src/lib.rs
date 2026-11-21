@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod derive;
 pub mod device;
 pub mod doctor;
+pub mod durable;
 pub mod git;
 pub mod guard;
 pub mod kit;
