@@ -172,6 +172,13 @@ pub fn overview() -> Result<()> {
     };
     println!("SSH agent: {}", svc(crate::ssh::AGENT_LABEL));
     println!("Schedule:  {}", svc(crate::backup::SCHEDULE_LABEL));
+    if let Some(run) = crate::unseal::unfinished_run() {
+        println!(
+            "Unseal:    unfinished run in {} — continue with `sealctl unseal --resume`",
+            crate::unseal::tilde(&run)
+        );
+    }
+    println!("Leaving the Ledger: sealctl unseal --all");
     Ok(())
 }
 

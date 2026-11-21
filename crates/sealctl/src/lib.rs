@@ -25,6 +25,7 @@ pub mod secrets;
 pub mod service;
 pub mod setup;
 pub mod ssh;
+pub mod unseal;
 pub mod util;
 pub mod volume;
 

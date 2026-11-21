@@ -14,6 +14,17 @@ pub fn run(ctx: &Ctx, full: bool) -> Result<()> {
         ok &= good;
     };
 
+    // 0. A `sealctl unseal` run that stopped part way.
+    if let Some(run) = crate::unseal::unfinished_run() {
+        report(
+            false,
+            format!(
+                "an unseal run stopped part way ({}) — continue it with `sealctl unseal --resume`",
+                crate::unseal::tilde(&run)
+            ),
+        );
+    }
+
     // 1. Certificate on disk.
     let cert = match cert::own() {
         Ok(c) => {

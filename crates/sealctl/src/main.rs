@@ -172,12 +172,83 @@ enum Cmd {
         idle: u64,
     },
 
+    /// Leave sealctl: hand volumes, backups, SSH keys, secrets, git signing and AI settings
+    /// back under passwords of your own (shows the plan first; `--dry-run` only shows it).
+    Unseal(UnsealArgs),
+
+    /// (internal) SSH_ASKPASS helper for `unseal`: prints the passphrase waiting in the pipe
+    /// named by SEALCTL_ASKPASS_FD.
+    #[command(hide = true)]
+    Askpass {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
+
     /// List Ledger devices on USB and Bluetooth.
     Devices,
     /// Show the OpenPGP card state on the device.
     Card,
     /// Print shell completions.
     Completions { shell: clap_complete::Shell },
+}
+
+#[derive(clap::Args)]
+#[command(
+    after_help = "Objects: secrets | secret <name> | volume <name> | backup <volume> | ssh <name> | git | ai [TOOL...]\n\
+Your volumes and backups stay encrypted; they will open with your own passwords. See docs/unseal.md."
+)]
+struct UnsealArgs {
+    /// What to hand back (see below); or --all.
+    #[arg(value_name = "OBJECT")]
+    object: Vec<String>,
+    /// Everything sealctl holds on this machine, then sealctl's settings, services and AI hooks.
+    #[arg(long, conflicts_with = "resume")]
+    all: bool,
+    /// Continue the newest unfinished run.
+    #[arg(long)]
+    resume: bool,
+    /// Where new passwords go (default: the keychain).
+    #[arg(long, value_enum)]
+    to: Option<sealctl::unseal::store::StoreKind>,
+    /// Where secrets and backup storage credentials go (default: same as --to).
+    #[arg(long, value_enum)]
+    secrets_to: Option<sealctl::unseal::store::StoreKind>,
+    /// The file for --secrets-to env (default ~/sealctl-secrets.env, mode 0600).
+    #[arg(long)]
+    env_file: Option<PathBuf>,
+    /// 1Password vault for --to op.
+    #[arg(long)]
+    op_vault: Option<String>,
+    /// Bitwarden folder for --to bw.
+    #[arg(long)]
+    bw_folder: Option<String>,
+    /// Type each new password (twice, 12+ characters) instead of generating it.
+    #[arg(long)]
+    type_passwords: bool,
+    /// Write SSH keys without a passphrase.
+    #[arg(long)]
+    no_ssh_passphrase: bool,
+    /// Keep rules that stop AI agents reading .env files (asked otherwise).
+    #[arg(long, conflicts_with = "drop_env_rules")]
+    keep_env_rules: bool,
+    /// Leave no .env rules behind.
+    #[arg(long)]
+    drop_env_rules: bool,
+    /// Leave one object out, e.g. --skip backup/safe (repeatable).
+    #[arg(long, value_name = "KIND/NAME")]
+    skip: Vec<String>,
+    /// Keys from the Ledger's 24 words instead of the device (only if it is lost or broken).
+    #[arg(long)]
+    words: bool,
+    /// Show the plan and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Print the plan (with --dry-run) as JSON on stdout.
+    #[arg(long)]
+    json: bool,
+    /// Leave the secret store folder in place.
+    #[arg(long)]
+    keep_store: bool,
 }
 
 #[derive(Subcommand)]
@@ -457,10 +528,42 @@ fn main() {
     .format_timestamp(None)
     .init();
 
+    let unseal = matches!(cli.cmd, Cmd::Unseal(_));
     if let Err(e) = real_main(cli) {
+        if unseal {
+            // `sealctl unseal` has its own exit codes (2, 8–11, 13) and plain messages
+            let code = sealctl::unseal::exit_code(&e).unwrap_or(1);
+            eprintln!("{e:#}");
+            std::process::exit(code);
+        }
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// `sealctl unseal` is run by a person at a terminal: stdin and stderr must be terminals, and
+/// never inside an AI agent (exit 8).
+fn unseal_allowed() -> Result<()> {
+    use std::io::IsTerminal;
+    if let Some(agent) = sealctl::guard::ai_agent() {
+        return Err(sealctl::unseal::exit(
+            8,
+            format!(
+                "refusing to run sealctl unseal inside {agent}: it hands your keys back. Run it yourself in a terminal."
+            ),
+        ));
+    }
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("SEALCTL_TEST_ASSUME_TTY").is_some() {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err(sealctl::unseal::exit(
+            8,
+            "sealctl unseal needs a person at a terminal (stdin and stderr must be a terminal)",
+        ));
+    }
+    Ok(())
 }
 
 fn transport_args(cli: &Cli) -> Vec<String> {
@@ -892,6 +995,42 @@ fn real_main(cli: Cli) -> Result<()> {
         Cmd::Doctor { full } => doctor::run(&ctx, full),
         Cmd::Kit(KitCmd::Export { dir }) => kit::export(&dir),
         Cmd::Kit(KitCmd::Import { dir }) => kit::import(&dir),
+        Cmd::Unseal(a) => {
+            unseal_allowed()?;
+            let target = if a.object.is_empty() {
+                None
+            } else {
+                Some(sealctl::unseal::parse_target(&a.object)?)
+            };
+            sealctl::unseal::run(
+                sealctl::unseal::Options {
+                    all: a.all,
+                    target,
+                    resume: a.resume,
+                    to: a.to,
+                    secrets_to: a.secrets_to,
+                    env_file: a.env_file,
+                    op_vault: a.op_vault,
+                    bw_folder: a.bw_folder,
+                    type_passwords: a.type_passwords,
+                    no_ssh_passphrase: a.no_ssh_passphrase,
+                    env_rules: if a.keep_env_rules {
+                        Some(true)
+                    } else if a.drop_env_rules {
+                        Some(false)
+                    } else {
+                        None
+                    },
+                    skip: a.skip,
+                    words: a.words,
+                    dry_run: a.dry_run,
+                    json: a.json,
+                    keep_store: a.keep_store,
+                },
+                ctx,
+            )
+        }
+        Cmd::Askpass { prompt: _ } => ssh::askpass(),
         Cmd::Devices => card::devices(ctx.select, ctx.scan),
         Cmd::Card => card::status(&ctx),
         Cmd::Completions { shell } => {
