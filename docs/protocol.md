@@ -1074,10 +1074,10 @@ Commands used:
 # the BIP39 English list (any copy; this one came from the bip39 crate's source)
 grep -o '"[a-z]*"' ~/.cargo/registry/src/*/bip39-2.2.2/src/language/english.rs | tr -d '"' > english.txt
 shasum -a 256 english.txt   # 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda
-node vectors.mjs english.txt   # prints every value; writes vectors.json and relay-signing.json
+node docs/vectors/generate.mjs english.txt   # prints every value; writes docs/vectors/v1.json and relay-signing.json
 ```
 
-The script (to be committed as `docs/vectors/generate.mjs`):
+The script, committed as `docs/vectors/generate.mjs` (it writes `v1.json` next to itself):
 
 ```js
 // Reproduces every test vector in docs/protocol.md.
@@ -1520,5 +1520,5 @@ put("pair.link", link);
   fs.writeFileSync(new URL("./relay-signing.json", import.meta.url), JSON.stringify(relay, null, 2) + "\n");
 }
 
-fs.writeFileSync(new URL("./vectors.json", import.meta.url), JSON.stringify(out, null, 2) + "\n");
+fs.writeFileSync(new URL("./v1.json", import.meta.url), JSON.stringify(out, null, 2) + "\n");
 ```
