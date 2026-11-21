@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sealctl-ledger", "crates/sealctl"]
+members = ["crates/sealctl-ledger", "crates/sealctl", "crates/sealctl-core"]
 
 [workspace.package]
 version = "0.5.0"

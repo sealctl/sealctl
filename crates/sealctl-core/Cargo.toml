@@ -1,0 +1,47 @@
+[package]
+name = "sealctl-core"
+description = "sealctl protocol and crypto core shared by the sealctl CLI and the phone apps"
+# The core follows the 0.7 release it ships in (`core_version()`), ahead of the
+# workspace version that the 0.5/0.6 CLI still carries.
+version = "0.7.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["sealctl", "hpke", "bip39", "ed25519"]
+categories = ["cryptography"]
+
+[lib]
+# `lib` for the CLI and the app's Rust crate; `cdylib` so `--features uniffi`
+# produces a library that `uniffi-bindgen generate --library` can read.
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = []
+# UniFFI proc-macro annotations (library mode, no UDL). The app pins the same
+# uniffi version (SPEC.md 2.2), so this one is pinned exactly.
+uniffi = ["dep:uniffi"]
+
+[dependencies]
+# Primitives: established crates only (SPEC.md 2.1, 21).
+sha2 = { version = "0.11", default-features = false }
+hmac = { version = "0.13", default-features = false }
+hkdf = { version = "0.13", default-features = false }
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
+hpke = { version = "0.15.1", default-features = false, features = ["alloc", "x25519", "chacha"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+bip39 = { version = "3.0.0", default-features = false, features = ["std", "zeroize"] }
+rand_core = { version = "0.10.1", default-features = false }
+getrandom = { version = "0.4", default-features = false, features = ["sys_rng"] }
+subtle = { version = "2.6", default-features = false }
+zeroize = { version = "1.8", features = ["zeroize_derive", "serde"] }
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+uniffi = { version = "=0.32.2", default-features = false, optional = true }
+
+[dev-dependencies]
+proptest = "1"
