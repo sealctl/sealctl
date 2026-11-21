@@ -86,7 +86,7 @@ Primitives come only from these crates (no hand-written primitives):
 
 ### 2.2 UniFFI surface (feature `uniffi`)
 
-Proc-macro annotations only (no UDL), so the app can build `sealctl-core` together with its own crate in UniFFI library mode. The UniFFI version is pinned in this workspace's `Cargo.lock`; the app uses the same one. Secret-holding types are UniFFI objects that zeroise on drop. Object keys (the 16-byte keys) never cross the boundary: the core derives them inside `seal_reply` and its siblings. Errors are one enum `CoreError { UnknownWord(index), Checksum, Count, BadLink, Expired, NewerVersion, BadProof, BadSignature, BadSealed, Replay, BadLabel, Internal }`; messages never contain key material.
+Proc-macro annotations only (no UDL), so the app can build `sealctl-core` together with its own crate in UniFFI library mode. The UniFFI version is pinned in this workspace's `Cargo.lock`; the app uses the same one. Secret-holding types are UniFFI objects that zeroise on drop. Object keys (the 16-byte keys) never cross the boundary: the core derives them inside `seal_reply` and its siblings. Errors are one enum `CoreError { UnknownWord(index), Checksum, Count, BadLink, Expired, NewerVersion, BadProof, BadSignature, BadSealed, Replay, BadLabel, BadPlan, Internal }`; messages never contain key material.
 
 | Export | Returns | Notes |
 | --- | --- | --- |
@@ -102,8 +102,11 @@ Proc-macro annotations only (no UDL), so the app can build `sealctl-core` togeth
 | `pairing_proof(keys, offer)` | 86-character proof | Needs the phone keys only |
 | `machine_tag(machine_key)` | 4 characters | |
 | `open_request(keys, relay_machine_key, id, sealed)` | `Request` | HPKE, machine signature, time, version, replay window |
-| `Request` | `kind`, `ctx` (agent, repository id and name, command, cwd, user, subject, names), `items` (purpose, id, path or URL, size, words fingerprint, key check), `uses`, `old` (retired fingerprint), `status` (for `report`), `rq`, `version` | |
-| `seal_reply(root_or_none, keys, request, decision)` | Sealed reply | `decision`: `Deny`, `Once { place }`, `Session { place }`, `Remember { place }`; `place` is `Trusted`, `Other` or `NoLocation`. Needs the root only when the request asks for keys |
+| `Request` | `kind`, `ctx` (agent, repository id and name, command, cwd, user, subject, names), `items` (purpose, id, path or URL, size, words fingerprint, key check), `uses`, `old` (retired fingerprint), `status` (for `report`), `handback` (for `report`), `plan` (items, `all`, hash, part), `level()` (the confirmation level the phone applies: the kind's level or `lvl`, whichever is higher), `has_match`, `rq`, `version` | The number match is held inside `Request`; it never crosses the boundary |
+| `Request.match_choices()`, `Request.check_match(pick)` | Three numbers in display order; `bool` | The right number and two random others; a wrong pick is final for that request (protocol.md, Number match) |
+| `PlanAssembler::new()`, `.add(request)` | Complete plan or `None` | Collects the parts of a plan sent in several `unseal` requests and checks `h` (`CoreError::BadPlan`) |
+| `seal_reply(root_or_none, keys, request, decision)` | Sealed reply | `decision`: `Deny`, `Refuse { err }`, `Once { place }`, `Session { place }`, `Remember { place }`, `Plan { place, not_before }`; `place` is `Trusted`, `Other` or `NoLocation`. Needs the root only when the request asks for keys. `Plan` signs the plan hash (protocol.md, Plan and plan signature) and hands out only keys named by plan items |
+| `seal_plan_keys_reply(root, keys, request, approval)` | Sealed reply | Answers a later `unseal` request of an approved plan: keys named by plan items only, inside the 30 minutes after `not_before` |
 | `seal_rewrap_reply(old_root, new_root, keys, request)` | Sealed reply | Old and new key per item |
 | `seal_old_words_reply(old_root, root, keys, request)` | Sealed reply | Derives only the listed objects' keys |
 | `seal_report_reply(keys, request, ack, messages)` | Sealed reply | Fallback channel |
@@ -115,7 +118,7 @@ Proc-macro annotations only (no UDL), so the app can build `sealctl-core` togeth
 | `backup_item_encode(words, fingerprint, created)`, `backup_item_decode(bytes)` | 45 bytes; fields | |
 | `core_version()`, `protocol_version()` | `"0.7.0"`, `"1"` | |
 
-The CLI uses the same functions from Rust (machine side: `seal_request`, `open_reply`, `seal_status`, `open_message`, `.id` and `.sealed` handling), which are not exported to the apps.
+The CLI uses the same functions from Rust (machine side: `seal_request`, which also returns the number match when the body has `match`; `open_reply`; `plan_text` and `verify_plan_signature`; `seal_status`, `open_message`, `.id` and `.sealed` handling), which are not exported to the apps.
 
 The app repository builds the XCFramework and Android libraries; this repository's `bindings.yml` workflow only proves that bindings generate and a Swift and a Kotlin smoke test call `fingerprint` and `open_request` on the vectors.
 
@@ -260,6 +263,11 @@ Every error is one line on stderr starting with `sealctl: `, then at most one li
 | Retired words | `sealctl: Sealed with words 7Hq3, retired 2028-03-02. Type them on the phone to move this object to your current words.` |
 | Other words | `sealctl: Sealed with words 7Hq3; your phone has words qHWf.` |
 | Busy volume | `sealctl: Volume safe is busy: node (pid 4211) has files open.` |
+| Wrong number picked (`no_match`) | `sealctl: The number picked on your phone was not 59. Nothing was changed.` |
+| Held after a wrong number (`held`) | `sealctl: Your phone holds sensitive requests from this machine for an hour after a wrong number. Try again after 11:42.` |
+| Not near (`not_near`) | `sealctl: Your phone could not tell it is near this machine. Run this at the machine's terminal and pick the number on your phone.` |
+| No biometrics (`no_biometrics`) | `sealctl: Your phone needs Face ID or a fingerprint for this. Fix that on the phone, or use your card: <command> --words` |
+| Cancelled during the delay | `sealctl: Cancelled from your phone.` or `sealctl: Cancelled from dev@box.example.com.` |
 
 ## 6. The session daemon
 
@@ -289,7 +297,8 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 | `own` | Values of `--own-approval` secrets for one command |
 | `keys` | Volume and backup keys for the CLI's volume and backup commands |
 | `store` | Write, rename or delete a secret (the daemon holds the store key) |
-| `events` | Stream of `waiting`, `answered`, `locked` events, so the CLI prints `Waiting for your phone` once |
+| `events` | Stream of `waiting`, `answered`, `locked`, `notice` events, so the CLI prints `Waiting for your phone` once |
+| `pending` | Delayed level 3 actions known from `notice` messages and the relay's `delayed` notes, for `status` and `cancel` |
 | `rewrap`, `migrate` | Section 16 |
 
 ### 6.3 States
@@ -335,6 +344,11 @@ While Open, the daemon keeps the phone informed and listens for locks (protocol.
 - Until then it keeps one `report` request waiting (ttl 300, renewed at most once per 60 seconds) and applies `ack` and `msgs` from the reply.
 - Usage log entries wait in `usage.jsonl` until a status that carries them is acknowledged. The log holds names, agents, repositories and masked commands, never values.
 - A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"). An `answers` message replaces `answers.json` (used by `sealctl rules`).
+- A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory, shows it in `sealctl status`, and shows a desktop notification (5.2) whether or not an agent is running:
+  - pending: `sealctl: your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at 11:00. Not you? Run: sealctl cancel`. The relay's own note, without the phone's details, reads `sealctl: a sensitive action was approved on your phone. It takes effect at 11:00. Not you? Run: sealctl cancel`;
+  - cancelled: `sealctl: cancelled from your phone: leaving sealctl on dev@mbp.example.com`;
+  - done with a report: `sealctl: dev@mbp.example.com handed back 9 objects (macOS Keychain). 0 failed.`
+- A Locked machine has no machine socket, so it learns of a pending action at its next relay call; `sealctl status` asks the relay (`GET .../delayed`, 2-second timeout) every time it runs.
 
 ### 6.7 Process hardening
 
@@ -369,6 +383,8 @@ sealctl pair [--name <user@host>] [--force] [--relay <origin>]
    ```
 
    Without a terminal (remote sessions, Claude on the web), print only the link on stdout and the waiting line on stderr.
+
+   Pairing is confirmation level 2 on the phone: biometrics, and the app's own camera scanning the code as proof that the person sees this machine. A link opened on the phone takes the user to the scanner. So the printed link, opened in a browser on the computer the user sits at, shows the QR code: the website's `/p` page draws it from the fragment, which never reaches the server.
 4. Poll `GET /v1/machines/{machine}` every 2 seconds until the code expires. Check the proof (protocol.md). A wrong proof: exit 1 with `This pairing did not come from your phone. Run sealctl pair again.`
 5. Save `machine.json`, delete the old pairing key if any, install the daemon service, create the store if none exists (the first `open` asks for the new store key), and print on stdout `Paired: dev@mbp.example.com #k7m2`.
 6. On the first pairing of this user, print on stderr (terminal only): `Free to use. If it earns its place, $5.99 once keeps the relay running: sealctl buy`.
@@ -394,15 +410,18 @@ Exit 5 when the code expires unpaired. The machine gate (`402` on the phone's si
 | Open; an agent uses a secret it has not used in this repository in this session | `agent` | `Waiting for your phone` unless the phone remembers the answer |
 | Open; a secret set with `--own-approval` | `own`, every time | `Waiting for your phone` |
 | Open; a new volume, backup or own-approval secret is created, or a manual volume is opened | `keys` | Usually nothing (automatic while the phone is unlocked) |
-| Any; the phone key changed | `rewrap` | `Moving to your new words…` on stderr if a command waits on it |
+| Any; the phone key changed | `rewrap`, `lvl` 2 | `Moving to your new words…` on stderr if a command waits on it. Level 2: biometrics on the phone, and `near`, since the daemon has no terminal for a number (16.1) |
 | Any; an object sealed with retired words is used | `old_words` | The retired-words message (5.5), exit 10; the phone asks for the words |
-| `sealctl seal` of a new object | `keys` | `Waiting for your phone` unless automatic |
-| `sealctl unseal` | `keys` for every object it hands back, `ctx.subject` `{"k": "machine", "n": "unseal"}` | `Waiting for your phone`; always One tap on the phone. With `--words`, no request |
+| `sealctl seal` of a new object | `keys` | `Waiting for your phone` unless automatic (level 1: nothing changes hands) |
+| `sealctl seal` of an existing object | `keys` with `ctx.subject` `{"k": "machine", "n": "seal"}`, `lvl` 2, `match` | `Waiting for your phone. On your phone, pick 47 if it asks.` Level 2 on the phone |
+| `sealctl unseal <object>` | `unseal` with the plan, `lvl` 2, `match` | `Waiting for your phone. On your phone, pick 47 if it asks.` Level 2. With `--words`, no request |
+| `sealctl unseal --all` | `unseal` with the plan, `lvl` 3, `match` | `Waiting for your phone. On your phone, pick 59.` Level 3, with the delay away from a trusted place (18.9). With `--words`, no request |
 
 - Repository: `git rev-parse --show-toplevel` from the working directory; id and name per protocol.md (`ctx.repo`). Outside git, `repo` is `null` and answers are kept per folder path.
 - A person is never asked inside an Open session. An agent is identified only by the environment variables in 5.2; that is a guard against mistakes, not against malware (threat model).
 - Allowed agent uses are kept in daemon memory until the session locks; `remember` answers also go to `answers.json` when the phone sends them.
 - A file in the repository never grants anything: `.sealctl.toml` only names which secrets a command gets.
+- **Confirmation levels** (protocol.md, Confirmation levels): the CLI sets `lvl` to the level of what it is about to do and `match: true` whenever a person at a terminal is shown the number. It prints the number on stderr, once, on the `Waiting for your phone` line. The phone decides the level; the CLI's `lvl` can only raise it.
 
 ## 10. Commands
 
@@ -416,6 +435,7 @@ Global flags: `-v` (more logging to stderr, never values), `--relay <origin>`, `
 | `sealctl open` | Opens the session now (store key, auto volumes, backup keys) | `Open · 30 min left` | 0, 3, 4, 5, 6, 7, 12 |
 | `sealctl lock [--force] [--no-backup]` | Section 6.5 | `Locked.` plus one line per volume | 0; 11 if a volume stays mounted |
 | `sealctl pair`, `sealctl unpair [--yes]` | Section 8 | | |
+| `sealctl cancel [<id>] [--yes]` | Cancels a delayed level 3 action (18.9) approved on the phone: Leave sealctl, showing the words, deleting the relay data, or an `unseal --all` on any machine. Lists pending ones from the relay; with one, asks `Cancel leaving sealctl on dev@mbp.example.com, due at 11:00? [y/N]`; `--yes` without a terminal. Refused inside an AI agent | `Cancelled.` | 0; 8; 9 nothing pending; 3, 6, 7 |
 | `sealctl doctor [--json]` | Checks: paired, relay `GET /v1/health`, clock offset, daemon running and same version, service installed, file permissions (section 3), `restic`/`diskutil`/`hdiutil`/`cryptsetup` present, hooks installed, store readable, no 0.5.0 leftovers | One line per check: `ok`, `problem: …` | 0, or 1 if any problem |
 
 `sealctl status` on a terminal:
@@ -433,6 +453,7 @@ Unpaid · sealctl buy
 
 - First line: `Locked`, `Locked from your phone`, `Locked: your phone left the place`, `Open · <time> left · hard stop <HH:MM>`, or `Waiting for your phone (asked 0:42 ago)`. Not paired: `Not paired · sealctl pair`.
 - A running migration adds `Migrate   re-encrypting volume safe · 41% · about 2 min left` (or `paused: battery below 20%`).
+- A pending level 3 action adds `Pending   leaving sealctl, approved on your phone · takes effect 11:00 · sealctl cancel`; `--json` has `"pending": [{"id", "what", "machine", "at"}]`.
 - The licence line is `Unpaid · sealctl buy`, or `Paid`. When the relay was never reached it is left out.
 - "nothing written to disk" means no value was written to a file by sealctl this month; `secret get` to a pipe or `recover --out` replaces it with `values given out: <n>`.
 
@@ -642,6 +663,8 @@ When the words change, the phone moves each machine to its new key (protocol.md,
 
 3. updates `inventory.json`, sends a status, and logs `Rewrapped 12 objects to words 4kPz` at `info`.
 
+Rewrap is confirmation level 2 on the phone: biometrics per request, and proximity. The daemon has no terminal, so it relies on the relay's `near`; a `not_near` answer leaves the objects on the old words, retried at the next daemon start, and `sealctl migrate --depth rewrap` at the machine's terminal sends the same request with a number (`On your phone, pick 23 if it asks.`).
+
 Rewrap needs each object reachable: an unmounted APFS volume can be rewrapped locked; a LUKS file and a sparse bundle need only the file; a restic repository needs its credentials (from the store). Objects that fail stay on the old words and are retried at every daemon start and listed by `sealctl migrate`.
 
 ### 16.2 `sealctl migrate`
@@ -733,7 +756,7 @@ The same rules, journal and password stores serve both directions. Release 0.6.0
 | Check before removing | Each object is opened with the new key or password before the old one is removed. Where the OS swaps a passphrase in one step (APFS, sparse bundles), the check runs at once after the swap; if it fails, the swap is reversed with the old passphrase, which still works in that case |
 | A journal for resuming | Every step is written to the run's journal (18.4) before and after it runs. `--resume` continues; each step first checks whether it is already done on the object itself |
 | Every edited file copied | Before its first edit, each file (`~/.ssh/config`, shell rc files, agent settings, git config files) is copied into the run folder with its mode |
-| No phone, relay or Ledger needed | `unseal` gets keys from the phone when it answers, with a `keys` request whose `ctx.subject` is `{"k": "machine", "n": "unseal"}`, several when the objects do not fit in one body (the phone always shows it as One tap). With `--words`, or when the phone or relay cannot be reached, it asks for the 24 words as `recover` does |
+| No phone, relay or Ledger needed | `unseal` gets keys from the phone when it answers, with `unseal` requests bound to the confirmed plan, at confirmation level 2 (objects) or 3 (`--all`) (18.9). With `--words`, or when the phone or relay cannot be reached, it asks for the 24 words as `recover` does; no level, number or delay applies then |
 | A person at a terminal | stdin and stderr must be terminals; refused inside an AI agent with exit 8. `--all` has no `--yes` |
 | No values shown | Values and passwords go only to the chosen store and are read back to check them by SHA-256 in memory. The only exception is the store `show`, chosen by the user, which writes each new password once to `/dev/tty` |
 | Nothing deleted that could be needed | Data is never deleted. Replaced files and the old store folder move to the run folder's `kept/`, still encrypted, and the final message says where |
@@ -901,7 +924,7 @@ Keep your paper card until no old copies of these backups or volumes remain.
 
 ### 18.7 Exit codes
 
-0 done; 2 usage, or another run active; 4, 5, 6, 7 from the phone or relay when keys come from the phone (then `--words` works); 8 inside an agent or without a terminal; 9 no such object; 10 the derived key does not open the object (other words; `.id` check mismatch); 11 a volume busy; 13 stopped part way or with skipped objects.
+0 done; 2 usage, or another run active; 4, 5, 6, 7 from the phone or relay when keys come from the phone (then `--words` works); 4 also for a wrong number, `held`, `no_biometrics` and a delay cancelled from the phone or another machine; 8 inside an agent or without a terminal; 9 no such object; 10 the derived key does not open the object (other words; `.id` check mismatch); 11 a volume busy; 13 stopped part way or with skipped objects.
 
 ### 18.8 Tests
 
@@ -914,6 +937,48 @@ Keep your paper card until no old copies of these backups or volumes remain.
 | Real OS | macOS runner: APFS volume in a disk-image container and a sparse bundle, sealed then unsealed, checked with `diskutil apfs unlockVolume -verify` and `hdiutil attach`; `ssh-add --apple-use-keychain` with a temporary key; launchd units removed (`launchctl print` fails). Linux runner: LUKS file with `sudo cryptsetup`, slots and token checked with `luksDump`; Secret Service through `gnome-keyring-daemon` in `dbus-run-session`; systemd user units where a user bus exists. restic: folder repositories on both, MinIO with versioning on Linux |
 | Cross-version | CI builds 0.6.0 from its tag, unseals a fixture home made with the 0.5.0 software Ledger key, then the 0.7 binary runs `seal --from handback.json` and opens every object |
 | Leak | The leak tests of section 21 cover both commands: a canary value never appears in stdout, stderr, the run folder, the journal or logs |
+| Confirmation | Against the fake relay and scripted phone: the `unseal` body and plan text match the vectors in protocol.md; the number printed equals the vector's; wrong number, `held`, `no_biometrics`, `not_near` give exit 4 and change nothing; a plan sent in parts; a reply whose `sig` does not verify, names another `h`, or has `nb` in the future by the machine's clock is refused; a key or step outside the plan stops the run; continuation requests after `nb` + 30 min get a new approval on `--resume`; the delayed path with the relay's `delayed` note, polling, release, and cancel from the phone and from a second fake machine (exit 4, nothing changed); the hand-back `report` is sent before the pairing step; `--words` sends no request |
+
+### 18.9 Confirmation on the phone
+
+`seal` and `unseal` ask the phone at the confirmation levels of protocol.md: level 2 for `seal` of an existing object and `unseal <object>`, level 3 for `unseal --all` and any plan with a pairing step. With `--words` none of this applies: no request, no number, no delay. Release 0.6.0 (24.1) keeps its own gate: a real terminal, the typed `unseal`, the Ledger PIN once.
+
+**`unseal --all`, step by step.**
+
+1. The plan is built, shown and confirmed with the typed `unseal` (18.5), as before.
+2. The CLI turns the plan into plan items (protocol.md, Plan and plan signature): one per row of the plan, with the key each step needs, and computes `h`. It sends `unseal` with `lvl` 3, `match: true`, `plan` and the keys of the first items. A plan over the body size goes in parts; only the last part carries `match`.
+3. It prints, on stderr:
+
+   ```text
+   Waiting for your phone. On your phone, pick 59.
+   ```
+
+4. Then, by answer:
+
+   | Answer | CLI does |
+   | --- | --- |
+   | Reply with `grant: "plan"` and `nb` already passed | Checks `sig` with the phone key against its own `h`, the request id and `nb`; writes `h`, `nb`, `sig` into `plan.json`; starts the run |
+   | Relay `delayed` note | Keeps the one-time key in memory and waits, below |
+   | `no_match`, `held`, `no_biometrics`, declined | The texts of 5.5; exit 4; nothing changed |
+   | No answer in 5 minutes | Exit 5, as any request |
+
+   While delayed:
+
+   ```text
+   Approved on your phone, away from a trusted place: it starts at 11:00.
+   Your phone and every paired machine can cancel it until then.
+   Starts in 59 min. Ctrl-C stops waiting; running it again needs a new approval.
+   Or use your card now: sealctl unseal --all --words
+   ```
+
+   The `Starts in` line is rewritten in place each minute on a terminal (one new line every 10 minutes otherwise). The CLI reads `GET /v1/phones/{phone}/delayed/{id}` every 60 seconds and at `releaseAt`, by wall clock, so a laptop that slept catches up. `state: "cancelled"` ends with `Cancelled from your phone.` (or the machine's name), exit 4. A reply fetched early by a faulty relay is not used before `nb`.
+5. **Inside the plan only.** Before each step, the CLI checks that the step's plan line is in the signed plan, and before using a key, that a plan item names it. Anything else is a bug: the run stops, exit 1, the journal says which step. Keys that did not fit in the first reply come from further `unseal` requests with `plan: {"h"}`, which the phone answers without asking, up to 30 minutes after `nb`.
+6. **Resume.** `--resume` within 30 minutes of `nb` continues with the same approval. Later, it shows the remaining plan, asks for the typed `unseal` again, and sends it as a new level 3 request: new number, new delay away from a trusted place.
+7. **Report.** Before the pairing step, the CLI sends a `report` with `handback`: each plan item, where its password or value went, and done, failed or skipped. The phone shows it and tells the other paired machines. If the report cannot be sent, the run goes on and the end text adds `Your phone did not get the report.`
+
+**`unseal <object>` and `seal`.** The same request at level 2: no delay, and the number is used by the phone only when it cannot tell it is near (`On your phone, pick 47 if it asks.`). `seal` sends `keys` with `ctx.subject` `{"k": "machine", "n": "seal"}`, `lvl` 2 and `match`.
+
+**Cancelling from another machine.** `sealctl cancel` (10.1) on any paired machine, or Cancel on the phone, cancels a pending delayed action. The CLI waiting on it learns at its next read.
 
 ## 19. Licence
 
@@ -974,6 +1039,7 @@ Choose 1, 2 or 3:
 | Clipboard | Copies clear after 30 seconds if the clipboard still holds the value |
 | Network | TLS only (except loopback test relays); certificate checks never disabled; relay errors never echo request bodies |
 | Words | Typed only into `sealctl recover`, and into `seal` and `unseal` with `--words`; read without echo; never accepted as an argument, from stdin when it is not a terminal, or from the environment |
+| Levels | `lvl` never lower than the action's level (18.9); `match: true` only when the number is printed to a terminal a person reads; the number is never logged, never in `--json`, never in the journal; a plan reply is used only after its `sig`, `h` and `nb` check, and only inside the plan |
 | Replies | A reply is used only after HPKE open, signature check with the paired phone key, `rq` check and key check against the `.id` file |
 | Agents | `secret get`, `recover`, `seal`, `unseal`, the credential helpers and `buy` refuse inside agents; masking cannot be turned off inside an agent |
 | Hand-back | `seal` and `unseal` give values and passwords only to the chosen store (stdin or native API), check them by hash, and write none to the journal, the run folder or the terminal (except the opt-in `show` store) |
@@ -1029,7 +1095,7 @@ Each milestone ends with its acceptance tests green in CI. 0.6.0 comes first and
 
 **Scope.** Version 0.6.0 is the 0.5.0 code in `crates/sealctl/src` with one command added: `sealctl unseal`, for one object or `--all`. Nothing else from this spec goes in: no phone, relay, new derivation, `seal`, or output changes to other commands. It follows section 18's rules (18.1), stores (18.3), run folder and journal (18.4), failure handling (18.6) and exit codes (18.7), with the differences below. Its job: hand every 0.5.0 object back under the user's own passwords, so that the user can install 0.7 and `seal` each one, or leave.
 
-**Keys.** From the Ledger through the existing session agent (`agent::oracle`), so the PIN is asked once. With `--words`, from the Ledger's 24 words through `recover::SeedOracle`, checked against the certificate exactly as `recover` does today, after this warning: `These words also guard anything else on your Ledger. Type them only if the Ledger is lost or broken.` Nothing reaches a phone or relay.
+**Keys.** From the Ledger through the existing session agent (`agent::oracle`), so the PIN is asked once. The confirmation levels of 18.9 do not apply to 0.6.0: there is no phone, and its gate stays a real terminal, the typed `unseal` and the PIN. With `--words`, from the Ledger's 24 words through `recover::SeedOracle`, checked against the certificate exactly as `recover` does today, after this warning: `These words also guard anything else on your Ledger. Type them only if the Ledger is lost or broken.` Nothing reaches a phone or relay.
 
 **Commands.**
 
@@ -1193,11 +1259,13 @@ Kept and reworked: `ai` (hooks, adapters, policy, skill), `guard` (detection, ma
 | --- | --- |
 | `sealctl-core` with `uniffi` feature, tagged releases | Section 2.2; the app pins the tag |
 | `docs/vectors/v1.json`, `relay-signing.json` | Section 21 |
-| Pairing link `https://sealctl.com/p#…` | The website serves `/p` (a page saying to use the app), `/.well-known/apple-app-site-association` and `/.well-known/assetlinks.json` for it |
+| Pairing link `https://sealctl.com/p#…` | The website serves `/p` (a page saying to use the app, and on a computer the QR code drawn in the browser from the fragment, for pairing without a terminal), `/.well-known/apple-app-site-association` and `/.well-known/assetlinks.json` for it |
 | Relay planned items | Listed in protocol.md, Relay API; the relay spec adopts the machine channel, `lastSeen` and `moved` |
 | `sealctl unseal`, `docs/unseal.md`, the hand-back list | Section 18 and 24.1: the website's "Leaving sealctl" and "Moving from the Ledger version" pages; the app's Leave sealctl flow, which relies on `unseal --all` unpairing the machine itself |
 | Release 0.6.0 kept installable | The tap keeps formula `sealctl@0.6` (keg-only) and the GitHub release keeps its packages, so a 0.5.0 user who upgraded too early can still run `unseal` |
 | `SEALCTL_RELAY` / `--relay` | For staging and the app's test bench |
+| The `unseal` request, plan hash and signature, number match, delayed approvals, `notice` messages | protocol.md; the app shows the number, the plan and the delay (app spec, levels 2 and 3), the relay holds delayed approvals (relay spec) |
+| `sealctl cancel` | The app's and website's text for cancelling a delayed action from a computer |
 | Status page | Relay errors link `https://sealctl.com/status` |
 | `sealctl-<version>-cli.md` | Attached to each release for the website's CLI reference |
 | Homebrew formula | `render-formula.sh` and the tap job |
@@ -1221,3 +1289,5 @@ Kept and reworked: `ai` (hooks, adapters, policy, skill), `guard` (detection, ma
 14. **The SSH passphrase in the macOS keychain.** `ssh-add --apple-use-keychain` stores it in the login keychain only through `ssh-add` itself, so `unseal` feeds it through `SSH_ASKPASS`. If Apple's `ssh-add` ignores `SSH_ASKPASS_REQUIRE=force` on some macOS version, the user types the passphrase once, read from the store's item.
 15. **Linux without a Secret Service** (servers, minimal desktops): the `keychain` store is not offered; the plan asks for `op`, `bw` or `show`. Is `show` acceptable as the only option there?
 16. **Homebrew users who upgrade before unsealing.** `brew upgrade` takes a 0.5.0 user straight to 0.7. The tap keeps `sealctl@0.6` and 0.7 prints how to use it (6.1). Should 0.7.0 be held back on the tap for some weeks after 0.6.0, so that most users unseal first?
+17. **Remote machines and proximity.** Level 2 counts the number match as proximity, so `unseal <object>` works on a dev box over SSH. Rewrap from the daemon has no terminal and needs `near`; a dev box or CI runner is never near, so its rewrap waits for `sealctl migrate --depth rewrap` run there by hand. Acceptable, or exempt rewrap during a change of words the user just started on the phone?
+18. **Pending notices on Locked machines.** A Locked machine has no machine socket and hears of a delayed action only at its next relay call or `sealctl status`. Keeping the machine socket open while Locked would announce at once, at the cost of pings from every machine all day (relay spec).

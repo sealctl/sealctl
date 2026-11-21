@@ -61,18 +61,26 @@ function keySchedule(ss, info) {
   const infoHash = lExtract(HPKE_ID, Buffer.alloc(0), "info_hash", info);
   const ksc = cat([0], pskId, infoHash);
   const secret = lExtract(HPKE_ID, ss, "secret", Buffer.alloc(0));
-  return { key: lExpand(HPKE_ID, secret, "key", ksc, 32), nonce: lExpand(HPKE_ID, secret, "base_nonce", ksc, 12) };
+  return {
+    key: lExpand(HPKE_ID, secret, "key", ksc, 32), nonce: lExpand(HPKE_ID, secret, "base_nonce", ksc, 12),
+    exp: lExpand(HPKE_ID, secret, "exp", ksc, 32),
+  };
 }
+// RFC 9180 section 5.3, secret export from a context
+const hpkeExport = (exp, ctx, L) => lExpand(HPKE_ID, exp, "sec", ctx, L);
 function hpkeSeal(pkR, info, aad, pt, ikmE) {
   const e = deriveKeyPair(ikmE); // fixed ephemeral for test vectors only; real senders use GenerateKeyPair
   const ss = eae(xDH(e.sk, pkR), cat(e.pk, pkR));
-  const { key, nonce } = keySchedule(ss, info);
-  return { enc: e.pk, ct: chachaSeal(key, nonce, aad, pt), ss };
+  const { key, nonce, exp } = keySchedule(ss, info);
+  return { enc: e.pk, ct: chachaSeal(key, nonce, aad, pt), ss, exp };
 }
 function hpkeOpen(skR, info, aad, enc, ct) {
   const ss = eae(xDH(skR, enc), cat(enc, xPub(skR)));
   const { key, nonce } = keySchedule(ss, info);
   return chachaOpen(key, nonce, aad, ct);
+}
+function hpkeOpenExport(skR, info, enc) {
+  return keySchedule(eae(xDH(skR, enc), cat(enc, xPub(skR))), info).exp;
 }
 // RFC 9180 A.2.1 check
 {
@@ -84,7 +92,12 @@ function hpkeOpen(skR, info, aad, enc, ct) {
   if (H(s.enc) !== "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a") throw new Error("A.2.1 enc");
   if (H(s.ss) !== "0bbe78490412b4bbea4812666f7916932b828bba79942424abb65244930d69a7") throw new Error("A.2.1 shared_secret");
   if (H(s.ct) !== "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28") throw new Error("A.2.1 ct");
-  console.log("RFC 9180 A.2.1 sequence 0: OK");
+  if (H(s.exp) !== "a3b010d4994890e2c6968a36f64470d3c824c8f5029942feb11e7a74b2921922") throw new Error("A.2.1 exporter_secret");
+  const exported = [["", "4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e"],
+    ["00", "8c1df14732580e5501b00f82b10a1647b40713191b7c1240ac80e2b68808ba69"],
+    ["54657374436f6e74657874", "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53"]];
+  for (const [ctx, want] of exported) if (H(hpkeExport(s.exp, B(ctx), 32)) !== want) throw new Error("A.2.1 export " + ctx);
+  console.log("RFC 9180 A.2.1 sequence 0 and exported values: OK");
 }
 
 // ---------- BIP39 ----------
@@ -302,6 +315,78 @@ put("pair.link", link);
   const mraw = Buffer.from(sealedMsg, "base64url");
   const mpt = hpkeOpen(mBoxSk, U("sealctl/v1/message"), M, mraw.subarray(0, 32), mraw.subarray(32));
   if (!edVerify(pk.P, cat(U("sealctl/v1/message"), Z, M, mpt.subarray(64)), mpt.subarray(0, 64))) throw new Error("message verify");
+}
+
+// unseal --all: level 3 request with number match, plan hash, plan signature (machine above, phone B)
+{
+  const pk = phoneKeys(root);
+  const id = b64u(B("404142434445464748494a4b4c4d4e4f"));
+  const ot = deriveKeyPair(sha256(U("sealctl test one-time key unseal")));
+  const t = Date.UTC(2026, 10, 21, 10, 0, 0);
+  put("unseal.request.id", id);
+  put("unseal.onetime.public_b64u", b64u(ot.pk));
+  const items = [
+    { k: "secrets", n: "store", p: "secrets", i: STORE },
+    { k: "volume", n: "safe", p: "volume", i: VOL },
+    { k: "ssh", n: "ed25519", p: "secrets", i: STORE },
+    { k: "git", n: "signing" },
+    { k: "ai", n: "Claude Code" },
+    { k: "services", n: "daemon" },
+    { k: "local", n: "~/.config/sealctl" },
+    { k: "pairing", n: "dev@mbp.example.com" },
+  ];
+  for (const it of items) for (const f of [it.k, it.n, it.p ?? "", it.i ?? ""]) if (/[\x00-\x1f\x7f]/.test(f)) throw new Error("plan field");
+  const planText = "sealctl-plan-v1\n" + b64u(M) + "\n" + items.map((it) => `${it.k}\t${it.n}\t${it.p ?? ""}\t${it.i ?? ""}\n`).join("");
+  const ph = sha256(U(planText));
+  put("plan.text", JSON.stringify(planText));
+  put("plan.hash_b64u", b64u(ph));
+  const body = U(JSON.stringify({
+    v: 1, t, why: "unseal", lvl: 3, ot: b64u(ot.pk), match: true,
+    ctx: { agent: null, repo: null, cmd: "sealctl unseal --all", cwd: "~", user: "dev@mbp.example.com", subject: { k: "machine", n: "unseal" } },
+    plan: { all: true, h: b64u(ph), items },
+    keys: [
+      { p: "secrets", i: STORE, w: fingerprint(root), c: check(keys[`secrets:${STORE}`]), o: { k: "store", p: "~/.local/share/sealctl/store/" + STORE, s: 4096 } },
+      { p: "volume", i: VOL, w: fingerprint(root), c: check(keys[`volume:${VOL}`]), o: { k: "volume", p: "/Volumes/safe", s: 53687091200 } },
+    ],
+  }));
+  put("unseal.request.body", body.toString("utf8"));
+  const reqSig = edSign(mSeed, cat(U("sealctl/v1/request"), Z, U(id), Z, pk.P, body));
+  put("unseal.request.signature", H(reqSig));
+  const aad = cat(U(id), Z, M);
+  const r = hpkeSeal(pk.BX, U("sealctl/v1/request"), aad, cat(reqSig, body), sha256(U("sealctl test ephemeral unseal")));
+  const sealedReq = b64u(cat(r.enc, r.ct));
+  put("unseal.request.enc", H(r.enc));
+  put("unseal.request.sealed", sealedReq);
+  put("unseal.request.sealed_length", sealedReq.length);
+  // number match: both ends export the same 4 bytes from the request's HPKE context
+  const x = hpkeExport(r.exp, U("sealctl/v1/match"), 4);
+  if (!hpkeExport(hpkeOpenExport(pk.boxSk, U("sealctl/v1/request"), r.enc), U("sealctl/v1/match"), 4).equals(x)) throw new Error("match export");
+  put("match.export", H(x));
+  put("match.number", 10 + (x.readUInt32BE(0) % 90));
+  // plan signature: approved away from a trusted place, so not before t + 1 h
+  const nb = t + 3600000;
+  const nbBytes = Buffer.alloc(8); nbBytes.writeBigUInt64BE(BigInt(nb));
+  const planMsg = cat(U("sealctl/v1/plan"), Z, U(id), Z, M, ph, nbBytes);
+  const psig = edSign(pk.idSeed, planMsg);
+  if (!edVerify(pk.P, planMsg, psig)) throw new Error("plan sig");
+  put("plan.not_before", nb);
+  put("plan.message_hex", H(planMsg));
+  put("plan.signature", H(psig));
+  const rbody = U(JSON.stringify({
+    v: 1, rq: b64u(sha256(body)), ok: true, lvl: 3, w: fingerprint(root), grant: "plan", place: "other",
+    plan: { h: b64u(ph), nb, sig: b64u(psig) },
+    keys: [{ p: "secrets", i: STORE, k: b64u(keys[`secrets:${STORE}`]) }, { p: "volume", i: VOL, k: b64u(keys[`volume:${VOL}`]) }],
+  }));
+  put("unseal.reply.body", rbody.toString("utf8"));
+  const repSig = edSign(pk.idSeed, cat(U("sealctl/v1/reply"), Z, U(id), Z, M, rbody));
+  put("unseal.reply.signature", H(repSig));
+  const rr = hpkeSeal(ot.pk, U("sealctl/v1/reply"), aad, cat(repSig, rbody), sha256(U("sealctl test ephemeral unseal reply")));
+  const sealedRep = b64u(cat(rr.enc, rr.ct));
+  put("unseal.reply.sealed", sealedRep);
+  put("unseal.reply.sealed_length", sealedRep.length);
+  const rraw = Buffer.from(sealedRep, "base64url");
+  const rpt = hpkeOpen(ot.sk, U("sealctl/v1/reply"), aad, rraw.subarray(0, 32), rraw.subarray(32));
+  if (!edVerify(pk.P, cat(U("sealctl/v1/reply"), Z, U(id), Z, M, rpt.subarray(64)), rpt.subarray(0, 64))) throw new Error("unseal reply verify");
 }
 
 // root backup item (iCloud Keychain / Block Store), words B
