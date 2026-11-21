@@ -271,17 +271,66 @@ impl Home {
         None
     }
 
-    /// The newest run folder.
+    /// The newest run folder (`~/sealctl-unsealed-<date>[-n]`).
     pub fn run_dir(&self) -> PathBuf {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(self.home.join(".sealctl-unseal"))
+        self.run_dirs().pop().expect("a run folder")
+    }
+
+    /// Every run folder in this HOME, oldest first.
+    pub fn run_dirs(&self) -> Vec<PathBuf> {
+        let mut v: Vec<(String, u32, PathBuf)> = std::fs::read_dir(&self.home)
             .unwrap()
             .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let rest = name.strip_prefix("sealctl-unsealed-")?.to_string();
+                let (date, n) = match rest.get(10..) {
+                    Some("") => (rest.clone(), 1),
+                    Some(s) => (rest[..10].to_string(), s.trim_start_matches('-').parse().ok()?),
+                    None => return None,
+                };
+                Some((date, n, e.path()))
+            })
             .collect();
         v.sort();
-        v.pop().expect("a run folder")
+        v.into_iter().map(|(_, _, p)| p).collect()
     }
+
+    /// A line `<what>: <password>` of passwords.txt in the newest run folder.
+    pub fn folder_password(&self, what: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.run_dir().join("passwords.txt")).ok()?;
+        text.lines()
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| l.strip_prefix(&format!("{what}: ")).map(str::to_string))
+    }
+
+    /// The variables of a dotenv file in the newest run folder.
+    pub fn folder_env(&self, file: &str) -> BTreeMap<String, String> {
+        let text = std::fs::read_to_string(self.run_dir().join(file)).unwrap();
+        sealctl::secrets::parse_dotenv(&text)
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect()
+    }
+}
+
+/// Text of every file below `root` except the plain files `sealctl unseal` writes on purpose
+/// (passwords.txt, secrets.env, backup-*.env, secrets-binary/): where no value may appear.
+pub fn all_text_but_plain(root: &Path) -> String {
+    let mut s = String::new();
+    for (rel, kind) in tree(root) {
+        let plain = rel == "passwords.txt"
+            || rel == "secrets.env"
+            || rel.starts_with("secrets-binary")
+            || (rel.starts_with("backup-") && rel.ends_with(".env"));
+        if plain || kind == "dir" || kind.starts_with("->") || kind == "special" {
+            continue;
+        }
+        s.push_str(&String::from_utf8_lossy(&std::fs::read(root.join(rel)).unwrap()));
+        s.push('\n');
+    }
+    s
 }
 
 /// Start the session agent with the software key standing in for the Ledger.

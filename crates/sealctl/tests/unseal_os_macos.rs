@@ -13,7 +13,8 @@ use common::{new_home, serial, text, FixtureOpts, Home};
 use sealctl::derive::{canonical_id, passphrase, Purpose};
 use sealctl::volume::{self, Kind, Volume};
 
-const ARGS: &[&str] = &["--all", "--to", "op", "--secrets-to", "env", "--keep-env-rules"];
+/// The default: new passwords and restic settings in the folder.
+const ARGS: &[&str] = &["--all", "--keep-env-rules"];
 
 struct Disks {
     /// The disk image holding the APFS container, to detach at the end.
@@ -165,14 +166,18 @@ fn apfs_volume_sparse_bundle_and_backup_are_handed_back() {
     assert!(out.status.success(), "{}", text(&out));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("stays encrypted; it will open with your own passphrase."),
+        err.contains("stays encrypted; it will open with a new passphrase (passwords.txt)."),
+        "{err}"
+    );
+    assert!(
+        err.contains("- volumes and backups stay encrypted; each gets a new random password, saved in"),
         "{err}"
     );
     // backup before its volume
     assert!(err.find("backup of").unwrap() < err.find(&format!("volume {}:", d.bundle.name)).unwrap());
 
     // APFS: the new passphrase from the store opens it; sealctl's no longer does; still locked
-    let new = h.fake_value(&format!("sealctl: volume {}", d.apfs.name)).unwrap();
+    let new = h.folder_password(&format!("volume {}", d.apfs.name)).unwrap();
     assert!(volume::apfs::verify(&d.apfs.id, new.as_bytes()).unwrap());
     assert!(!volume::apfs::verify(&d.apfs.id, derived(Purpose::Volume, &d.apfs.id).as_bytes()).unwrap());
     assert!(
@@ -203,18 +208,27 @@ fn apfs_volume_sparse_bundle_and_backup_are_handed_back() {
     let path = d.bundle.path.clone().unwrap();
     assert!(!path.join("sealctl.id").exists());
     sb.lock(&d.bundle, false).unwrap();
-    let new_b = h
-        .fake_value(&format!("sealctl: volume {}", d.bundle.name))
-        .unwrap();
+    let new_b = h.folder_password(&format!("volume {}", d.bundle.name)).unwrap();
     assert!(sb.verify(&d.bundle, new_b.as_bytes()).unwrap());
     assert!(!sb
         .verify(&d.bundle, derived(Purpose::Volume, &d.bundle.id).as_bytes())
         .unwrap());
 
     // restic: same snapshots under the new password, one key, sealctl's password refused
-    let pw = h
-        .fake_value(&format!("sealctl: backup {}/password", d.bundle.name))
+    let pw = h.folder_password(&format!("backup {}", d.bundle.name)).unwrap();
+    // backup-<volume>.env: everything restic needs, and a shell can source it
+    let envf = format!("backup-{}.env", d.bundle.name);
+    let env = h.folder_env(&envf);
+    assert_eq!(env["RESTIC_REPOSITORY"], d.repo.to_string_lossy());
+    assert_eq!(env["RESTIC_PASSWORD"], pw);
+    let sourced = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("set -a; . \"$1\"; set +a; restic snapshots --json")
+        .arg("sh")
+        .arg(h.run_dir().join(&envf))
+        .output()
         .unwrap();
+    assert!(sourced.status.success(), "{}", text(&sourced));
     let after = restic(&d.repo, &pw, &["snapshots", "--json"]);
     assert!(after.status.success(), "{}", text(&after));
     let ids = |o: &std::process::Output| -> Vec<String> {
@@ -227,6 +241,7 @@ fn apfs_volume_sparse_bundle_and_backup_are_handed_back() {
             .collect()
     };
     assert_eq!(ids(&after), ids(&snapshots_before));
+    assert_eq!(ids(&sourced), ids(&snapshots_before));
     let keys = restic(&d.repo, &pw, &["key", "list", "--json"]);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&keys.stdout)
@@ -256,8 +271,9 @@ fn apfs_volume_sparse_bundle_and_backup_are_handed_back() {
         .collect();
     assert_eq!(kinds, ["backup", "volume", "volume"]);
     assert_eq!(hb["objects"][0]["url"], d.repo.to_string_lossy().as_ref());
-    for v in h.fake_values() {
-        assert!(!err.contains(&v) && !common::all_text(&h.run_dir()).contains(&v));
+    assert!(h.fake_values().is_empty(), "nothing in a password store");
+    for v in [new, new_b, pw] {
+        assert!(!err.contains(&v) && !common::all_text_but_plain(&h.run_dir()).contains(&v));
     }
 }
 
@@ -328,18 +344,24 @@ fn a_failed_check_removes_nothing_and_a_kill_resumes() {
         .verify(&d.bundle, derived(Purpose::Volume, &d.bundle.id).as_bytes())
         .unwrap());
 
-    // APFS: killed right after the change took effect, before the journal says so
+    // APFS (the folder): a power cut right after the change took effect, before the journal
+    // says so; the passphrase was durable in passwords.txt before the change
     let a = d.apfs.name.clone();
+    let report = h.tmp.path().join("powercut.txt");
     let out = h.unseal(
-        &["volume", &a, "--to", "op"],
+        &["volume", &a],
         "y\n",
-        &[("SEALCTL_TEST_KILL", &format!("volume:{a}:change:before-done"))],
+        &[
+            ("SEALCTL_TEST_POWERCUT", &format!("volume:{a}:change:before-done")),
+            ("SEALCTL_TEST_POWERCUT_REPORT", &report.display().to_string()),
+        ],
     );
     {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(out.status.signal(), Some(9), "{}", text(&out));
     }
-    let new = h.fake_value(&format!("sealctl: volume {a}")).unwrap();
+    assert_eq!(std::fs::read_to_string(&report).unwrap(), "", "all durable");
+    let new = h.folder_password(&format!("volume {a}")).unwrap();
     assert!(
         volume::apfs::verify(&d.apfs.id, new.as_bytes()).unwrap(),
         "the change took effect"

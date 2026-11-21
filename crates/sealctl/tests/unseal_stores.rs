@@ -21,9 +21,10 @@ fn ssh_only() -> FixtureOpts {
 #[test]
 fn op_and_bw_never_see_a_value_in_argv() {
     let _g = serial();
-    let h = new_home();
+    let mut h = new_home();
     common::fixture(&h, &ssh_only());
     common::start_agent();
+    h.start_ssh_agent();
 
     let out = h.unseal(
         &["ssh", "ed25519", "--to", "bw", "--bw-folder", "Work"],
@@ -37,6 +38,21 @@ fn op_and_bw_never_see_a_value_in_argv() {
         &[],
     );
     assert!(out.status.success(), "{}", text(&out));
+    // with a password store, today's behaviour: a passphrase, the agent and keychain on macOS
+    if cfg!(target_os = "macos") {
+        let want = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[2; 32]));
+        let fp = want
+            .public_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        let listed = sealctl::ssh::agent_fingerprints(&h.ssh_agent_sock().unwrap());
+        assert!(listed.contains(&fp), "github not in the agent: {listed:?}");
+        let config = std::fs::read_to_string(h.home.join(".ssh/config")).unwrap();
+        assert!(
+            config.contains("Host *\n    UseKeychain yes\n    AddKeysToAgent yes\n"),
+            "{config}"
+        );
+    }
     let out = h.unseal(&["secret", "mail", "--secrets-to", "op"], "y\n", &[]);
     assert!(out.status.success(), "{}", text(&out));
     let out = h.unseal(&["secrets", "--secrets-to", "bw"], "y\n", &[]);
@@ -138,6 +154,7 @@ fn keychain_store_roundtrip() {
         name: "unseal-test",
         notes: "test".into(),
         credential: false,
+        var: None,
     };
     let value = store::generate_password().unwrap();
     let loc = s
@@ -146,6 +163,42 @@ fn keychain_store_roundtrip() {
     assert_eq!(loc.service.as_deref(), Some(service.as_str()));
     assert_eq!(loc.account.as_deref(), Some("volume/unseal-test"));
     assert_eq!(&*s.read(&loc).unwrap(), value.as_bytes());
+    // the item has a readable label (Keychain Access shows it)
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                &service,
+                "-a",
+                "volume/unseal-test",
+            ])
+            .output()
+            .unwrap();
+        let attrs = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            attrs.contains("\"labl\"<blob>=\"sealctl: volume unseal-test\""),
+            "{attrs}"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let attrs = keyring::Entry::new(&service, "volume/unseal-test")
+            .unwrap()
+            .get_attributes()
+            .unwrap();
+        assert_eq!(
+            attrs.get("label").map(String::as_str),
+            Some("sealctl: volume unseal-test")
+        );
+    }
+    // stored again (a resumed step): the new value
+    let again = store::generate_password().unwrap();
+    let loc = s
+        .put_checked(StoreKind::Keychain, &item, again.as_bytes(), &|_| Ok(()))
+        .unwrap();
+    assert_eq!(&*s.read(&loc).unwrap(), again.as_bytes());
     keyring::Entry::new(&service, "volume/unseal-test")
         .unwrap()
         .delete_credential()

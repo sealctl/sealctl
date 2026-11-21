@@ -14,24 +14,29 @@ fn dry_run_shows_the_plan_and_changes_nothing() {
     common::start_agent();
     let before = common::tree(&h.home);
 
-    let out = h.unseal(
-        &["--all", "--dry-run", "--to", "op", "--secrets-to", "env"],
-        "",
-        &[],
-    );
+    // the default: everything into the folder, nothing to a password store
+    let out = h.unseal(&["--all", "--dry-run"], "", &[]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{}", text(&out));
     if std::env::var_os("SHOW_PLAN").is_some() {
         eprintln!("{err}");
     }
+    let (stamp, _) = sealctl::util::local_time();
     for want in [
         "This hands everything sealctl 0.5 holds on",
-        "Your files stay encrypted. Keys come from your Ledger",
-        "New passwords go to: 1Password",
-        "Secrets go to:       a .env file",
-        "This file holds your keys in plain text, where AI agents can read them.",
-        " 1  secrets      7 secrets",
-        "ssh keys     2 keys                   \u{2192} ~/.ssh/ed25519, ~/.ssh/github with your own passphrase",
+        "back to you, in plain, standard form.",
+        "Keys come from your Ledger",
+        &format!(
+            "Everything goes into one new folder: ~/sealctl-unsealed-{}\n",
+            &stamp[..10]
+        ),
+        "- SSH keys end with no passphrase: plain key files in ~/.ssh;",
+        "- secrets are written in plain form into secrets.env in the folder.",
+        "Nothing is written to Keychain, 1Password or Bitwarden (--to keychain|op|bw|show for that).",
+        "Only you can read the folder",
+        "Delete it yourself once the new passwords and keys work. sealctl never deletes it.",
+        " 1  secrets      7 secrets                \u{2192} secrets.env in the folder, plain",
+        "ssh keys     2 keys                   \u{2192} ~/.ssh/ed25519, ~/.ssh/github with no passphrase",
         "git          global + 1 repository    keeps signing with your key through ssh-keygen.",
         "AI tools     Claude Code, Codex",
         "local files",
@@ -40,6 +45,25 @@ fn dry_run_shows_the_plan_and_changes_nothing() {
     ] {
         assert!(err.contains(want), "missing {want:?} in:\n{err}");
     }
+    assert!(!err.contains("keychain and ssh-agent"), "{err}");
+
+    // a password manager on request: today's behaviour
+    let out = h.unseal(
+        &["--all", "--dry-run", "--to", "op", "--secrets-to", "env"],
+        "",
+        &[],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", text(&out));
+    for want in [
+        "- SSH keys get a new passphrase, kept in 1Password;",
+        "- secrets are written in plain form into ~/sealctl-secrets.env.",
+        "This file holds your keys in plain text, where AI agents can read them.",
+        "ssh keys     2 keys                   \u{2192} ~/.ssh/ed25519, ~/.ssh/github with your own passphrase",
+    ] {
+        assert!(err.contains(want), "missing {want:?} in:\n{err}");
+    }
+    assert!(!err.contains("Nothing is written to Keychain"), "{err}");
     // order: secrets, ssh, git, AI, (services,) local files
     let pos = |s: &str| err.find(s).unwrap_or_else(|| panic!("{s} in {err}"));
     assert!(pos("secrets      7") < pos("ssh keys"));
@@ -48,7 +72,7 @@ fn dry_run_shows_the_plan_and_changes_nothing() {
     assert!(pos("AI tools") < pos("local files"));
     assert!(!err.contains("Type unseal"), "a dry run asks nothing");
     assert_eq!(common::tree(&h.home), before, "--dry-run changed files");
-    assert!(!h.home.join(".sealctl-unseal").exists());
+    assert!(h.run_dirs().is_empty());
     for (_, v) in common::fixture_secrets() {
         assert!(!err.contains(&v) && !String::from_utf8_lossy(&out.stdout).contains(&v));
     }
@@ -99,20 +123,12 @@ fn dry_run_shows_the_plan_and_changes_nothing() {
     );
     assert_eq!(common::tree(&h.home), before);
 
-    // nothing confirmed: nothing changes
-    let out = h.unseal(&["--all", "--to", "op", "--keep-env-rules"], "no\n", &[]);
+    // nothing confirmed: nothing changes, no folder is made
+    let out = h.unseal(&["--all", "--keep-env-rules"], "no\n", &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(String::from_utf8_lossy(&out.stderr).contains("Nothing was changed."));
-    let mut after = common::tree(&h.home);
-    after.remove(".sealctl-unseal");
-    assert_eq!(after, before, "an unconfirmed run changed files");
-    assert!(
-        std::fs::read_dir(h.home.join(".sealctl-unseal"))
-            .unwrap()
-            .next()
-            .is_none(),
-        "no run folder is left"
-    );
+    assert_eq!(common::tree(&h.home), before, "an unconfirmed run changed files");
+    assert!(h.run_dirs().is_empty(), "no run folder is made");
 }
 
 #[test]

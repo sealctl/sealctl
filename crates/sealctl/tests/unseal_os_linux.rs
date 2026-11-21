@@ -116,13 +116,13 @@ fn luks_volume_and_backup_are_handed_back() {
     assert_eq!(keyslots(&file), 1);
 
     let out = h.unseal(
-        &["--all", "--to", "op", "--secrets-to", "env", "--keep-env-rules"],
+        &["--all", "--keep-env-rules"],
         "unseal\n",
         &[("SEALCTL_SUDO_NONINTERACTIVE", "1")],
     );
     assert!(out.status.success(), "{}", text(&out));
 
-    let new = h.fake_value(&format!("sealctl: volume {name}")).unwrap();
+    let new = h.folder_password(&format!("volume {name}")).unwrap();
     let be = volume::backend(Kind::Luks);
     let v = Volume { ..vol.clone() };
     assert!(
@@ -138,8 +138,10 @@ fn luks_volume_and_backup_are_handed_back() {
     assert!(be.is_unlocked(&v).unwrap(), "left mounted as found");
     assert_eq!(std::fs::read(v.mountpoint.join("hello.txt")).unwrap(), b"hello");
     if have_restic {
-        let pw = h.fake_value(&format!("sealctl: backup {name}/password")).unwrap();
+        let pw = h.folder_password(&format!("backup {name}")).unwrap();
         assert!(restic(&repo, &pw, &["snapshots"]).status.success());
+        let env = h.folder_env(&format!("backup-{name}.env"));
+        assert_eq!(env["RESTIC_PASSWORD"], pw);
         assert!(
             !restic(&repo, &derived(Purpose::Restic, &name), &["cat", "config"])
                 .status
