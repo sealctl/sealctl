@@ -1,11 +1,18 @@
-//! `sealctl unseal`: hand everything sealctl holds back to the user, under passwords of their
-//! own, so they can leave the Ledger version (0.6.0) — and install 0.7 and `seal` each object,
-//! or stop using sealctl.
+//! `sealctl unseal`: the inverse of sealing. Everything sealctl holds comes back to the user in
+//! plain, standard form, so they can leave the Ledger version (0.6.0) — and install 0.7 and
+//! `seal` each object, or stop using sealctl.
+//!
+//! By default everything goes into one visible folder, `~/sealctl-unsealed-<date>` (0700):
+//! volumes and backups stay encrypted under a new random password written to `passwords.txt`
+//! first; SSH keys become plain key files without a passphrase; secrets go to `secrets.env`;
+//! restic settings to `backup-<volume>.env`. Nothing goes to Keychain, 1Password or Bitwarden
+//! unless asked (`--to`, `--secrets-to`). The person deletes the folder; sealctl never does.
 //!
 //! Rules (SPEC.md section 18, 24.1):
 //! * plan first: nothing changes before the plan is shown and confirmed (`y` for one object,
 //!   the typed word `unseal` for `--all`); `--dry-run` only shows it;
-//! * every object is opened with the new password, read back from where it was stored, before
+//! * write-ahead: a new password is durable where it was stored (file and directory `fsync`ed)
+//!   and read back before anything depends on it; every object is opened with it before
 //!   sealctl's key or slot is removed;
 //! * every step goes to a journal in the run folder, so a stopped run resumes (`--resume`);
 //! * every edited file is copied into the run folder first; nothing is deleted that could be
@@ -190,6 +197,12 @@ pub struct Plan {
     pub from: String,
     pub all: bool,
     pub stores: store::Config,
+    /// The run folder: `~/sealctl-unsealed-<date>` (the next free name when the run starts).
+    #[serde(default)]
+    pub folder: PathBuf,
+    /// AI tools on this machine that get rules keeping their agents out of the folder.
+    #[serde(default)]
+    pub ai_rules: Vec<String>,
     pub no_ssh_passphrase: bool,
     pub keep_store: bool,
     pub env_rules: Option<bool>,
@@ -495,17 +508,6 @@ fn problems(objects: &[Object], cfg: &store::Config) -> Vec<String> {
                     }
                 }
             }
-            Object::Secrets { names, .. } if cfg.secrets_to == StoreKind::Env => {
-                let mut seen = std::collections::BTreeMap::new();
-                for n in names {
-                    if let Some(other) = seen.insert(store::env_var_name(n), n.clone()) {
-                        p.push(format!(
-                            "secrets {other} and {n} would both be {} in the .env file; use another --secrets-to",
-                            store::env_var_name(n)
-                        ));
-                    }
-                }
-            }
             Object::Backup { volume } => {
                 if !crate::util::which(&crate::backup::restic_bin())
                     && std::env::var_os("SEALCTL_RESTIC").is_none()
@@ -590,53 +592,95 @@ fn line(out: &mut String, n: usize, kind: &str, name: &str, desc: &[String]) {
 /// The plan as people read it (stderr).
 pub fn plan_text(plan: &Plan, words: bool) -> String {
     let mut s = String::new();
+    let cfg = &plan.stores;
     if plan.all {
         s.push_str(&format!(
-            "This hands everything sealctl 0.5 holds on {} back to you, under passwords of your own.\n",
+            "This hands everything sealctl 0.5 holds on {} back to you, in plain, standard form.\n",
             machine_word()
         ));
     } else {
-        s.push_str("This hands the object below back to you, under a password of your own.\n");
+        s.push_str("This hands the object below back to you, in plain, standard form.\n");
     }
-    s.push_str("Your files stay encrypted. ");
     if words {
         s.push_str("Keys come from your 24 words.\n\n");
     } else {
         s.push_str("Keys come from your Ledger: keep it connected with the OpenPGP app open.\n\n");
     }
-    let needs_to = plan.objects.iter().any(|o| {
-        matches!(o, Object::Volume { .. } | Object::Backup { .. })
-            || matches!(o, Object::Ssh { .. } if !plan.no_ssh_passphrase)
-    });
-    let needs_secrets = plan
-        .objects
-        .iter()
-        .any(|o| matches!(o, Object::Secrets { .. } | Object::Backup { .. }));
-    if needs_to {
-        s.push_str(&format!(
-            "New passwords go to: {:<18} (change with --to keychain|op|bw|show)\n",
-            plan.stores.to.describe()
-        ));
+    let has = |f: fn(&Object) -> bool| plan.objects.iter().any(f);
+    let vols = has(|o| matches!(o, Object::Volume { .. }));
+    let backups = has(|o| matches!(o, Object::Backup { .. }));
+    let ssh = has(|o| matches!(o, Object::Ssh { .. }));
+    let secrets = has(|o| matches!(o, Object::Secrets { .. }));
+    let folder = tilde(&plan.folder);
+    s.push_str(&format!("Everything goes into one new folder: {folder}\n"));
+    let mut points: Vec<String> = vec![];
+    if vols || backups {
+        let what = match (vols, backups) {
+            (true, true) => "volumes and backups stay",
+            (true, false) => "volumes stay",
+            _ => "backups stay",
+        };
+        points.push(if cfg.to == StoreKind::Folder {
+            format!(
+                "{what} encrypted; each gets a new random password, saved in passwords.txt in the folder before it is set"
+            )
+        } else {
+            format!("{what} encrypted; each gets a new password, kept in {}", cfg.to.describe())
+        });
     }
-    if needs_secrets {
-        s.push_str(&format!(
-            "Secrets go to:       {:<18} (change with --secrets-to keychain|op|bw|env)\n",
-            plan.stores.secrets_to.describe()
-        ));
+    if backups && cfg.secrets_to == StoreKind::Folder {
+        points.push(
+            "restic settings (repository, password, storage credentials) go into backup-<volume>.env".into(),
+        );
     }
-    if plan.stores.secrets_to == StoreKind::Env && needs_secrets {
-        let f = plan
-            .stores
-            .env_file
-            .clone()
-            .or_else(|| store::default_env_file().ok())
-            .unwrap_or_default();
+    if ssh {
+        points.push(if plan.no_ssh_passphrase {
+            "SSH keys end with no passphrase: plain key files in ~/.ssh".into()
+        } else {
+            format!("SSH keys get a new passphrase, kept in {}", cfg.to.describe())
+        });
+    }
+    if secrets {
+        points.push(match cfg.secrets_to {
+            StoreKind::Folder => "secrets are written in plain form into secrets.env in the folder".into(),
+            StoreKind::Env => format!("secrets are written in plain form into {}", where_secrets(cfg)),
+            k => format!("secrets go to {}", k.describe()),
+        });
+    }
+    let n = points.len();
+    for (i, p) in points.iter().enumerate() {
+        let end = if i + 1 == n { "." } else { ";" };
+        s.push_str(&wrap(&format!("- {p}{end}"), "  ", "    "));
+    }
+    let external = |k: StoreKind| !matches!(k, StoreKind::Folder | StoreKind::Env);
+    let uses_to = vols || backups || (ssh && !plan.no_ssh_passphrase);
+    let uses_secrets = secrets || backups;
+    if !(uses_to && external(cfg.to)) && !(uses_secrets && external(cfg.secrets_to)) {
+        s.push_str(
+            "  Nothing is written to Keychain, 1Password or Bitwarden (--to keychain|op|bw|show for that).\n",
+        );
+    }
+    if cfg.secrets_to == StoreKind::Env && uses_secrets {
         s.push_str(&format!(
             "  {}: This file holds your keys in plain text, where AI agents can read them.\n  \
              Move them to a password manager, then delete it.\n",
-            tilde(&f)
+            where_secrets(cfg)
         ));
     }
+    let mut guard = String::from("  Only you can read the folder");
+    if !plan.ai_rules.is_empty() {
+        guard.push_str(&format!(
+            "; {} {} told not to read it",
+            ai_names(&plan.ai_rules).join(", "),
+            if plan.ai_rules.len() == 1 { "is" } else { "are" }
+        ));
+    }
+    if cfg!(target_os = "macos") {
+        guard.push_str("; Time Machine skips it");
+    }
+    guard.push_str(".\n");
+    s.push_str(&guard);
+    s.push_str("  Delete it yourself once the new passwords and keys work. sealctl never deletes it.\n");
     s.push('\n');
     let mut n = 0;
     for o in &plan.objects {
@@ -648,9 +692,9 @@ pub fn plan_text(plan: &Plan, words: bool) -> String {
                 } else {
                     format!("{} secrets", names.len())
                 };
-                let mut d = vec![format!("\u{2192} {}", where_secrets(&plan.stores))];
+                let mut d = vec![format!("\u{2192} {}", where_secrets(cfg))];
                 if *whole {
-                    d.push("the store folder is kept, still encrypted, in the run folder.".into());
+                    d.push("the store folder is kept, still encrypted, in the folder.".into());
                 }
                 line(&mut s, n, "secrets", &what, &d);
             }
@@ -666,7 +710,10 @@ pub fn plan_text(plan: &Plan, words: bool) -> String {
                     "backup",
                     &format!("of volume {} (restic)", volume.name),
                     &[
-                        "stays encrypted; it will open with your own password.".into(),
+                        format!(
+                            "stays encrypted; it will open with a new password ({}).",
+                            where_password(cfg)
+                        ),
                         "sealctl's key and the backup schedule are removed.".into(),
                         "Backups no longer run by themselves.".into(),
                         format!("repository: {url}"),
@@ -679,8 +726,9 @@ pub fn plan_text(plan: &Plan, words: bool) -> String {
                 "volume",
                 &format!("{} ({})", volume.name, kind_label(volume.kind)),
                 &[format!(
-                    "{} stays encrypted; it will open with your own passphrase.",
-                    volume.name
+                    "{} stays encrypted; it will open with a new passphrase ({}).",
+                    volume.name,
+                    where_password(cfg)
                 )],
             ),
             Object::Ssh { keys } => {
@@ -691,12 +739,12 @@ pub fn plan_text(plan: &Plan, words: bool) -> String {
                 };
                 let dests: Vec<String> = keys.iter().map(|k| tilde(&k.dest)).collect();
                 let pass = if plan.no_ssh_passphrase {
-                    "without a passphrase".to_string()
+                    "with no passphrase".to_string()
                 } else {
                     "with your own passphrase".to_string()
                 };
                 let mut d = vec![format!("\u{2192} {} {pass}", dests.join(", "))];
-                if cfg!(target_os = "macos") && !plan.no_ssh_passphrase {
+                if cfg!(target_os = "macos") && cfg.to != StoreKind::Folder && !plan.no_ssh_passphrase {
                     d.push("added to the macOS keychain and ssh-agent.".into());
                 }
                 d.push("sealctl's IdentityAgent lines in ~/.ssh/config are removed.".into());
@@ -751,7 +799,7 @@ pub fn plan_text(plan: &Plan, words: bool) -> String {
                 "",
                 &[
                     "~/.config/sealctl, ~/.local/share/sealctl, ~/.local/state/sealctl removed;".into(),
-                    "the store and certificate are kept in the run folder.".into(),
+                    "the store and certificate are kept, encrypted, in the folder.".into(),
                 ],
             ),
         }
@@ -774,8 +822,41 @@ pub fn plan_text(plan: &Plan, words: bool) -> String {
     s
 }
 
+/// `text` wrapped at 92 columns: `first` before the first line, `rest` before the others.
+fn wrap(text: &str, first: &str, rest: &str) -> String {
+    let mut out = String::new();
+    let mut cur = first.to_string();
+    let mut empty = true;
+    for w in text.split(' ') {
+        if !empty && cur.len() + 1 + w.len() > 92 {
+            out.push_str(&cur);
+            out.push('\n');
+            cur = rest.to_string();
+            empty = true;
+        }
+        if !empty {
+            cur.push(' ');
+        }
+        cur.push_str(w);
+        empty = false;
+    }
+    out.push_str(&cur);
+    out.push('\n');
+    out
+}
+
+/// Where new passwords go, short (the plan's object lines).
+fn where_password(cfg: &store::Config) -> String {
+    match cfg.to {
+        StoreKind::Folder => "passwords.txt".into(),
+        StoreKind::Keychain => format!("{}, service {}", StoreKind::Keychain.describe(), store::SERVICE),
+        k => k.describe().to_string(),
+    }
+}
+
 fn where_secrets(cfg: &store::Config) -> String {
     match cfg.secrets_to {
+        StoreKind::Folder => "secrets.env in the folder, plain".into(),
         StoreKind::Keychain => format!("{}, service {}", StoreKind::Keychain.describe(), store::SERVICE),
         StoreKind::Env => tilde(
             &cfg.env_file
@@ -810,67 +891,33 @@ fn ask(prompt: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-fn choose_store(question: &str, offered: &[StoreKind]) -> Result<StoreKind> {
-    eprintln!("{question}");
-    for (i, k) in offered.iter().enumerate() {
-        eprintln!("  {}  {:<9} {}", i + 1, k.as_str(), k.describe());
-    }
-    for _ in 0..3 {
-        let a = ask("Choose a number: ")?;
-        if let Some(k) = a
-            .parse::<usize>()
-            .ok()
-            .and_then(|i| i.checked_sub(1))
-            .and_then(|i| offered.get(i))
-        {
-            return Ok(*k);
-        }
-        if let Some(k) = offered.iter().find(|k| k.as_str() == a) {
-            return Ok(*k);
-        }
-    }
-    Err(exit(2, "no store chosen"))
-}
-
-/// Pick the stores: the flags, else the keychain when there is one, else a question listing the
-/// stores present.
-fn stores_config(opts: &Options, interactive: bool) -> Result<store::Config> {
-    let present = store::available();
-    let to = match opts.to {
-        Some(k) => k,
-        None if present.contains(&StoreKind::Keychain) => StoreKind::Keychain,
-        None if interactive => choose_store("Where should new passwords go?", &present)?,
-        None => *present.first().unwrap_or(&StoreKind::Show),
-    };
+/// Pick the stores: the flags, else the run folder (`--to` alone sends secrets to the same
+/// store, as before; `--to show` sends them to the folder).
+fn stores_config(opts: &Options) -> store::Config {
+    let to = opts.to.unwrap_or(StoreKind::Folder);
     let secrets_to = match opts.secrets_to {
         Some(k) => k,
-        None if to != StoreKind::Show => to,
-        None if present.contains(&StoreKind::Keychain) => StoreKind::Keychain,
-        None => {
-            let mut offered: Vec<StoreKind> = present.into_iter().filter(|k| *k != StoreKind::Show).collect();
-            offered.push(StoreKind::Env);
-            if interactive {
-                choose_store("Where should secrets go?", &offered)?
-            } else {
-                offered[0]
-            }
-        }
+        None if to == StoreKind::Show => StoreKind::Folder,
+        None => to,
     };
-    Ok(store::Config {
+    store::Config {
         to,
         secrets_to,
         env_file: opts.env_file.clone(),
         op_vault: opts.op_vault.clone(),
         bw_folder: opts.bw_folder.clone(),
         type_passwords: opts.type_passwords,
-    })
+    }
 }
 
 /// Build the plan (no changes).
-pub fn build_plan(opts: &Options, interactive: bool) -> Result<Plan> {
+pub fn build_plan(opts: &Options) -> Result<Plan> {
     let (objects, skipped) = discover(opts)?;
-    let stores = stores_config(opts, interactive && !opts.dry_run)?;
+    let stores = stores_config(opts);
     let problems = problems(&objects, &stores);
+    // with the folder, SSH keys end without a passphrase (the owner's decision: plain, standard
+    // key files; a passphrase can be added with ssh-keygen -p)
+    let no_ssh_passphrase = opts.no_ssh_passphrase || stores.to == StoreKind::Folder;
     Ok(Plan {
         sealctl: 1,
         kind: "unseal-plan".into(),
@@ -879,7 +926,12 @@ pub fn build_plan(opts: &Options, interactive: bool) -> Result<Plan> {
         from: env!("CARGO_PKG_VERSION").into(),
         all: opts.all,
         stores,
-        no_ssh_passphrase: opts.no_ssh_passphrase,
+        folder: journal::next_dir()?,
+        ai_rules: crate::ai::unsealed_rule_tools()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        no_ssh_passphrase,
         keep_store: opts.keep_store,
         env_rules: opts.env_rules,
         objects,
@@ -1042,16 +1094,7 @@ pub fn run(opts: Options, dev: crate::Ctx) -> Result<()> {
             return Err(exit(2, "there is no unfinished sealctl unseal run"));
         };
         if !opts.resume {
-            let started = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let hhmm = started
-                .split('T')
-                .nth(1)
-                .map(|t| t.split('-').take(2).collect::<Vec<_>>().join(":"))
-                .unwrap_or(started.clone());
-            let a = ask(&format!("Resume the run from {hhmm}? [Y/n] "))?;
+            let a = ask(&format!("Resume the run in {}? [Y/n] ", tilde(&dir)))?;
             if a.eq_ignore_ascii_case("n") || a.eq_ignore_ascii_case("no") {
                 return Err(exit(
                     2,
@@ -1068,7 +1111,7 @@ pub fn run(opts: Options, dev: crate::Ctx) -> Result<()> {
         return execute(run, plan, keys);
     }
 
-    let mut plan = build_plan(&opts, true)?;
+    let mut plan = build_plan(&opts)?;
     if let Some(dir) = unfinished.as_ref().filter(|_| opts.dry_run) {
         eprintln!(
             "Note: a run stopped part way in {}; sealctl unseal --resume continues it.\n",
@@ -1104,32 +1147,29 @@ pub fn run(opts: Options, dev: crate::Ctx) -> Result<()> {
         let a = ask("Keep the rules that stop AI agents reading .env files? [Y/n] ")?;
         plan.env_rules = Some(!(a.eq_ignore_ascii_case("n") || a.eq_ignore_ascii_case("no")));
     }
-    let run = journal::Run::create()?;
-    eprintln!(
-        "Run folder: {}. If anything stops, run: sealctl unseal --resume",
-        tilde(&run.dir)
-    );
+    eprintln!("If anything stops, run: sealctl unseal --resume");
     let go = if plan.all {
         ask("Type unseal to start: ")? == "unseal"
     } else {
         matches!(ask("Start? [y/N] ")?.as_str(), "y" | "Y" | "yes")
     };
     if !go {
-        // nothing changed: the run folder goes again
-        let dir = run.dir.clone();
-        drop(run);
-        let _ = std::fs::remove_dir_all(&dir);
         eprintln!("Nothing was changed.");
         return Ok(());
     }
+    // the folder is made only now, under the next free name
+    let run = journal::Run::create(&plan.folder)?;
+    plan.folder = run.dir.clone();
     run.write_json("plan.json", &plan)?;
     execute(run, plan, keys)
 }
 
 fn execute(run: journal::Run, plan: Plan, keys: Keys) -> Result<()> {
     catch_ctrl_c();
+    let mut stores = store::Stores::new(plan.stores.clone());
+    stores.folder = Some(run.dir.clone());
     let mut r = Runner {
-        stores: store::Stores::new(plan.stores.clone()),
+        stores,
         run,
         plan,
         keys,
@@ -1137,6 +1177,15 @@ fn execute(run: journal::Run, plan: Plan, keys: Keys) -> Result<()> {
         busy: vec![],
         notes: vec![],
     };
+    if let Err(e) = prepare(&mut r) {
+        return Err(exit(
+            exit_code(&e).unwrap_or(13),
+            format!(
+                "{e:#}\nNothing was handed back yet.\nRun folder: {}\nRun sealctl unseal --resume after fixing this.",
+                tilde(&r.run.dir)
+            ),
+        ));
+    }
     let total = r.plan.objects.len();
     let objects = r.plan.objects.clone();
     for (i, o) in objects.iter().enumerate() {
@@ -1179,12 +1228,260 @@ fn stopped(r: &Runner, o: &Object, e: anyhow::Error) -> anyhow::Error {
     )
 }
 
+/// The first steps of every run, before anything is written in plain form: README.txt, the
+/// Time Machine exclusion (macOS) and the AI rules that keep agents out of the folder.
+fn prepare(r: &mut Runner) -> Result<()> {
+    r.step("folder:readme", |r| {
+        let text = readme_text(&r.plan, &r.run.dir);
+        r.run.write_file("README.txt", text.as_bytes())?;
+        Ok(("README.txt written".into(), None))
+    })?;
+    if cfg!(target_os = "macos") {
+        r.step("folder:tmutil", |r| {
+            let out = crate::util::system_cmd("tmutil")
+                .arg("addexclusion")
+                .arg(&r.run.dir)
+                .stdin(std::process::Stdio::null())
+                .output();
+            let note = match out {
+                Ok(o) if o.status.success() => {
+                    "Time Machine skips the folder (tmutil addexclusion)".to_string()
+                }
+                Ok(o) => format!(
+                    "tmutil addexclusion failed ({}); Time Machine may back the folder up",
+                    String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                ),
+                Err(e) => format!("tmutil not run ({e}); Time Machine may back the folder up"),
+            };
+            Ok((note, None))
+        })?;
+    }
+    let tools = r.plan.ai_rules.clone();
+    if !tools.is_empty() {
+        r.step("folder:ai-rules", |r| {
+            for t in &tools {
+                let Some(f) = crate::ai::unsealed_rules_file(t) else {
+                    continue;
+                };
+                r.before_edit(&f)?;
+                crate::ai::write_unsealed_rules(t)?;
+                crate::ai::still_parses(&f)?;
+            }
+            Ok((
+                format!(
+                    "rules that keep agents out of ~/sealctl-unsealed-*: {}",
+                    tools.join(", ")
+                ),
+                None,
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// README.txt of the run folder: what is in it, how to check each item by hand, and to delete
+/// it. No values.
+pub fn readme_text(plan: &Plan, dir: &Path) -> String {
+    let d = tilde(dir);
+    let cfg = &plan.stores;
+    let mut s = String::new();
+    s.push_str(&format!(
+        "sealctl unseal on {}, {}\n\n\
+         This folder holds what sealctl handed back to you, in plain, standard form. Only you can\n\
+         read it (mode 0700). It may hold passwords, secrets and SSH keys in plain text: keep it\n\
+         off shared drives and synced folders. {}\n\n\
+         Check that everything below opens, keep the passwords where you keep passwords, then\n\
+         delete this folder:\n\n    rm -rf {d}\n\n\
+         sealctl never deletes it.\n\n",
+        plan.machine,
+        plan.created,
+        if plan.ai_rules.is_empty() {
+            "Keep AI agents away from it."
+        } else {
+            "AI agents are told not to read it."
+        }
+    ));
+    s.push_str("What is here\n------------\n");
+    let mut rows: Vec<(String, String)> = vec![];
+    let backups: Vec<&Volume> = plan
+        .objects
+        .iter()
+        .filter_map(|o| match o {
+            Object::Backup { volume } => Some(volume),
+            _ => None,
+        })
+        .collect();
+    let has_vols = plan.objects.iter().any(|o| matches!(o, Object::Volume { .. }));
+    if cfg.to == StoreKind::Folder && (has_vols || !backups.is_empty()) {
+        rows.push((
+            store::folder::PASSWORDS.into(),
+            "new volume passphrases and restic passwords, one per line".into(),
+        ));
+    }
+    if cfg.secrets_to == StoreKind::Folder {
+        if plan.objects.iter().any(|o| matches!(o, Object::Secrets { .. })) {
+            rows.push((
+                store::folder::SECRETS.into(),
+                "the secrets of sealctl's store, plain (a shell can source it)".into(),
+            ));
+        }
+        for v in &backups {
+            rows.push((
+                store::folder::backup_env(&v.name),
+                "restic: repository, password, storage credentials".into(),
+            ));
+        }
+    }
+    rows.push((
+        "handback.json".into(),
+        "what was handed back, where each password went (no passwords)".into(),
+    ));
+    rows.push((
+        "files/".into(),
+        "every file sealctl edited, as it was before".into(),
+    ));
+    rows.push((
+        "kept/".into(),
+        "sealctl's originals, still encrypted to the Ledger".into(),
+    ));
+    rows.push((
+        "plan.json, journal.jsonl".into(),
+        "the run (sealctl unseal --resume reads them)".into(),
+    ));
+    for (f, what) in rows {
+        s.push_str(&format!("  {f:<26} {what}\n"));
+    }
+    let pw = |label: &str| -> String {
+        match cfg.to {
+            StoreKind::Folder => format!("the line \"{label}\" in {d}/passwords.txt"),
+            k => format!("in {} (\"sealctl: {label}\")", k.describe()),
+        }
+    };
+    s.push_str("\nCheck each item by hand\n-----------------------\n");
+    for o in &plan.objects {
+        match o {
+            Object::Volume { volume: v } => {
+                let label = format!("volume {}", v.name);
+                let path = v
+                    .path
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let (open, change) = match v.kind {
+                    Kind::ApfsVolume => (
+                        format!("diskutil apfs unlockVolume {}", v.id),
+                        format!("diskutil apfs changePassphrase {} -user disk", v.id),
+                    ),
+                    Kind::Sparsebundle => (
+                        format!("hdiutil attach \"{path}\""),
+                        format!("hdiutil chpass \"{path}\""),
+                    ),
+                    Kind::Luks => (
+                        format!("sudo cryptsetup open --test-passphrase \"{path}\""),
+                        format!("sudo cryptsetup luksChangeKey \"{path}\""),
+                    ),
+                };
+                s.push_str(&format!(
+                    "\nVolume {} ({}), still encrypted. Its passphrase: {}.\n    {open}\n\
+                     \x20 To choose your own passphrase: {change}{}\n",
+                    v.name,
+                    kind_label(v.kind),
+                    pw(&label),
+                    if v.kind == Kind::Luks {
+                        ""
+                    } else {
+                        " (or Disk Utility)"
+                    }
+                ));
+            }
+            Object::Backup { volume: v } => {
+                let repo = v.backup.as_ref().map(|b| b.repository.as_str()).unwrap_or("");
+                s.push_str(&format!(
+                    "\nBackup of volume {} (restic, {repo}), still encrypted. Its password: {}.\n",
+                    v.name,
+                    pw(&format!("backup {}", v.name))
+                ));
+                if cfg.secrets_to == StoreKind::Folder {
+                    s.push_str(&format!(
+                        "    set -a; . {d}/{}; set +a\n    restic snapshots\n",
+                        store::folder::backup_env(&v.name)
+                    ));
+                } else {
+                    s.push_str(&format!("    restic -r {repo} snapshots\n"));
+                }
+                s.push_str(
+                    "  Backups no longer run by themselves: run restic backup yourself, or schedule it.\n\
+                     \x20 Your own password: restic key passwd (with the same settings).\n",
+                );
+            }
+            Object::Ssh { keys } => {
+                s.push_str("\nSSH keys, standard OpenSSH files:\n");
+                for k in keys {
+                    let f = tilde(&k.dest);
+                    if plan.no_ssh_passphrase {
+                        s.push_str(&format!(
+                            "    ssh-keygen -y -f {f}     prints the line in {f}.pub, asking nothing\n"
+                        ));
+                    } else {
+                        s.push_str(&format!(
+                            "    ssh-keygen -y -f {f}     asks for the passphrase ({}), prints the line in {f}.pub\n",
+                            pw(&format!("ssh {}", k.name))
+                        ));
+                    }
+                }
+                if plan.no_ssh_passphrase {
+                    s.push_str("  They have no passphrase. To add one: ssh-keygen -p -f <key>\n");
+                }
+                s.push_str("  Then log in where you use them, e.g. ssh -T git@github.com\n");
+            }
+            Object::Git { .. } => {
+                s.push_str(
+                    "\nGit signing goes through standard ssh-keygen. In a repository:\n    \
+                     git commit --allow-empty -m \"signing check\" && git log --show-signature -1\n",
+                );
+            }
+            Object::Secrets { names, .. } => {
+                match cfg.secrets_to {
+                    StoreKind::Folder => {
+                        s.push_str(&format!(
+                            "\nSecrets: {d}/secrets.env (variable, then the secret's name in sealctl):\n"
+                        ));
+                        for (n, v) in store::env_vars(names) {
+                            s.push_str(&format!("    {v:<32} {n}\n"));
+                        }
+                    }
+                    k => s.push_str(&format!(
+                        "\nSecrets: in {}.\n",
+                        where_secrets(&store::Config {
+                            secrets_to: k,
+                            ..cfg.clone()
+                        })
+                    )),
+                }
+                s.push_str("  Programs that used `sealctl run` need another way to get them now.\n");
+            }
+            _ => {}
+        }
+    }
+    s.push_str(
+        "\nKeep your Ledger and its paper card until no old copies of these backups or volumes\n\
+         remain (old snapshots of a disk, an old copy of a repository): those open only with the\n\
+         Ledger. The originals in kept/ do too.\n",
+    );
+    s
+}
+
 fn end_text(r: &Runner) {
     let h = objects::handback(r);
     let mut stores: Vec<String> = vec![];
     for o in &h.objects {
         for l in o.password.iter().chain(o.value.iter()) {
             let d = match l.store {
+                StoreKind::Folder => continue,
                 StoreKind::Keychain => format!(
                     "{}, service {}",
                     StoreKind::Keychain.describe(),
@@ -1198,24 +1495,88 @@ fn end_text(r: &Runner) {
             }
         }
     }
-    let run_dir = tilde(&r.run.dir);
+    let dir = &r.run.dir;
+    let d = tilde(dir);
     if r.plan.all {
         eprintln!("\nDone. sealctl 0.5 holds nothing on {}.", machine_word());
     } else {
         eprintln!("\nDone.");
     }
+    let mut rows: Vec<(String, String)> = vec![];
+    let mut plain = false;
+    if dir.join(store::folder::PASSWORDS).exists() {
+        rows.push((
+            store::folder::PASSWORDS.into(),
+            "the new passwords of your volumes and backups".into(),
+        ));
+        plain = true;
+    }
+    if dir.join(store::folder::SECRETS).exists() {
+        rows.push((
+            store::folder::SECRETS.into(),
+            "your secrets, in plain text".into(),
+        ));
+        plain = true;
+    }
+    if dir.join(store::folder::BINARY).exists() {
+        rows.push((
+            format!("{}/", store::folder::BINARY),
+            "secrets that are not text, one file each".into(),
+        ));
+    }
+    for o in &r.plan.objects {
+        if let Object::Backup { volume } = o {
+            let f = store::folder::backup_env(&volume.name);
+            if dir.join(&f).exists() {
+                rows.push((f, "restic settings (README.txt shows how to use them)".into()));
+                plain = true;
+            }
+        }
+    }
+    rows.push(("README.txt".into(), "how to check each item by hand".into()));
+    rows.push((
+        "handback.json".into(),
+        "the hand-back list (no passwords in it)".into(),
+    ));
+    eprintln!("Everything is in {d}:");
+    for (f, what) in rows {
+        eprintln!("  {f:<22} {what}");
+    }
     if !stores.is_empty() {
         eprintln!("Your passwords: {}.", stores.join("; "));
+    }
+    let keys: Vec<String> = r
+        .plan
+        .objects
+        .iter()
+        .filter_map(|o| match o {
+            Object::Ssh { keys } => Some(keys.iter().map(|k| tilde(&k.dest)).collect::<Vec<_>>()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    if !keys.is_empty() && r.plan.no_ssh_passphrase {
+        eprintln!(
+            "SSH keys: {}, with no passphrase (add one with ssh-keygen -p -f <key>).",
+            keys.join(", ")
+        );
     }
     for n in &r.notes {
         eprintln!("{n}");
     }
-    eprintln!("Hand-back list: {run_dir}/handback.json (no passwords in it).");
-    eprintln!("The run folder {run_dir} can be deleted once everything opens with your new passwords.");
     if r.plan.all {
-        eprintln!("Next: install sealctl 0.7 and run sealctl seal --from that file. Or remove sealctl:");
+        eprintln!(
+            "To move to sealctl 0.7: install it and run sealctl seal --from {d}/handback.json. Or remove sealctl:"
+        );
         eprintln!("  {}", uninstall_hint());
         eprintln!("Keep your Ledger and paper card until no old copies of these backups or volumes remain.");
+    }
+    eprintln!("Once the new passwords and keys work, delete the folder:");
+    eprintln!("  rm -rf {d}");
+    if plain {
+        eprintln!("It holds your passwords and secrets in plain text. sealctl never deletes it.");
+    } else {
+        eprintln!("sealctl never deletes it.");
     }
 }
 

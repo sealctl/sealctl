@@ -46,6 +46,10 @@ keyring = { version = "3", features = ["apple-native", "sync-secret-service", "c
 # two passphrases on two file descriptors (cryptsetup luksAddKey, restic key add); FIFOs, signals
 libc = "0.2"
 
+# `sealctl unseal --to keychain`: Keychain items with a readable label (keyring can't set one)
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [features]
 # Test-only switches for the `unseal` integration tests (kill at a step, no terminal needed).
 # Never enabled in release builds.

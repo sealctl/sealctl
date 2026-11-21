@@ -286,6 +286,7 @@ pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
                         '"' => val.push('"'),
                         '\\' => val.push('\\'),
                         '$' => val.push('$'),
+                        '`' => val.push('`'),
                         other => {
                             val.push('\\');
                             val.push(other);

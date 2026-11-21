@@ -83,8 +83,10 @@ fn as_text(v: &[u8]) -> Result<Zeroizing<String>> {
 }
 
 fn write_keeping_mode(path: &Path, text: &str) -> Result<()> {
-    // follows symlinks (dotfiles setups) and keeps the file's permissions
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    // follows symlinks (dotfiles setups), keeps the file's permissions, and is durable: a power
+    // cut leaves the old file or the new one, never a part
+    crate::durable::replace_keeping_mode(path, text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn user_and_host() -> (String, String) {
@@ -103,6 +105,8 @@ fn secrets(r: &mut Runner, names: &[String], whole: bool) -> Result<String> {
         .filter(|n| !r.run.is_done(&format!("secret:{n}:store")))
         .cloned()
         .collect();
+    // the variable of each secret in a dotenv file, the same on every resume
+    let vars = store::env_vars(names);
     let mut values: BTreeMap<String, Zeroizing<Vec<u8>>> = BTreeMap::new();
     if !pending.is_empty() {
         let oracle = r.oracle()?;
@@ -118,6 +122,7 @@ fn secrets(r: &mut Runner, names: &[String], whole: bool) -> Result<String> {
                 name: n,
                 notes: format!("Secret {n}, handed back by sealctl unseal."),
                 credential: true,
+                var: vars.get(n).cloned(),
             };
             let loc = r.store(kind, &item, &v)?;
             Ok((
@@ -139,13 +144,16 @@ fn secrets(r: &mut Runner, names: &[String], whole: bool) -> Result<String> {
                 None,
             ))
         })?;
-        kept = " The encrypted store is in the run folder's kept/secrets.";
+        kept = " The encrypted store is in the folder's kept/secrets.";
     }
     let n = names.len();
+    let to = match kind {
+        StoreKind::Folder => store::folder::SECRETS.to_string(),
+        k => k.describe().to_string(),
+    };
     Ok(format!(
-        "secrets: {n} {} in {}, each read back.{kept}",
+        "secrets: {n} {} in {to}, each read back.{kept}",
         if n == 1 { "secret" } else { "secrets" },
-        kind.describe()
     ))
 }
 
@@ -243,11 +251,33 @@ fn backup_steps(
                 policy.repository, policy.repository
             ),
             credential: false,
+            var: None,
         },
     )?;
 
     let secrets_to = r.plan.stores.secrets_to;
+    let to = r.plan.stores.to;
     r.step(&st("credentials"), |r| {
+        // the folder: backup-<volume>.env holds everything restic needs, ready to source
+        if secrets_to == StoreKind::Folder {
+            let mut first: Vec<(&str, Zeroizing<Vec<u8>>)> = vec![(
+                "RESTIC_REPOSITORY",
+                Zeroizing::new(policy.repository.as_bytes().to_vec()),
+            )];
+            if to == StoreKind::Folder {
+                first.push(("RESTIC_PASSWORD", read_back(r, &st("password"))?));
+            }
+            for (var, val) in first {
+                let item = Item {
+                    kind: "backup",
+                    name: &format!("{name}/{var}"),
+                    notes: String::new(),
+                    credential: true,
+                    var: None,
+                };
+                r.store(StoreKind::Folder, &item, &val)?;
+            }
+        }
         let mut data = serde_json::Map::new();
         for (var, val) in &env {
             let item = Item {
@@ -255,6 +285,7 @@ fn backup_steps(
                 name: &format!("{name}/{var}"),
                 notes: format!("{var} for the restic repository {}", policy.repository),
                 credential: true,
+                var: None,
             };
             let loc = r.store(secrets_to, &item, val.as_bytes())?;
             data.insert(var.clone(), serde_json::to_value(&loc)?);
@@ -433,6 +464,7 @@ fn volume_obj(r: &mut Runner, vol: &Volume) -> Result<String> {
             name: &name,
             notes: volume_notes(vol),
             credential: false,
+            var: None,
         },
     )?;
 
@@ -563,6 +595,34 @@ fn apple_keychain() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// `ssh-keygen -y -P "" -f <key>` must print the key's public key: OpenSSH itself opens the
+/// file without a passphrase. Skipped (the file was already read back) without ssh-keygen.
+fn ssh_keygen_check(path: &Path, public: &str) -> Result<()> {
+    if !crate::util::which("ssh-keygen") {
+        return Ok(());
+    }
+    let out = std::process::Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("running ssh-keygen -y")?;
+    let got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .take(2)
+        .map(str::to_string)
+        .collect();
+    if !out.status.success() || got.join(" ") != public {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "ssh-keygen -y -P \"\" -f {} does not give the key's public key{}",
+            tilde(path),
+            err.lines().next().map(|l| format!(": {l}")).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 fn ssh(r: &mut Runner, keys: &[SshKey]) -> Result<String> {
     let no_pass = r.plan.no_ssh_passphrase;
     for k in keys {
@@ -582,6 +642,7 @@ fn ssh(r: &mut Runner, keys: &[SshKey]) -> Result<String> {
                         public.fingerprint(HashAlg::Sha256)
                     ),
                     credential: false,
+                    var: None,
                 },
             )?;
         }
@@ -593,6 +654,9 @@ fn ssh(r: &mut Runner, keys: &[SshKey]) -> Result<String> {
             };
             if k.dest.exists() {
                 if crate::ssh::opens_with(&k.dest, pass.as_deref().map(|p| &p[..]), &public)? {
+                    if pass.is_none() {
+                        ssh_keygen_check(&k.dest, &k.public)?;
+                    }
                     return Ok(("already written".into(), None));
                 }
                 bail!(
@@ -604,16 +668,30 @@ fn ssh(r: &mut Runner, keys: &[SshKey]) -> Result<String> {
                 bail!("{} is gone", k.path.display());
             }
             let oracle = r.oracle()?;
+            // written to a temporary file, fsynced, renamed, directory fsynced; the encrypted
+            // original stays where it is until the keep step moves it to kept/ssh
             crate::ssh::export(oracle, &k.path, &k.dest, pass.as_deref().map(|p| &p[..]))?;
+            if pass.is_none() {
+                ssh_keygen_check(&k.dest, &k.public)?;
+            }
             Ok((
-                format!(
-                    "written as {} and read back with the new passphrase",
-                    tilde(&k.dest)
-                ),
+                if pass.is_none() {
+                    format!(
+                        "written as {} without a passphrase; ssh-keygen -y gives its public key",
+                        tilde(&k.dest)
+                    )
+                } else {
+                    format!(
+                        "written as {} and read back with the new passphrase",
+                        tilde(&k.dest)
+                    )
+                },
                 Some(json!({"dest": k.dest})),
             ))
         })?;
-        if cfg!(target_os = "macos") {
+        // only for a password store: with the folder, keys are plain files and nothing goes
+        // to an agent or the keychain
+        if cfg!(target_os = "macos") && r.plan.stores.to != StoreKind::Folder {
             r.step(&st("agent"), |r| {
                 let Some(sock) = system_agent() else {
                     r.notes.push(format!(
@@ -820,24 +898,8 @@ fn git(r: &mut Runner, configs: &[crate::git::SigningConfig]) -> Result<String> 
             })?;
             let allowed = crate::paths::ssh_dir()?.join("allowed_signers");
             let public = PublicKey::from_openssh(&std::fs::read_to_string(&new_pub)?)?;
-            r.before_edit(&cfg.file)?;
-            r.before_edit(&allowed)?;
-            crate::git::merge_allowed_signers(&allowed, &[])?;
-            let principal = match crate::git::principal_for(&allowed, &public) {
-                Some(p) => p,
-                None => {
-                    let email = crate::git::config_get(&cfg.file, "user.email")
-                        .unwrap_or_else(|| "git".into());
-                    crate::git::merge_allowed_signers(
-                        &allowed,
-                        &[format!("{email} namespaces=\"git\" {line}")],
-                    )?;
-                    email
-                }
-            };
-            crate::git::hand_back(cfg, &new_pub, &allowed)?;
 
-            // check: sign as git does, verify with ssh-keygen against the allowed signers
+            // the passphrase of the key file, for the check
             let private = new_pub.with_extension("");
             let ssh_key = keys.iter().find(|k| k.dest == private).cloned();
             let pass = match &ssh_key {
@@ -862,17 +924,40 @@ fn git(r: &mut Runner, configs: &[crate::git::SigningConfig]) -> Result<String> 
                     }
                 }
             };
+            // a key without a passphrase: git signs with the key file itself, no agent needed;
+            // with a passphrase: with the .pub, through the agent that holds it
+            let signing = if pass.is_none() { private.clone() } else { new_pub.clone() };
+            r.before_edit(&cfg.file)?;
+            r.before_edit(&allowed)?;
+            crate::git::merge_allowed_signers(&allowed, &[])?;
+            let principal = match crate::git::principal_for(&allowed, &public) {
+                Some(p) => p,
+                None => {
+                    let email = crate::git::config_get(&cfg.file, "user.email")
+                        .unwrap_or_else(|| "git".into());
+                    crate::git::merge_allowed_signers(
+                        &allowed,
+                        &[format!("{email} namespaces=\"git\" {line}")],
+                    )?;
+                    email
+                }
+            };
+            crate::git::hand_back(cfg, &signing, &allowed)?;
+
+            // check: sign as git does, verify with ssh-keygen against the allowed signers
             let key = crate::ssh::open_file(&private, pass.as_deref().map(|p| &p[..]))?;
             crate::git::test_sign(&key, &allowed, &principal)?;
             Ok((
                 format!(
                     "signs with {} through ssh-keygen; test signature verified",
-                    tilde(&new_pub)
+                    tilde(&signing)
                 ),
-                Some(json!({"pub": new_pub})),
+                Some(json!({"pub": new_pub, "key": signing})),
             ))
         })?;
-        if let Some(p) = pub_path.and_then(|d| d["pub"].as_str().map(PathBuf::from)) {
+        if let Some(p) =
+            pub_path.and_then(|d| d["key"].as_str().or_else(|| d["pub"].as_str()).map(PathBuf::from))
+        {
             if !used.contains(&p) {
                 used.push(p);
             }
@@ -1071,10 +1156,7 @@ fn local_state(r: &mut Runner) -> Result<String> {
         }
         Ok(("sealctl's folders are gone".into(), None))
     })?;
-    Ok(
-        "local files: sealctl's folders removed; the store and certificate are in the run folder's kept/."
-            .into(),
-    )
+    Ok("local files: sealctl's folders removed; the store and certificate are in the folder's kept/.".into())
 }
 
 // ---------------------------------------------------------------- reports ----

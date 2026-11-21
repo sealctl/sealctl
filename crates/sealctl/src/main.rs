@@ -173,7 +173,8 @@ enum Cmd {
     },
 
     /// Leave sealctl: hand volumes, backups, SSH keys, secrets, git signing and AI settings
-    /// back under passwords of your own (shows the plan first; `--dry-run` only shows it).
+    /// back in plain, standard form, into ~/sealctl-unsealed-<date> (shows the plan first;
+    /// `--dry-run` only shows it).
     Unseal(UnsealArgs),
 
     /// (internal) SSH_ASKPASS helper for `unseal`: prints the passphrase waiting in the pipe
@@ -195,7 +196,9 @@ enum Cmd {
 #[derive(clap::Args)]
 #[command(
     after_help = "Objects: secrets | secret <name> | volume <name> | backup <volume> | ssh <name> | git | ai [TOOL...]\n\
-Your volumes and backups stay encrypted; they will open with your own passwords. See docs/unseal.md."
+Volumes and backups stay encrypted, with new random passwords saved in ~/sealctl-unsealed-<date>/passwords.txt;\n\
+SSH keys end with no passphrase; secrets go to secrets.env in that folder. Delete the folder once everything\n\
+works; sealctl never does. See docs/unseal.md."
 )]
 struct UnsealArgs {
     /// What to hand back (see below); or --all.
@@ -207,10 +210,11 @@ struct UnsealArgs {
     /// Continue the newest unfinished run.
     #[arg(long)]
     resume: bool,
-    /// Where new passwords go (default: the keychain).
+    /// Where new passwords go (default: folder, i.e. passwords.txt in the run folder).
     #[arg(long, value_enum)]
     to: Option<sealctl::unseal::store::StoreKind>,
-    /// Where secrets and backup storage credentials go (default: same as --to).
+    /// Where secrets and backup storage credentials go (default: same as --to; the folder
+    /// for --to show).
     #[arg(long, value_enum)]
     secrets_to: Option<sealctl::unseal::store::StoreKind>,
     /// The file for --secrets-to env (default ~/sealctl-secrets.env, mode 0600).
@@ -225,7 +229,7 @@ struct UnsealArgs {
     /// Type each new password (twice, 12+ characters) instead of generating it.
     #[arg(long)]
     type_passwords: bool,
-    /// Write SSH keys without a passphrase.
+    /// Write SSH keys without a passphrase (always with --to folder, the default).
     #[arg(long)]
     no_ssh_passphrase: bool,
     /// Keep rules that stop AI agents reading .env files (asked otherwise).

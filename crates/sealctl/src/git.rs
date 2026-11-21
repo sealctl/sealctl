@@ -216,14 +216,7 @@ pub fn global_config_files() -> Result<Vec<std::path::PathBuf>> {
 }
 
 /// Folders never searched for repositories.
-const SKIP_DIRS: &[&str] = &[
-    "Library",
-    "node_modules",
-    ".cache",
-    "target",
-    ".Trash",
-    ".sealctl-unseal",
-];
+const SKIP_DIRS: &[&str] = &["Library", "node_modules", ".cache", "target", ".Trash"];
 
 /// Every git config that signs through sealctl: the global ones, and `.git/config` of
 /// repositories under `$HOME` (6 levels deep, skipping Library, node_modules, .cache, target).
@@ -263,7 +256,8 @@ pub fn find_configs() -> Result<Vec<SigningConfig>> {
                 }
                 continue;
             }
-            if SKIP_DIRS.contains(&name.as_ref()) {
+            // the run folders of `sealctl unseal` hold copies of edited git configs
+            if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(crate::unseal::journal::PREFIX) {
                 continue;
             }
             walk(&e.path(), depth + 1, found);
@@ -312,11 +306,12 @@ pub fn merge_allowed_signers(dest: &std::path::Path, extra: &[String]) -> Result
     Ok(true)
 }
 
-/// Point one config at standard `ssh-keygen` signing with `new_pub`: `gpg.ssh.program` unset,
-/// `user.signingkey` = the `.pub` path, `gpg.ssh.allowedSignersFile` = `allowed`.
-/// `gpg.format`, `commit.gpgsign` and `tag.gpgsign` stay as they are.
-pub fn hand_back(cfg: &SigningConfig, new_pub: &std::path::Path, allowed: &std::path::Path) -> Result<()> {
-    config_set(&cfg.file, "user.signingkey", &new_pub.to_string_lossy())?;
+/// Point one config at standard `ssh-keygen` signing with `key`: `gpg.ssh.program` unset,
+/// `user.signingkey` = `key` (a key file without a passphrase, or the `.pub` of one an agent
+/// holds), `gpg.ssh.allowedSignersFile` = `allowed`. `gpg.format`, `commit.gpgsign` and
+/// `tag.gpgsign` stay as they are.
+pub fn hand_back(cfg: &SigningConfig, key: &std::path::Path, allowed: &std::path::Path) -> Result<()> {
+    config_set(&cfg.file, "user.signingkey", &key.to_string_lossy())?;
     config_set(
         &cfg.file,
         "gpg.ssh.allowedSignersFile",
