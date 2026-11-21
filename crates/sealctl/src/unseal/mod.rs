@@ -469,8 +469,32 @@ fn problems(objects: &[Object], cfg: &store::Config) -> Vec<String> {
             p.push(format!("--secrets-to {}: {e}", cfg.secrets_to.as_str()));
         }
     }
+    let keys: Vec<SshKey> = objects
+        .iter()
+        .filter_map(|o| match o {
+            Object::Ssh { keys } => Some(keys.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     for o in objects {
         match o {
+            Object::Git { configs } => {
+                for c in configs {
+                    let line = c.signingkey.as_deref().and_then(crate::git::signingkey_line);
+                    let found = line
+                        .as_deref()
+                        .map(|l| objects::find_pub(l, &keys).ok().flatten().is_some())
+                        .unwrap_or(false);
+                    if !found {
+                        p.push(format!(
+                            "{} signs with a key that is not one of sealctl's key files (the Ledger's own key?); \
+                             point it at a key file first (sealctl git setup --key <name>), or --skip git",
+                            tilde(&c.file)
+                        ));
+                    }
+                }
+            }
             Object::Secrets { names, .. } if cfg.secrets_to == StoreKind::Env => {
                 let mut seen = std::collections::BTreeMap::new();
                 for n in names {

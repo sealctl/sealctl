@@ -753,7 +753,7 @@ fn git_step_id(cfg: &crate::git::SigningConfig) -> String {
 }
 
 /// The handed-back `.pub` whose key is `line` (`ssh-ed25519 AAAA…`).
-fn find_pub(line: &str, keys: &[SshKey]) -> Result<Option<PathBuf>> {
+pub(super) fn find_pub(line: &str, keys: &[SshKey]) -> Result<Option<PathBuf>> {
     for k in keys {
         if k.public == line {
             return Ok(Some(crate::ssh::public_path(&k.dest)));

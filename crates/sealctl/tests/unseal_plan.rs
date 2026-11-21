@@ -177,4 +177,29 @@ fn refused_inside_ai_agents_and_without_a_terminal() {
     let out = h.unseal(&["--resume"], "", &[]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     assert_eq!(common::tree(&h.home), before);
+
+    // git signing with a key that is not one of sealctl's files (the Ledger's own key) is a
+    // problem the plan names; a real run refuses to start (exit 9) and changes nothing
+    let global = h.home.join(".gitconfig");
+    assert!(std::process::Command::new("git")
+        .args(["config", "--file"])
+        .arg(&global)
+        .args([
+            "user.signingkey",
+            "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherLedgerKey0000000000000000000000000000"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let before = common::tree(&h.home);
+    let out = h.unseal(&["--all", "--dry-run", "--to", "op"], "", &[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        err.contains("To fix before it can start:") && err.contains("--skip git"),
+        "{err}"
+    );
+    let out = h.unseal(&["--all", "--to", "op"], "unseal\n", &[]);
+    assert_eq!(out.status.code(), Some(9), "{}", text(&out));
+    assert_eq!(common::tree(&h.home), before);
 }
