@@ -1,0 +1,100 @@
+{
+  "scheme": "sealctl-relay-v1",
+  "note": "Ed25519 seeds are test keys derived from the test words in docs/protocol.md Appendix A. Signatures are deterministic (RFC 8032).",
+  "keys": {
+    "machine": {
+      "seed": "0989ff28e15082da9bb580b18e7ce58d8c666779a43656a9896312ab698d1540",
+      "public": "0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8"
+    },
+    "phone": {
+      "seed": "3c3bee53d281b885c38f4630822bec3610231d463687584f68ff8c1251efb8bc",
+      "public": "6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk",
+      "words": "B"
+    },
+    "oldPhone": {
+      "seed": "da11aecf08f293cc3b477215bf611239942b322944328a2ba8a7e9b1d50d9198",
+      "public": "4Zkfuuv3Jt7aychw6n9UcFN8xz5RMHzxogXuGEG_-8Y",
+      "words": "A"
+    }
+  },
+  "vectors": [
+    {
+      "name": "machine reads the licence",
+      "signer": "machine",
+      "method": "GET",
+      "path": "/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/licence",
+      "time": "1795251600",
+      "body": "",
+      "bodyHash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "canonical": "sealctl-relay-v1\nGET\n/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/licence\n1795251600\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "key": "0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8",
+      "signature": "nQWDa5Q8smZ_ZQc3Ekdj8LIJZlC5ikSAd4axMvIS3jQwoIx6NiDQrUzSHZUPMJZfMBv9kmMz0ex2NNg5p7InAA"
+    },
+    {
+      "name": "machine opens a wait socket",
+      "signer": "machine",
+      "method": "GET",
+      "path": "/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/wait",
+      "time": "1795251600",
+      "body": "",
+      "bodyHash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "canonical": "sealctl-relay-v1\nGET\n/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/wait\n1795251600\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "key": "0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8",
+      "signature": "C7cngd2q9TNh9zavRAWTCZITcdhr89x7VMCfHetZV_Hxjbtm8lmOy2mGze9X1Zo8J1kpIB9DR8NU1GGRA91JDg"
+    },
+    {
+      "name": "machine looks itself up",
+      "signer": "machine",
+      "method": "GET",
+      "path": "/v1/machines/0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8",
+      "time": "1795251600",
+      "body": "",
+      "bodyHash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "canonical": "sealctl-relay-v1\nGET\n/v1/machines/0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8\n1795251600\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "key": "0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8",
+      "signature": "IdFnWMLQ0HqDyJxH3xsaSnHtzLM3frDbnjeKa_y9M8qeSCHKeKweN73UXFHLoccVRJ5AeQPo8jpnBwnLn97XDA"
+    },
+    {
+      "name": "phone registers a machine",
+      "signer": "phone",
+      "method": "POST",
+      "path": "/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/machines",
+      "time": "1795251600",
+      "body": "{\"machine\":\"0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8\",\"name\":\"dev@mbp.example.com\",\"os\":\"macOS 15.2\",\"model\":\"Mac15,3\",\"proof\":\"EJ4y1Oe4rkm4dufqP-AHPtR5WIsso3php0rQmPs65AThSRiImp_7ileFdhzPDuG22z2UdiEIFFxfUcicBHpPig\"}",
+      "bodyHash": "JrVOtaR5nxz6mJLXsGq7_0WOQ24TNdV2l8Yg4aiS3MM",
+      "canonical": "sealctl-relay-v1\nPOST\n/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/machines\n1795251600\nJrVOtaR5nxz6mJLXsGq7_0WOQ24TNdV2l8Yg4aiS3MM",
+      "key": "6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk",
+      "signature": "HnhlbaNcBKkPrE45ltkVdYnT2uiHg815GraqFu_MWdBnlLSrMtGcANA4w1n56SIQA92uBZRd_HyUAyK-GrlEDQ"
+    },
+    {
+      "name": "phone lists requests with a query",
+      "signer": "phone",
+      "method": "GET",
+      "path": "/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/requests?limit=10",
+      "time": "1795251600",
+      "body": "",
+      "bodyHash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "canonical": "sealctl-relay-v1\nGET\n/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/requests?limit=10\n1795251600\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "key": "6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk",
+      "signature": "mJtAXH-_iKHTgoOKquPj31gPQbogaUNctMmT0Wg2Qpca3z2spy_I4jsiCAXVEyVOAq9pbvpfAJYcnnJz8WaWAQ"
+    },
+    {
+      "name": "machine unpairs itself",
+      "signer": "machine",
+      "method": "DELETE",
+      "path": "/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/machines/0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8",
+      "time": "1795251600",
+      "body": "",
+      "bodyHash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "canonical": "sealctl-relay-v1\nDELETE\n/v1/phones/6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk/machines/0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8\n1795251600\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+      "key": "0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8",
+      "signature": "fnNmmizsWhg6y2wuoSY0ECe_bfdBeNPGmHpytHj-487X_M0_dRV25HGHkIqxS8e8SlsLv-k6Ni2Pvc1Z8cAGDg"
+    }
+  ],
+  "licenceMove": {
+    "old": "4Zkfuuv3Jt7aychw6n9UcFN8xz5RMHzxogXuGEG_-8Y",
+    "new": "6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk",
+    "message": "sealctl-licence-move-v1\n4Zkfuuv3Jt7aychw6n9UcFN8xz5RMHzxogXuGEG_-8Y\n6jOhto9rTH8m9Up6iegjDiB66iuP5cbQcp5Jsw0S-Vk",
+    "proof": "C3mPZonDdXNMNe-QesIvCGaljfjLeMpksxUYoEHrMLd5IrdHWd-hDN38mDvdmpRrF7LgwLU9WrDKgAA8Bv0kBQ"
+  }
+}
