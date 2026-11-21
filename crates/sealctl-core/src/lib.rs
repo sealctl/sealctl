@@ -38,6 +38,9 @@ mod time;
 pub mod wire;
 pub mod words;
 
+#[cfg(test)]
+mod tests;
+
 pub use channel::{open_machine_status, seal_machine_message};
 pub use error::{CoreError, Result};
 pub use keys::{key_check, ObjectKey, Purpose};
