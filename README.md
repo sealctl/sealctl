@@ -170,20 +170,25 @@ enter it about once per session.
 
 ## Leaving sealctl
 
-`sealctl unseal` hands everything back under passwords of your own: volumes and backups **stay
-encrypted** and open with your own passphrase, SSH keys become standard key files, secrets go
-to your password manager, and sealctl's services, settings and AI hooks are removed. New
-passwords go to the macOS Keychain (or the Secret Service) by default, or to 1Password,
-Bitwarden, or shown once (`--to op|bw|show`).
+`sealctl unseal` is the inverse of sealing: everything comes back in plain, standard form, in
+one folder you delete when everything works. Volumes and backups **stay encrypted** under a new
+random password saved in `~/sealctl-unsealed-<date>/passwords.txt` (written and synced before it
+is set); SSH keys become standard key files with no passphrase; secrets go to `secrets.env` and
+restic settings to `backup-<volume>.env` in the same folder; sealctl's services, settings and AI
+hooks are removed. Nothing goes to Keychain, 1Password or Bitwarden unless you ask
+(`--to keychain|op|bw|show`). The folder is 0700, excluded from Time Machine, and AI agents get
+deny rules for it; sealctl never deletes it.
 
 ```sh
 sealctl unseal --all --dry-run     # the plan; changes nothing
 sealctl unseal --all               # type "unseal" to start; resumable with --resume
+rm -rf ~/sealctl-unsealed-<date>   # you, once the new passwords and keys work
 ```
 
-Every object is opened with the new password before sealctl's key is removed, every step is
-journaled, and every edited file is copied first. Release 0.6.0 is the last one that reads the
-Ledger: to move to sealctl 0.7, unseal with 0.6.0 first. Details: [docs/unseal.md](docs/unseal.md).
+Every new password is durable in the folder and read back before it is used, every object is
+opened with it before sealctl's key is removed, every step is journaled with `fsync`, and every
+edited file is copied first. Release 0.6.0 is the last one that reads the Ledger: to move to
+sealctl 0.7, unseal with 0.6.0 first. Details: [docs/unseal.md](docs/unseal.md).
 
 ## Recovery
 

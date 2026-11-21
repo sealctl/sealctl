@@ -166,7 +166,7 @@ Paths follow 0.5.0: XDG variables when set, else these defaults, on macOS and Li
 | `~/.local/state/sealctl/migrate.json` | Re-encryption job state | No |
 | `~/.local/state/sealctl/backup/<name>.toml` | Last backup times and last error | No |
 | `~/.local/state/sealctl/daemon.log` | Daemon log, rotated at 1 MB, 3 files | Must not be |
-| `~/.sealctl-unseal/<run>/` | One `seal` or `unseal` run: plan, journal, copies of edited files, the hand-back list, objects kept for safety (section 18.4). Outside sealctl's own folders so that `unseal --all` can remove those | No |
+| `~/sealctl-unsealed-<date>/` | One `seal` or `unseal` run: plan, journal, copies of edited files, the hand-back list, objects kept for safety, and (`unseal`) the new passwords and secrets in plain form (section 18.4). Visible, outside sealctl's own folders so that `unseal --all` can remove those; deleted by the user, never by sealctl | No (plain passwords; excluded from Time Machine) |
 | `~/.ssh/sealctl_<name>.pub` | SSH public keys (0644) | No |
 | `~/Library/LaunchAgents/com.sealctl.daemon.plist`, `com.sealctl.backup.plist`, `com.sealctl.migrate.plist` (0644) | macOS services | No |
 | `~/.config/systemd/user/sealctl.service`, `sealctl-backup.{service,timer}`, `sealctl-migrate.service` (0644) | Linux services | No |
@@ -735,7 +735,8 @@ The same rules, journal and password stores serve both directions. Release 0.6.0
 | Every edited file copied | Before its first edit, each file (`~/.ssh/config`, shell rc files, agent settings, git config files) is copied into the run folder with its mode |
 | No phone, relay or Ledger needed | `unseal` gets keys from the phone when it answers, with a `keys` request whose `ctx.subject` is `{"k": "machine", "n": "unseal"}`, several when the objects do not fit in one body (the phone always shows it as One tap). With `--words`, or when the phone or relay cannot be reached, it asks for the 24 words as `recover` does |
 | A person at a terminal | stdin and stderr must be terminals; refused inside an AI agent with exit 8. `--all` has no `--yes` |
-| No values shown | Values and passwords go only to the chosen store and are read back to check them by SHA-256 in memory. The only exception is the store `show`, chosen by the user, which writes each new password once to `/dev/tty` |
+| No values shown | Values and passwords go only to the chosen store — by default the run folder's plain files (18.3) — and are read back to check them by SHA-256 in memory. The only exception is the store `show`, chosen by the user, which writes each new password once to `/dev/tty` |
+| Write ahead, durably | A new password is durable where it was stored (temporary file, `fsync`, rename, directory `fsync`) and read back before the operation that depends on it. Every file sealctl writes is replaced the same way; journal lines are `fsync`ed. A power cut leaves either the old or the new state of every file, and `--resume` continues |
 | Nothing deleted that could be needed | Data is never deleted. Replaced files and the old store folder move to the run folder's `kept/`, still encrypted, and the final message says where |
 
 ### 18.2 Commands
@@ -753,7 +754,7 @@ sealctl unseal --all [--skip <kind>/<name>]... [--keep-store]
 sealctl unseal --resume
 
 Password and secret stores (both commands):
-  [--to keychain|op|bw|show] [--secrets-to keychain|op|bw|env] [--env-file F]
+  [--to folder|keychain|op|bw|show] [--secrets-to folder|keychain|op|bw|env] [--env-file F]
   [--op-vault V] [--bw-folder F] [--type-passwords] [--no-ssh-passphrase]
   [--keep-env-rules | --drop-env-rules] [--words] [--dry-run] [--json]
 ```
@@ -778,12 +779,12 @@ Aliases kept from earlier commands: `volume import` is `seal volume`, `ssh impor
 | Object | Steps | Check before sealctl's key is removed | Left behind |
 | --- | --- | --- | --- |
 | Secret store | Each value, own-approval secrets included, to the secrets store (18.3) | Every value read back with the same SHA-256 | The store folder moved to `kept/store` (still sealed) unless `--keep-store` |
-| APFS volume | `diskutil apfs changePassphrase` from `hex(volume key)` to the new passphrase; the hint cleared with `setPassphraseHint ... -hint ""`; `<mount>/.sealctl/` removed (the volume is mounted for this if it was not, and left as it was found) | `unlockVolume -verify` passes with the new passphrase read back from the store and fails with the derived one | The volume, still encrypted. The plan says: `safe stays encrypted; it will open with your own passphrase.` |
+| APFS volume | `diskutil apfs changePassphrase` from `hex(volume key)` to the new passphrase; the hint cleared with `setPassphraseHint ... -hint ""`; `<mount>/.sealctl/` removed (the volume is mounted for this if it was not, and left as it was found) | `unlockVolume -verify` passes with the new passphrase read back from the store and fails with the derived one | The volume, still encrypted. The plan says: `safe stays encrypted; it will open with a new passphrase (passwords.txt).` |
 | Sparse bundle | `hdiutil chpass`; `sealctl.id` removed | `hdiutil attach -nomount` with the new passphrase; the old fails | The bundle, still encrypted |
 | LUKS | `luksAddKey` with the new passphrase; sealctl's slot found with `--test-passphrase -v` and removed with `luksKillSlot`; token `sealctl` removed (`cryptsetup token remove`) | `--test-passphrase` passes with the new one before the kill; the derived one fails after it | The LUKS file, still encrypted |
 | Restic repository | `restic key add --user "$USER" --host <hostname>` with the new password; storage credentials to the secrets store; sealctl's key removed (`restic key remove`), with old versions of that key file deleted as in 16.1; schedule and on-lock backups removed | `restic cat config` with the new password; after the removal, the derived password gives "wrong password" | The repository with all snapshots. The plan says `stays encrypted; it will open with your own password` and that backups no longer run by themselves |
-| SSH key | `ssh/<n>` written as `~/.ssh/<n>` (0600, `<n>-1` if taken) and `.pub` (0644), OpenSSH format, encrypted with the new passphrase (none only with `--no-ssh-passphrase`); macOS: `ssh-add --apple-use-keychain`, with the passphrase given through `SSH_ASKPASS` (the hidden `sealctl askpass`, reading it from a pipe); `~/.ssh/config`: `IdentityAgent <sealctl socket>` lines removed, `IdentityFile` lines naming `sealctl_<n>` rewritten, and on macOS `UseKeychain yes` and `AddKeysToAgent yes` added under `Host *` when missing; shell rc lines exporting `SSH_AUTH_SOCK=<sealctl socket>` commented out | The new file opens with the passphrase read back from the store and has the same public key; on macOS `ssh-add -l` against the system agent lists it | A standard key file |
-| Git signing | `--global` config and every `.git/config` under `$HOME` (depth 6, skipping `Library`, `node_modules`, `.cache`, `target`) whose `gpg.ssh.program` is sealctl's: `gpg.ssh.program` unset, `user.signingkey` set to the new `.pub` path, `gpg.ssh.allowedSignersFile` to `~/.ssh/allowed_signers` (sealctl's lines appended); `gpg.format`, `commit.gpgsign`, `tag.gpgsign` kept | `ssh-keygen -Y sign -n git` of a test buffer with the new key, then `ssh-keygen -Y verify` against the allowed signers file | Signing through normal `ssh-keygen` |
+| SSH key | `ssh/<n>` written as `~/.ssh/<n>` (0600, `<n>-1` if taken) and `.pub` (0644), OpenSSH format. With the default store `folder`: no passphrase, nothing added to an agent or the keychain, checked with `ssh-keygen -y -P "" -f`. With a password store: encrypted with the new passphrase (none with `--no-ssh-passphrase`); macOS: `ssh-add --apple-use-keychain`, with the passphrase given through `SSH_ASKPASS` (the hidden `sealctl askpass`, reading it from a pipe); `~/.ssh/config`: `IdentityAgent <sealctl socket>` lines removed, `IdentityFile` lines naming `sealctl_<n>` rewritten, and on macOS `UseKeychain yes` and `AddKeysToAgent yes` added under `Host *` when missing; shell rc lines exporting `SSH_AUTH_SOCK=<sealctl socket>` commented out | The new file opens with the passphrase read back from the store and has the same public key; on macOS `ssh-add -l` against the system agent lists it | A standard key file |
+| Git signing | `--global` config and every `.git/config` under `$HOME` (depth 6, skipping `Library`, `node_modules`, `.cache`, `target`) whose `gpg.ssh.program` is sealctl's: `gpg.ssh.program` unset, `user.signingkey` set to the key file (no passphrase) or its `.pub` (with one), `gpg.ssh.allowedSignersFile` to `~/.ssh/allowed_signers` (sealctl's lines appended); `gpg.format`, `commit.gpgsign`, `tag.gpgsign` kept | `ssh-keygen -Y sign -n git` of a test buffer with the new key, then `ssh-keygen -Y verify` against the allowed signers file | Signing through normal `ssh-keygen` |
 | AI integrations | `ai uninstall` for every installed tool: hooks, skill, session text, deny rules, policy files. Then, unless `--drop-env-rules` (asked once otherwise): Claude Code and Qwen Code get `permissions.deny` entries `Read(**/.env)`, `Read(**/.env.*)`, `Read(~/.aws/credentials)`, `Read(~/.netrc)`, `Read(~/.git-credentials)`, `Read(~/.npmrc)` and the `--env-file` path if used; Gemini CLI gets `~/.gemini/policies/deny-env-files.toml` with a comment naming `sealctl unseal`. Tools without such a setting are listed as having none | `ai status` shows nothing installed; every edited file still parses | Optional deny rules that need no sealctl |
 | Services | Daemon, backup schedule and migration units removed; the daemon stopped | `launchctl print` or `systemctl --user status` finds none | |
 | Local state | `~/.config/sealctl`, `~/.local/state/sealctl`, `~/.ssh/sealctl_*.pub` removed; `~/.local/share/sealctl` moved to `kept/` | The folders are gone | |
@@ -794,15 +795,16 @@ Aliases kept from earlier commands: `volume import` is `seal volume`, `ssh impor
 
 ### 18.3 Where passwords and secrets go
 
-New passwords (volumes, backups, SSH keys) go to one store, chosen once per run: `--to`, or a question on the terminal listing only the stores present. Secrets and backup storage credentials go to `--secrets-to`, which defaults to the same store.
+`unseal` is the inverse of `seal`: by default everything comes back in plain, standard form into the run folder (18.4), and nothing goes to a password store. New passwords (volumes, backups, SSH keys with a store) go to `--to`, default `folder`. Secrets and backup storage credentials go to `--secrets-to`, which defaults to the same store (the folder for `--to show`). With `folder`, SSH keys end without a passphrase.
 
 | Store | Writes | Reads back | Needs |
 | --- | --- | --- | --- |
-| `keychain` (default) | macOS Keychain or the Linux Secret Service (GNOME Keyring, KeePassXC) through the `keyring` crate: service `sealctl-unsealed`, account `<kind>/<name>` (for example `volume/safe`, `secret/shop/openai-api-key`, `backup/safe-backup/AWS_SECRET_ACCESS_KEY`), label `sealctl: volume safe` | The same API | macOS; on Linux a running Secret Service, else this store is not offered |
+| `folder` (default) | The run folder, 0600 files, written durably: `passwords.txt` (`volume safe: <passphrase>`, `backup safe: <password>`), `secrets.env` (`NAME="value"`, the name from the secret name upper-cased with `/`, `-`, `.`, `@`, `+` as `_`, `_2` on a clash), `backup-<volume>.env` (`RESTIC_REPOSITORY`, `RESTIC_PASSWORD`, storage credentials). Double quotes with `\ " $` and backquote escaped and line breaks kept: a POSIX shell (`set -a; . file`) and the dotenv parser read back the same bytes | The file, parsed | Nothing |
+| `keychain` | macOS Keychain or the Linux Secret Service (GNOME Keyring, KeePassXC): service `sealctl-unsealed`, account `<kind>/<name>` (for example `volume/safe`, `secret/shop/openai-api-key`, `backup/safe-backup/AWS_SECRET_ACCESS_KEY`), label `sealctl: volume safe`, `sealctl: backup safe password`, `sealctl: secret shop/openai-api-key` (macOS: the Security framework, since the `keyring` crate sets no label) | The `keyring` crate | macOS; on Linux a running Secret Service |
 | `op` | 1Password: `op item create` with a JSON item template on stdin; category Password (secrets: API Credential); title as the label; tag `sealctl`; vault `--op-vault` or the account's default | `op read op://<vault>/<item id>/password` into memory | `op` signed in |
 | `bw` | Bitwarden: `bw encode` and `bw create item`, both reading stdin; folder `--bw-folder` | `bw get password <item id>` into memory | `bw` unlocked (`BW_SESSION` set) |
 | `show` | Opt-in. Each new password written once to `/dev/tty`: `New passphrase for volume safe: …` then `Write it down. Type its last 4 characters to go on:` | The 4 characters typed | A terminal |
-| `env` (secrets only) | `--env-file` (default `~/sealctl-secrets.env`), mode 0600, `NAME=value`, the name from the secret name upper-cased with `/`, `-`, `.` as `_`; two secrets with the same variable name stop the plan | Parsed back with the dotenv parser | A warning in the plan: `This file holds your keys in plain text, where AI agents can read them. Move them to a password manager, then delete it.` |
+| `env` (secrets only) | `--env-file` (default `~/sealctl-secrets.env`), mode 0600, as `secrets.env` above | Parsed back with the dotenv parser | A warning in the plan: `This file holds your keys in plain text, where AI agents can read them. Move them to a password manager, then delete it.` |
 
 - Values reach `op`, `bw` and the OS keychain through stdin or the native API, never an argument or an environment variable.
 - New passwords are generated: 32 characters of `a-z0-9` in groups of four joined by `-` (about 165 bits), from OS randomness. `--type-passwords` asks for each one instead, twice, at least 12 characters.
@@ -830,10 +832,12 @@ New passwords (volumes, backups, SSH keys) go to one store, chosen once per run:
 
 ### 18.4 Run folder and journal
 
-Each `seal` or `unseal` run (other than `--dry-run`) makes `~/.sealctl-unseal/<run>/`, mode 0700, where `<run>` is the local start time, `2026-11-21T10-12-03`. It sits outside sealctl's folders so that `unseal --all` can remove those and still finish.
+Each `seal` or `unseal` run (other than `--dry-run`) makes `~/sealctl-unsealed-<date>/` (`-2`, `-3`, … when taken), mode 0700, files 0600, once the plan is confirmed. It is visible on purpose and sits outside sealctl's folders so that `unseal --all` can remove those and still finish. sealctl never deletes it; the final message tells the user to, with `rm -rf`, once the new passwords and keys work. Before anything is written in plain form: `README.txt`, `tmutil addexclusion` on macOS (a failure noted in the journal), and deny rules for `~/sealctl-unsealed-*` in every AI tool present that has such rules (Claude Code and Qwen Code `permissions.deny` `Read(~/sealctl-unsealed-*/**)` and `Bash(*sealctl-unsealed-*)`, Gemini CLI `policies/deny-sealctl-unsealed.toml`), which stay.
 
 | File | Content |
 | --- | --- |
+| `README.txt` | What is in the folder, the commands to check each item by hand, and to delete the folder |
+| `passwords.txt`, `secrets.env`, `backup-<volume>.env` | The `folder` store (18.3) |
 | `plan.json` | The plan as confirmed: objects, steps, chosen stores |
 | `journal.jsonl` | One line per step event |
 | `files/<path under $HOME>` | The copy of every file before its first edit, with its mode |
@@ -848,29 +852,36 @@ Journal line:
 {"v": 1, "t": "2026-11-21T10:14:02+01:00", "n": 7, "step": "volume:safe:change", "state": "done", "note": "passphrase changed; verify passed"}
 ```
 
-`state` is `start`, `done`, `failed` or `skipped`. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed.
+`state` is `start`, `done`, `failed` or `skipped`. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed; a line cut short by a power cut is dropped when the run is resumed. The folder's directory is `fsync`ed after each file it gains, and copies into `files/` and moves into `kept/` are made durable before the step that needs them goes on.
 
-- `--resume` takes the newest run without `done`. A plain `unseal --all` that finds one asks `Resume the run from 10:12? [Y/n]`.
+- `--resume` takes the newest run without `done`. A plain `unseal --all` that finds one asks `Resume the run in ~/sealctl-unsealed-2026-11-21? [Y/n]`.
 - For each step not `done`, the step's check runs first against the object (does the new password already open it? is sealctl's key already gone?), so a step interrupted after it took effect is recorded, not repeated.
 - Ctrl-C lets the current OS call finish, writes the journal line, and exits 13.
-- The final message names the run folder and says it can be deleted once everything opens with the new passwords.
+- The final message names the run folder, what is in it, and says to delete it (`rm -rf <folder>`) once the new passwords and keys work.
 
 ### 18.5 Plan and output
 
 ```text
 $ sealctl unseal --all
-This hands everything sealctl holds on dev@mbp.example.com back to you, under passwords of your own.
+This hands everything sealctl holds on dev@mbp.example.com back to you, in plain, standard form.
 
-New passwords go to: macOS Keychain   (change with --to keychain|op|bw|show)
-Secrets go to:       macOS Keychain   (change with --secrets-to keychain|op|bw|env)
+Everything goes into one new folder: ~/sealctl-unsealed-2026-11-21
+  - volumes and backups stay encrypted; each gets a new random password, saved in
+    passwords.txt in the folder before it is set;
+  - restic settings (repository, password, storage credentials) go into backup-<volume>.env;
+  - SSH keys end with no passphrase: plain key files in ~/.ssh;
+  - secrets are written in plain form into secrets.env in the folder.
+  Nothing is written to Keychain, 1Password or Bitwarden (--to keychain|op|bw|show for that).
+  Only you can read the folder; Claude Code is told not to read it; Time Machine skips it.
+  Delete it yourself once the new passwords and keys work. sealctl never deletes it.
 
- 1  secrets      7 secrets                → macOS Keychain, service sealctl-unsealed
- 2  backup       safe-backup (restic)     stays encrypted; it will open with your own password.
+ 1  secrets      7 secrets                → secrets.env in the folder, plain
+ 2  backup       safe-backup (restic)     stays encrypted; it will open with a new password (passwords.txt).
                                             sealctl's key is removed. Backups no longer run by themselves.
- 3  volume       safe (APFS)              stays encrypted; it will open with your own passphrase.
- 4  ssh keys     ed25519, github          → ~/.ssh/ed25519, ~/.ssh/github with your own passphrase, in the macOS keychain.
+ 3  volume       safe (APFS)              safe stays encrypted; it will open with a new passphrase (passwords.txt).
+ 4  ssh keys     ed25519, github          → ~/.ssh/ed25519, ~/.ssh/github with no passphrase
                                             sealctl's IdentityAgent line in ~/.ssh/config is removed.
- 5  git          signing                  keeps signing with ~/.ssh/ed25519.pub through ssh-keygen.
+ 5  git          signing                  keeps signing with ~/.ssh/ed25519 through ssh-keygen.
  6  AI tools     Claude Code, Codex       hooks, skill and session text removed.
  7  services     daemon, backup schedule  stopped and removed.
  8  local files  ~/.config/sealctl and ~/.local/state/sealctl removed; the store is kept in the run folder.
@@ -878,7 +889,7 @@ Secrets go to:       macOS Keychain   (change with --secrets-to keychain|op|bw|e
     last, by you brew uninstall sealctl/tap/sealctl
 
 Keep the rules that stop AI agents reading .env files? [Y/n]
-Run folder: ~/.sealctl-unseal/2026-11-21T10-12-03. If anything stops, run: sealctl unseal --resume
+If anything stops, run: sealctl unseal --resume
 Type unseal to start:
 ```
 
@@ -886,9 +897,11 @@ The plan and progress go to stderr; `--json` prints the plan (with `--dry-run`) 
 
 ```text
 Done. sealctl holds nothing on this machine.
-Your passwords: macOS Keychain, service sealctl-unsealed.
-Hand-back list: ~/.sealctl-unseal/2026-11-21T10-12-03/handback.json (no passwords in it).
+Everything is in ~/sealctl-unsealed-2026-11-21: passwords.txt, secrets.env, backup-safe-backup.env,
+README.txt, handback.json (no passwords in it).
 Remove the program: brew uninstall sealctl/tap/sealctl
+Once the new passwords and keys work, delete the folder:
+  rm -rf ~/sealctl-unsealed-2026-11-21
 Keep your paper card until no old copies of these backups or volumes remain.
 ```
 
@@ -911,6 +924,7 @@ Keep your paper card until no old copies of these backups or volumes remain.
 | Stores | Fake `op` and `bw` scripts on `PATH` that record argv and keep values in a temporary file: tests assert no value in any argv and that a changed read-back value stops the run. The keychain store against a test service name, removed after |
 | Integration | The real binary with the fake relay and scripted phone: `seal` and `unseal` of every kind, `unseal --all` on a fixture home with every object kind, `--dry-run` changes nothing (hashes of every file before and after), `--words` with no relay, agent refusal, no terminal |
 | Kill and resume | A test-only build (feature `test-hooks`) stops the process with SIGKILL after each step id in turn; `--resume` must reach the same end state as an uninterrupted run |
+| Power cut | The same, but first everything not made durable is thrown away: the build tracks every write, `fsync` and directory `fsync` of sealctl, and at the cut puts each file back to its durable state, removes files in the run folder never made durable, and leaves half a journal line. The cut must find nothing to throw away, and `--resume` must reach the same end state |
 | Real OS | macOS runner: APFS volume in a disk-image container and a sparse bundle, sealed then unsealed, checked with `diskutil apfs unlockVolume -verify` and `hdiutil attach`; `ssh-add --apple-use-keychain` with a temporary key; launchd units removed (`launchctl print` fails). Linux runner: LUKS file with `sudo cryptsetup`, slots and token checked with `luksDump`; Secret Service through `gnome-keyring-daemon` in `dbus-run-session`; systemd user units where a user bus exists. restic: folder repositories on both, MinIO with versioning on Linux |
 | Cross-version | CI builds 0.6.0 from its tag, unseals a fixture home made with the 0.5.0 software Ledger key, then the 0.7 binary runs `seal --from handback.json` and opens every object |
 | Leak | The leak tests of section 21 cover both commands: a canary value never appears in stdout, stderr, the run folder, the journal or logs |
@@ -1048,13 +1062,13 @@ In 0.5.0 a backup belongs to a volume, so it is named by its volume. `unseal sec
 
 | 0.5.0 object | Found by | Steps | Check before sealctl's key goes | Left behind |
 | --- | --- | --- | --- | --- |
-| Secrets | `secrets::list()`: `~/.local/share/sealctl/secrets/**/*.gpg` | Each value opened with the store password (`derive` purpose `secrets`, id `store`) and written to the secrets store | Each value read back from the store with the same SHA-256 | The `secrets/` folder moved to `kept/secrets` (still encrypted to the Ledger) |
-| Backup of a volume | `[backup]` in `~/.config/sealctl/volumes/<name>.toml`. Password and credentials from `<mount>/.sealctl/backup.toml` while the volume is mounted (the volume is mounted with its derived key for this if needed); else the password derived from `key_id`, or from the repository URL for repositories made before `key_id` existed, and credentials asked without echo | `restic key add --new-password-file /dev/fd/4`, the derived password on stdin and the new one on fd 4 (no staged file, unlike today's `backup::rekey`); the new key id noted from `restic key list --json`; credentials to the secrets store; `restic key remove <sealctl's key id>` run with the new password; `<mount>/.sealctl/` deleted; the schedule `io.github.oleksiyp.sealctl.backup` removed when no volume has a backup left | `restic cat config` opens with the new password and `key list` marks the new key current; after the removal the derived password gives "wrong password" | The repository and every snapshot, under the user's password |
-| APFS volume (`apfs-volume`) | `volume::Volume::list()` | `apfs::change` (`diskutil apfs changePassphrase <uuid> -user disk -oldStdinpassphrase -newStdinpassphrase`) from the derived passphrase to the new one | `diskutil apfs unlockVolume <uuid> -verify -stdinpassphrase` passes with the new passphrase read back from the store and fails with the derived one. If the new one fails, the change is reversed | The volume, still encrypted, under the user's passphrase; mounted or not as it was found |
+| Secrets | `secrets::list()`: `~/.local/share/sealctl/secrets/**/*.gpg` | Each value opened with the store password (`derive` purpose `secrets`, id `store`) and written to the secrets store (default: `secrets.env` in the run folder) | Each value read back from the store with the same SHA-256 | The `secrets/` folder moved to `kept/secrets` (still encrypted to the Ledger) |
+| Backup of a volume | `[backup]` in `~/.config/sealctl/volumes/<name>.toml`. Password and credentials from `<mount>/.sealctl/backup.toml` while the volume is mounted (the volume is mounted with its derived key for this if needed); else the password derived from `key_id`, or from the repository URL for repositories made before `key_id` existed, and credentials asked without echo | The new password durable in `passwords.txt` (or the `--to` store) and `backup-<volume>.env` written first; `restic key add --new-password-file /dev/fd/4`, the derived password on stdin and the new one on fd 4 (no staged file, unlike today's `backup::rekey`); the new key id noted from `restic key list --json`; credentials to the secrets store; `restic key remove <sealctl's key id>` run with the new password; `<mount>/.sealctl/` deleted; the schedule `io.github.oleksiyp.sealctl.backup` removed when no volume has a backup left | `restic cat config` opens with the new password and `key list` marks the new key current; after the removal the derived password gives "wrong password" | The repository and every snapshot, under the user's password |
+| APFS volume (`apfs-volume`) | `volume::Volume::list()` | A new random passphrase durable in `passwords.txt` (or the `--to` store) and read back, then `apfs::change` (`diskutil apfs changePassphrase <uuid> -user disk -oldStdinpassphrase -newStdinpassphrase`) from the derived passphrase to it | `diskutil apfs unlockVolume <uuid> -verify -stdinpassphrase` passes with the new passphrase read back from the store and fails with the derived one. If the new one fails, the change is reversed | The volume, still encrypted, under the user's passphrase; mounted or not as it was found |
 | Sparse bundle | Same | `sparsebundle::change_passphrase` (`hdiutil chpass -oldstdinpass -newstdinpass`); `<bundle>/sealctl.id` removed | `hdiutil attach -nomount -stdinpass` then `hdiutil detach` with the new passphrase; the derived one fails | The bundle, still encrypted |
 | LUKS file | Same | New `luks` functions replacing the `change_passphrase` stub: `cryptsetup luksAddKey --key-file /dev/fd/3 <file> /dev/fd/4`; sealctl's slot found with `cryptsetup open --test-passphrase -v --key-file=- <file>` ("Key slot N unlocked"); `cryptsetup luksKillSlot <file> N` with the new passphrase on stdin | `--test-passphrase` with the new passphrase passes before the kill; the derived one fails after it | The LUKS file, still encrypted |
-| SSH keys | `ssh::key_files()`: `~/.ssh/sealctl_<name>` | `ssh::unlock_file` with the derived passphrase; written with the new passphrase (the `ssh-key` crate's OpenSSH encryption, as `ssh-keygen` writes it) to `~/.ssh/<name>` (0600; `<name>-1` if taken) and `.pub` (0644); macOS: `ssh-add --apple-use-keychain ~/.ssh/<name>` through `sealctl askpass`; `~/.ssh/config` (and files it `Include`s): `IdentityAgent` lines naming `ssh-agent.sock` under `~/.local/state/sealctl` removed, `IdentityFile` lines naming `sealctl_<name>` rewritten, and on macOS `UseKeychain yes` and `AddKeysToAgent yes` added under `Host *` when missing; `export SSH_AUTH_SOCK=` lines naming that socket in `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zprofile`, `~/.config/fish/config.fish` commented out with `# removed by sealctl unseal:`; service `ssh::AGENT_LABEL` removed | The new file opens with the passphrase read back from the store and gives the same public key; on macOS `ssh-add -l` against the system agent lists its fingerprint | Standard key files. The old `sealctl_<name>` files moved to `kept/ssh` |
-| Git signing | `git config --global` and `.git/config` files under `$HOME` (depth 6, skipping `Library`, `node_modules`, `.cache`, `target`) whose `gpg.ssh.program` is `~/.config/sealctl/git-ssh-keygen` | `gpg.ssh.program` unset; `user.signingkey` `key::<line>` replaced by the path of the matching new `.pub`; `gpg.ssh.allowedSignersFile` set to `~/.ssh/allowed_signers`, with the lines of `~/.config/sealctl/allowed_signers` appended; `gpg.format`, `commit.gpgsign`, `tag.gpgsign` kept; the shim deleted | `ssh-keygen -Y sign -f <new .pub> -n git` of a test buffer, then `ssh-keygen -Y verify` with the allowed signers file | Signing through standard `ssh-keygen` |
+| SSH keys | `ssh::key_files()`: `~/.ssh/sealctl_<name>` | `ssh::unlock_file` with the derived passphrase; written durably (temporary file, `fsync`, rename, directory `fsync`) to `~/.ssh/<name>` (0600; `<name>-1` if taken) and `.pub` (0644): by default with no passphrase, checked with `ssh-keygen -y -P "" -f`, and nothing goes to an agent or the keychain; with a password store, encrypted with a new passphrase (the `ssh-key` crate's OpenSSH encryption) and on macOS `ssh-add --apple-use-keychain ~/.ssh/<name>` through `sealctl askpass`; `~/.ssh/config` (and files it `Include`s): `IdentityAgent` lines naming `ssh-agent.sock` under `~/.local/state/sealctl` removed, `IdentityFile` lines naming `sealctl_<name>` rewritten, and on macOS `UseKeychain yes` and `AddKeysToAgent yes` added under `Host *` when missing; `export SSH_AUTH_SOCK=` lines naming that socket in `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zprofile`, `~/.config/fish/config.fish` commented out with `# removed by sealctl unseal:`; service `ssh::AGENT_LABEL` removed | The new file opens (without a passphrase, or with the one read back from the store) and gives the same public key; with a store, on macOS `ssh-add -l` against the system agent lists its fingerprint | Standard key files. The old `sealctl_<name>` files moved to `kept/ssh` |
+| Git signing | `git config --global` and `.git/config` files under `$HOME` (depth 6, skipping `Library`, `node_modules`, `.cache`, `target`) whose `gpg.ssh.program` is `~/.config/sealctl/git-ssh-keygen` | `gpg.ssh.program` unset; `user.signingkey` `key::<line>` replaced by the path of the matching new key file (the `.pub` when it has a passphrase); `gpg.ssh.allowedSignersFile` set to `~/.ssh/allowed_signers`, with the lines of `~/.config/sealctl/allowed_signers` appended; `gpg.format`, `commit.gpgsign`, `tag.gpgsign` kept; the shim deleted | `ssh-keygen -Y sign -f <new .pub> -n git` of a test buffer, then `ssh-keygen -Y verify` with the allowed signers file | Signing through standard `ssh-keygen` |
 | AI integrations | `ai::status` for every tool in `ai::tools()` | `ai::uninstall` for each installed tool (hooks, skill, deny rules, the Gemini policy file, Cursor hooks; `write_json_after_strip` removes the `.before-sealctl` copies, so the run folder copies the files first). Then the `.env` rules of 18.2 unless `--drop-env-rules` | `ai::status` reports nothing installed; each edited file parses | Optional `.env` deny rules |
 | Services | `service::is_installed` for `io.github.oleksiyp.sealctl.ssh-agent` and `.backup` (launchd plists, systemd `sealctl-ssh-agent` and `sealctl-backup` units); a running `sealctl agent` | `service::uninstall` each; `agent::stop()` last, after every key is used | None installed; `agent.sock` gone | |
 | Local state | `~/.config/sealctl` (`keys/` certificate, `device-check-*`, `volumes/`, `allowed_signers`, `git-ssh-keygen`), `~/.local/share/sealctl`, `~/.local/state/sealctl` | Certificate moved to `kept/keys` (`--words` needs it to check old copies later); the rest removed | Folders gone | |
@@ -1064,27 +1078,37 @@ In 0.5.0 a backup belongs to a volume, so it is named by its volume. `unseal sec
 
 ```text
 $ sealctl unseal --all
-This hands everything sealctl 0.5 holds on this Mac back to you, under passwords of your own.
-Your files stay encrypted. Keys come from your Ledger: keep it connected with the OpenPGP app open.
+This hands everything sealctl 0.5 holds on this Mac back to you, in plain, standard form.
+Keys come from your Ledger: keep it connected with the OpenPGP app open.
 
-New passwords go to: macOS Keychain   (change with --to keychain|op|bw|show)
-Secrets go to:       macOS Keychain   (change with --secrets-to keychain|op|bw|env)
+Everything goes into one new folder: ~/sealctl-unsealed-2026-11-21
+  - volumes and backups stay encrypted; each gets a new random password, saved in
+    passwords.txt in the folder before it is set;
+  - restic settings (repository, password, storage credentials) go into backup-<volume>.env;
+  - SSH keys end with no passphrase: plain key files in ~/.ssh;
+  - secrets are written in plain form into secrets.env in the folder.
+  Nothing is written to Keychain, 1Password or Bitwarden (--to keychain|op|bw|show for that).
+  Only you can read the folder; Claude Code is told not to read it; Time Machine skips it.
+  Delete it yourself once the new passwords and keys work. sealctl never deletes it.
 
- 1  secrets      7 secrets                → macOS Keychain, service sealctl-unsealed
- 2  backup       of volume safe (restic)  stays encrypted; it will open with your own password.
+ 1  secrets      7 secrets                → secrets.env in the folder, plain
+                                            the store folder is kept, still encrypted, in the folder.
+ 2  backup       of volume safe (restic)  stays encrypted; it will open with a new password (passwords.txt).
                                             sealctl's key and the backup schedule are removed.
- 3  volume       safe (APFS)              stays encrypted; it will open with your own passphrase.
- 4  ssh keys     2 keys                   → ~/.ssh/<name> with your own passphrase, in the macOS keychain.
-                                            sealctl's SSH agent service is removed.
+                                            Backups no longer run by themselves.
+                                            repository: s3:https://s3.example.com/safe-backup
+ 3  volume       safe (APFS)              safe stays encrypted; it will open with a new passphrase (passwords.txt).
+ 4  ssh keys     2 keys                   → ~/.ssh/ed25519, ~/.ssh/github with no passphrase
+                                            sealctl's IdentityAgent lines in ~/.ssh/config are removed.
  5  git          global signing           keeps signing with your key through ssh-keygen.
- 6  AI tools     Claude Code, Codex       hooks and skill removed.
- 7  services     ssh-agent, backup        removed.
- 8  local files  ~/.config/sealctl, ~/.local/share/sealctl, ~/.local/state/sealctl removed;
-                                            the store and certificate are kept in the run folder.
+ 6  AI tools     Claude Code, Codex       hooks, skill and deny rules removed.
+ 7  services     ssh-agent, backup, session agent stopped and removed.
+ 8  local files                           ~/.config/sealctl, ~/.local/share/sealctl, ~/.local/state/sealctl removed;
+                                            the store and certificate are kept, encrypted, in the folder.
     last, by you brew uninstall sealctl/tap/sealctl
 
 Keep the rules that stop AI agents reading .env files? [Y/n]
-Run folder: ~/.sealctl-unseal/2026-11-21T10-12-03. If anything stops, run: sealctl unseal --resume
+If anything stops, run: sealctl unseal --resume
 Type unseal to start:
 ```
 
@@ -1092,11 +1116,19 @@ The end:
 
 ```text
 Done. sealctl 0.5 holds nothing on this Mac.
-Your passwords: macOS Keychain, service sealctl-unsealed.
-Hand-back list: ~/.sealctl-unseal/2026-11-21T10-12-03/handback.json (no passwords in it).
-Next: install sealctl 0.7 and run sealctl seal --from that file. Or remove sealctl:
+Everything is in ~/sealctl-unsealed-2026-11-21:
+  passwords.txt          the new passwords of your volumes and backups
+  secrets.env            your secrets, in plain text
+  backup-safe.env        restic settings (README.txt shows how to use them)
+  README.txt             how to check each item by hand
+  handback.json          the hand-back list (no passwords in it)
+SSH keys: ~/.ssh/ed25519, ~/.ssh/github, with no passphrase (add one with ssh-keygen -p -f <key>).
+To move to sealctl 0.7: install it and run sealctl seal --from ~/sealctl-unsealed-2026-11-21/handback.json. Or remove sealctl:
   brew uninstall sealctl/tap/sealctl
 Keep your Ledger and paper card until no old copies of these backups or volumes remain.
+Once the new passwords and keys work, delete the folder:
+  rm -rf ~/sealctl-unsealed-2026-11-21
+It holds your passwords and secrets in plain text. sealctl never deletes it.
 ```
 
 Output keeps 0.5.0's style for other commands; `unseal` itself prints no emoji.
@@ -1137,14 +1169,14 @@ Output keeps 0.5.0's style for other commands; `unseal` itself prints no emoji.
 
 1. `sealctl unseal --all --dry-run` lists exactly: 7 secrets; volume `safe` (APFS) and its restic backup `safe-backup`; the 2 `~/.ssh/sealctl_*` keys; global git signing; services `ssh-agent` and `backup`; every AI tool `sealctl ai status` shows installed. File hashes under `~` are unchanged afterwards.
 2. `sealctl unseal --all` with the Ledger ends with exit 0 and the end text; the PIN is asked once.
-3. `safe`: Finder and `diskutil apfs unlockVolume` open it with the passphrase from Keychain Access; `diskutil apfs list` still shows it encrypted; the old Ledger-derived passphrase no longer opens it.
-4. `safe-backup`: with the password and storage credentials from the Keychain, `restic snapshots` lists the same snapshot ids as before the run, `restic check` passes, `restic key list` shows one key, and a new `restic backup /Volumes/safe` succeeds.
-5. Secrets: 7 Keychain items under `sealctl-unsealed`, each recorded as read back in the journal; one opened by hand in Keychain Access.
-6. SSH: after logging out and in, `ssh -T git@github.com` works with no prompt; `ssh-add -l` lists both keys; `~/.ssh/config` has no sealctl socket.
+3. `safe`: Finder and `diskutil apfs unlockVolume` open it with the passphrase from the line `volume safe` in `~/sealctl-unsealed-<date>/passwords.txt`; `diskutil apfs list` still shows it encrypted; the old Ledger-derived passphrase no longer opens it.
+4. `safe-backup`: after `set -a; . ~/sealctl-unsealed-<date>/backup-safe.env; set +a`, `restic snapshots` lists the same snapshot ids as before the run, `restic check` passes, `restic key list` shows one key, and a new `restic backup /Volumes/safe` succeeds.
+5. Secrets: all 7 in `secrets.env`, each recorded as read back in the journal; nothing new in Keychain Access, 1Password or Bitwarden.
+6. SSH: `ssh -T git@github.com` works with no prompt; `ssh-keygen -y -f ~/.ssh/<name>` asks nothing; `~/.ssh/config` has no sealctl socket.
 7. Git: a new commit is signed and `git log --show-signature -1` reports a good signature.
 8. Claude Code: `~/.claude/settings.json` has no `sealctl hook`, `~/.claude/skills/sealctl-secrets` is gone, and the `.env` deny rules are present if chosen. The same for the other installed tools.
 9. `launchctl list | grep -i sealctl` prints nothing; `~/.config/sealctl`, `~/.local/share/sealctl` and `~/.local/state/sealctl` are gone; the old files are in the run folder's `kept/`.
-10. The last line names `brew uninstall sealctl/tap/sealctl`; sealctl is still installed.
+10. The output names `brew uninstall sealctl/tap/sealctl` and `rm -rf ~/sealctl-unsealed-<date>`; sealctl is still installed and the folder is still there; `tmutil isexcluded` reports it excluded; Claude Code refuses to read it.
 11. Resume: on a second macOS user account set up the same way, Ctrl-C during the backup step and again during the SSH step, then `sealctl unseal --resume`, reach the same end state as items 3 to 9.
 
 ### 24.2 0.7.0

@@ -12,25 +12,37 @@ The last release that reads the Ledger. It adds one command, to leave it.
 
 ### Added
 
-- `sealctl unseal <object>` and `sealctl unseal --all`: hand secrets, volumes (APFS, sparse
-  bundle, LUKS), restic backups, SSH keys, git signing and AI integrations back under passwords
-  of your own, then remove sealctl's services and settings. Volumes and backups stay
-  encrypted. The plan is shown first (`--dry-run` only shows it; `--all` starts only when you
-  type `unseal`); each object is opened with the new password, read back from where it was
-  stored, before sealctl's key or key slot is removed; every step is journaled in
-  `~/.sealctl-unseal/<run>/` so a stopped run continues with `--resume`; every edited file is
-  copied there first and the old store and key files are kept there, still encrypted. New
-  passwords go to the macOS Keychain / Secret Service (default), 1Password (`--to op`),
-  Bitwarden (`--to bw`) or are shown once (`--to show`); secrets can also go to a 0600 `.env`
-  file (`--secrets-to env`). `--words` takes the keys from the Ledger's 24 words. The run ends
-  with a hand-back list (`handback.json`, no passwords) for `sealctl seal --from` in 0.7, and
-  names the command that removes the program; it never runs it. Refused inside AI agents and
-  without a terminal. See docs/unseal.md.
+- `sealctl unseal <object>` and `sealctl unseal --all`: the inverse of sealing. Secrets,
+  volumes (APFS, sparse bundle, LUKS), restic backups, SSH keys, git signing and AI
+  integrations come back in plain, standard form, then sealctl's services and settings are
+  removed. Everything goes into one visible folder, `~/sealctl-unsealed-<date>` (0700, files
+  0600, excluded from Time Machine, AI agents denied by rules that stay), which you delete
+  yourself once everything works — sealctl never does: `README.txt` (how to check each item),
+  `passwords.txt` (a new random passphrase per volume and password per backup: volumes and
+  backups stay encrypted), `backup-<volume>.env` (`RESTIC_REPOSITORY`, `RESTIC_PASSWORD`,
+  storage credentials, ready for `set -a; . file`), `secrets.env` (every secret, plain; quoting
+  that a shell and dotenv parsers read back exactly, multi-line JSON included). SSH keys become
+  standard key files with no passphrase (nothing goes to ssh-agent or the Keychain); git signs
+  with the plain key file. The plan is shown first (`--dry-run` only shows it; `--all` starts
+  only when you type `unseal`). Write-ahead: each new password is durable in the folder (file
+  and directory `fsync`ed) and read back before it is set, and each object is opened with it
+  before sealctl's key or key slot is removed; every step is journaled with `fsync` so a stopped
+  run — Ctrl-C, a crash, a power cut — continues with `--resume`; every edited file is copied
+  into the folder first and the old store and key files are kept there, still encrypted. Password
+  stores on request, as before: macOS Keychain / Secret Service (`--to keychain`, items labelled
+  `sealctl: volume safe`, `sealctl: backup safe password`, …), 1Password (`--to op`), Bitwarden
+  (`--to bw`), shown once (`--to show`); secrets also to a `.env` file outside the folder
+  (`--secrets-to env`). `--words` takes the keys from the Ledger's 24 words. The run ends with
+  a hand-back list (`handback.json`, no passwords) for `sealctl seal --from` in 0.7, names the
+  command that removes the program and the `rm -rf` for the folder; it runs neither. Refused
+  inside AI agents and without a terminal. See docs/unseal.md.
 - `sealctl status` says how to leave the Ledger; `status` and `doctor` report an unfinished
   unseal run.
 
 ### Changed
 
+- Files sealctl writes are replaced durably: a temporary file, `fsync` (F_FULLFSYNC on macOS),
+  a rename, and an `fsync` of the directory.
 - LUKS volumes can change their passphrase (`luksAddKey`, then the old slot is removed).
 - `sealctl backup rekey` passes the new restic password on a pipe instead of a file inside
   the volume.
