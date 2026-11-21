@@ -232,13 +232,13 @@ https://sealctl.com/p#v=1&m=<machine>&x=<machine box>&s=<code>&n=<name>&o=<os>&d
 | `x` | `b64u(MX)`: the machine box public key (X25519), 43 characters |
 | `s` | `b64u(pairing code)`: 16 random bytes made for this pairing, 22 characters |
 | `n` | Name, `user@full-hostname`, 1 to 200 characters |
-| `o` | OS, e.g. `macOS 15.2` or `Ubuntu 24.04`, up to 200 characters |
+| `o` | OS, e.g. `macOS 15.2` or `Ubuntu 24.04`, up to 200 characters; a reader takes a missing `o` as empty |
 | `d` | Model, e.g. `Mac15,3`, up to 200 characters; omitted when unknown |
 | `h` | Hardware hint, 22 characters; omitted when unknown |
 | `e` | Expiry, Unix seconds: 10 minutes after the code was made. The phone refuses an expired code |
-| `r` | Relay origin, e.g. `https://relay-staging.sealctl.com`; omitted for `https://relay.sealctl.com` |
+| `r` | Relay origin, e.g. `https://relay-staging.sealctl.com`; omitted for `https://relay.sealctl.com`. An `https://` origin with no path, or `http://` only to `localhost`, `127.0.0.1` or `[::1]` (test relays) |
 
-Values are percent-encoded (RFC 3986; unreserved characters stay as they are), in the order above. The core's parser also accepts the part after `#` on its own, so the text can be typed or pasted. Parameters it does not know are ignored. The data sits in the fragment, so a browser that opens the link sends none of it to sealctl.com. The phone app claims the link as a universal link (iOS) and an app link (Android); the web page at `/p` only says to scan the code with the sealctl app.
+Values are percent-encoded (RFC 3986; unreserved characters stay as they are), in the order above. The core's parser also accepts the part after `#` on its own, so the text can be typed or pasted. Parameters it does not know are ignored; a known parameter given twice, a field over its length, or a control character in `n`, `o` or `d` refuses the code. The parser checks `v` first, so a newer code is refused as newer rather than as malformed, and refuses an expired code. The pairing code `s` stays inside the core: the app gets the other fields, and `pairing_proof` uses the code. The data sits in the fragment, so a browser that opens the link sends none of it to sealctl.com. The phone app claims the link as a universal link (iOS) and an app link (Android); the web page at `/p` only says to scan the code with the sealctl app.
 
 ### The proof
 
@@ -301,6 +301,8 @@ The phone gets `id`, `machine` (= `M`) and `sealed` from the relay. It:
 2. opens the HPKE ciphertext with its box private key, with `info` and `aad` as above;
 3. splits the plaintext into `sig` (64 bytes) and `body`, and verifies `sig` with `M`;
 4. refuses a body whose `t` is more than 10 minutes from its own clock, or an `id` it has already answered.
+
+In the core, `open_request` does steps 2 to 4 except the `id` check (`Expired` for `t`; a body whose `v` is higher is `NewerVersion`); the app keeps the ids it answered (Pending, app spec 9.1). A `Request` object can be answered once; a second reply from it is the error `Replay`.
 
 ### Reply
 
@@ -367,7 +369,7 @@ Request kinds (`why`):
 | `agent` | The session is Open and an agent uses a secret for the first time in a repository | Automatic when the answer is remembered; otherwise One tap | 1 |
 | `own` | An `--own-approval` secret is used | One tap, every time | 1 |
 | `rewrap` | The phone key changed: the machine asks for old and new keys of everything it holds | In the app, one machine at a time | 2 |
-| `old_words` | An object is sealed with retired words | In the app: the user types those words | The typed words are the confirmation |
+| `old_words` | An object is sealed with retired words | In the app: the user types those words | 2 (`level()` in the core); the typed words are the confirmation |
 | `unseal` | `sealctl unseal` hands objects back under the user's own passwords | In the app | 2; 3 with `plan.all`, or a plan that holds a `pairing` item |
 | `report` | No machine channel on the relay yet (below), or `sealctl migrate`, or a finished `unseal` | Never shown | |
 
@@ -385,12 +387,12 @@ The machine says nothing about where it is. For the Automatic level the phone us
 | `rq` | string | `b64u(SHA256(request body))` |
 | `ok` | bool | `false` when denied or failed |
 | `err` | string | When `ok` is `false`: `declined`, `bad_label`, `wrong_key`, `retired_words`, `unsupported`, `phone_locked`; for levels 2 and 3 also `no_match` (the wrong number was picked), `not_near` (no proximity, below), `no_biometrics` (biometrics unavailable or locked out), `held` (this machine picked a wrong number within the last hour), `outside_plan` (a key not in the approved plan), `plan_expired` |
-| `lvl` | number | The confirmation level the phone applied |
-| `w` | string | The phone's current words fingerprint |
+| `lvl` | number | The confirmation level the phone applied; absent for level 1, as in the request |
+| `w` | string | The phone's current words fingerprint; absent in a reply sealed without the root (a denial, or agent uses without keys while the phone is locked) |
 | `grant` | string | `once`: the keys and uses are for the command that asked, then wiped; `session`: kept until the session locks; `plan`: for the approved `unseal` plan only |
 | `plan` | object | `unseal` only: `{"h", "nb", "sig"}`, the [plan signature](#plan-and-plan-signature) |
 | `part` | number | `unseal` plan sent in parts: the part acknowledged, for every part but the last |
-| `more` | bool | `unseal`: `true` when keys of the plan remain to be asked for |
+| `more` | bool | `unseal`: `true` when keys of the plan remain to be asked for: the keys this request asked for did not all fit in one reply, and the machine asks for the rest. Only `plan` grants split keys; any other approval that does not fit is not sent |
 | `remember` | bool | The phone stored the answer for the agent uses in the request |
 | `place` | string | `trusted`, `other` or `none` (no location permission) |
 | `cap`, `base`, `rate` | numbers | Allowance: cap in seconds, base in seconds, seconds added per minute worked |
@@ -398,7 +400,7 @@ The machine says nothing about where it is. For the Automatic level the phone us
 | `ack` | number | `report` only: the `seq` the phone stored |
 | `msgs` | array | `report` only: [machine message](#machine-status-and-messages) bodies waiting for this machine |
 
-The core fills `cap`, `base` and `rate` from the place: `trusted` 14,400 / 1,800 / 120, `other` 600 / 600 / 0, `none` 3,600 / 1,800 / 120. The machine computes its idle allowance as `min(cap, base + rate × minutes worked today)` and does not hard-code these numbers. The machine computes the hard stop itself: 02:00 local time, or 14 hours after the first `open` granted today, whichever comes first.
+A `plan` grant carries no `cap`, `base` and `rate` (no allowance at levels 2 and 3). For `once` and `session` the core fills `cap`, `base` and `rate` from the place: `trusted` 14,400 / 1,800 / 120, `other` 600 / 600 / 0, `none` 3,600 / 1,800 / 120. The machine computes its idle allowance as `min(cap, base + rate × minutes worked today)` and does not hard-code these numbers. The machine computes the hard stop itself: 02:00 local time, or 14 hours after the first `open` granted today, whichever comes first.
 
 ### Confirmation levels
 
@@ -432,7 +434,7 @@ The request context is the HPKE context of that one sealed request (RFC 9180 sec
 
 On the phone:
 
-1. The core keeps `N` inside the `Request` object and never hands it to Swift or Kotlin. It offers `N` and two other numbers from 10 to 99, distinct, drawn by the phone at random, in random order, and checks the pick.
+1. The core keeps `N` inside the `Request` object and never hands it to Swift or Kotlin. It offers `N` and two other numbers from 10 to 99, distinct, drawn by the phone at random, in random order, and checks the pick. Only a number it offered can be right, and the first wrong pick is final for that request. The core answers any approval of a level 3 request without a right pick with `no_match`.
 2. The number screen comes before anything the machine wrote: it shows only the machine's name from the phone's own pairing record and the three numbers. Command, paths and plan item names, all written by the machine, appear only after a right pick, so a machine cannot spell out the answer.
 3. A wrong pick answers `no_match`. For one hour after it, every level 2 or 3 request from that machine is answered `held` without being shown.
 
@@ -519,7 +521,7 @@ Status body:
 | --- | --- |
 | `v`, `t` | Version, time |
 | `seq` | Increases by one with every status from this machine; the phone ignores a `seq` it has seen |
-| `state` | `{"s": "locked" \| "open" \| "waiting", "left": <idle seconds left>, "stop": <hard stop time>, "place": <place from the last open>, "busy": [<volumes still mounted after a lock, with the process holding them>]}` |
+| `state` | `{"s": "locked" \| "open" \| "waiting", "left": <idle seconds left>, "stop": <hard stop time>, "place": <place from the last open>, "busy": [<volumes still mounted after a lock, with the process holding them>]}`; each `busy` item is `{"n": <volume name>, "p": <process name>, "pid"?: <process id>}` |
 | `log` | Uses since the last acknowledged status, at most 50: `[{"t", "a", "r", "c", "n": [names], "own": bool}]` |
 | `inv` | Objects on this machine, when changed: `[{"p", "i", "w", "c", "o"}]` as in request `keys` |
 | `migrate` | Re-encryption: `{"items": [{"p", "i", "path", "s", "rw": <seconds>, "re": [<min s>, <max s>], "free": <bytes>, "done": <0 to 1>, "paused": <reason or null>}]}` |
@@ -942,7 +944,7 @@ https://sealctl.com/p#v=1&m=0F1KEPyKdmRmXeKvFt-eqoWgd_KglZaTGvTE2uYiKJ8&x=4jROv9
 
 ### Request and reply (machine above, phone B)
 
-For the vectors, the one-time key and every HPKE ephemeral key come from HPKE `DeriveKeyPair` with fixed input, as RFC 9180's own vectors do. Real senders use fresh random keys.
+For the vectors, the one-time key and every HPKE ephemeral key come from HPKE `DeriveKeyPair` with fixed input, as RFC 9180's own vectors do. Real senders use fresh random keys. X25519 private keys are shown as `DeriveKeyPair` gives them, before clamping; a library that keeps keys clamped (x25519-dalek) shows the same key with the low three bits of the first byte cleared and the top bit of the last byte cleared, bit 6 set.
 
 | | Value |
 | --- | --- |

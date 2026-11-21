@@ -57,17 +57,21 @@ A library crate with `#![forbid(unsafe_code)]` (the generated UniFFI scaffolding
 | Module | Contents |
 | --- | --- |
 | `words` | Generate 24 words (`getrandom`), validate the checksum, complete a word from its first 4 letters, `Words → Root` |
-| `root` | `Root` (32 bytes, `SecretBox`), `derive(label, len)`, fingerprint, phone identity and box keys, state key |
+| `root` | `Root` (32 bytes, `Zeroizing`), `derive(label, len)`, fingerprint, phone identity and box keys, state key |
 | `keys` | `ObjectKey` (16 bytes), `check()`, `hex()` for OS tools, `b64u()` for the wire, label validation |
 | `ids` | UUID v4 generation and parsing, `.id` file parse and write (`IdFile`) |
 | `sealed` | `.sealed` header parse, seal, open (mode 1 and 2), secret name validation |
 | `pairing` | QR link build and parse, pairing proof make and check, move proof make and check, tag, hardware hint |
-| `request` | Request and reply bodies (serde types), seal and open both ways, `rq` |
+| `wire` | Request, reply, status and message bodies (serde types; field order is the wire order) |
+| `request` | Seal a request (machine), open it into a `Request` (phone), open a reply (machine), `rq` |
+| `reply` | The phone's replies for every kind: `Decision`, plan signature, rewrap, old words, report |
+| `plan` | Plan text, hash and signature, `PlanAssembler`, `PlanApproval` |
+| `machine` | `MachineKeys` (pairing seed and box key), tag, hardware hint |
 | `channel` | Machine status and machine messages: seal, open, `seq` checks |
 | `phone` | `PhoneKeys` (identity seed and box key, 64-byte storage form), words backup item encode and decode, place to allowance numbers |
 | `relay_auth` | Canonical string and Ed25519 signing for relay calls; verification for tests |
 | `state_blob` | Seal and open of the phone's state blob |
-| `vectors` | `#[cfg(test)]` loader of `docs/vectors/*.json`; every vector checked |
+| `tests` | `#[cfg(test)]`: every value of `docs/vectors/v1.json` and `relay-signing.json` (a test fails if any value goes unchecked), RFC vectors, negative cases, property tests, the secret-type check |
 
 Primitives come only from these crates (no hand-written primitives):
 
@@ -76,17 +80,19 @@ Primitives come only from these crates (no hand-written primitives):
 | SHA-256, HMAC | `sha2`, `hmac` |
 | HKDF | `hkdf` |
 | PBKDF2 for BIP39 | inside `bip39` (feature `std`, `zeroize`) |
-| Ed25519 | `ed25519-dalek` 2 (features `zeroize`, `rand_core`) |
-| X25519 | `x25519-dalek` 2 (`static_secrets`, `zeroize`) |
-| HPKE (RFC 9180) | `hpke` (rust-hpke), suite `X25519HkdfSha256`, `HkdfSha256`, `ChaCha20Poly1305` |
-| AEAD | `chacha20poly1305` |
-| Randomness | `getrandom`, `rand_core::OsRng` |
-| Memory hygiene | `zeroize` (derive), `secrecy` |
-| Encodings | `base64` (URL_SAFE_NO_PAD), `hex`, `uuid` (v4), `serde`, `serde_json` |
+| Ed25519 | `ed25519-dalek` 3 (features `fast`, `zeroize`); `verify_strict` |
+| X25519 | `x25519-dalek` 3, through `hpke` (keys are HPKE `X25519HkdfSha256` keys) |
+| HPKE (RFC 9180) | `hpke` 0.15 (rust-hpke, features `x25519`, `chacha`, `alloc`), suite `X25519HkdfSha256`, `HkdfSha256`, `ChaCha20Poly1305` |
+| AEAD | `chacha20poly1305` 0.11 |
+| SHA-256, HMAC, HKDF versions | `sha2` 0.11, `hmac` 0.13, `hkdf` 0.13 (the RustCrypto generation `hpke` 0.15 uses, so there is one copy of each) |
+| BIP39 | `bip39` 3 (features `std`, `zeroize`) |
+| Randomness | `getrandom` 0.4 (`SysRng`, wrapped in `rand_core` 0.10 `UnwrapErr`) |
+| Memory hygiene | `zeroize` (derive, `serde` for reply keys) |
+| Encodings | `base64` (URL_SAFE_NO_PAD), `hex`, `serde`, `serde_json`; UUIDs are 16 random bytes with the version bits set, formatted by hand |
 
 ### 2.2 UniFFI surface (feature `uniffi`)
 
-Proc-macro annotations only (no UDL), so the app can build `sealctl-core` together with its own crate in UniFFI library mode. The UniFFI version is pinned in this workspace's `Cargo.lock`; the app uses the same one. Secret-holding types are UniFFI objects that zeroise on drop. Object keys (the 16-byte keys) never cross the boundary: the core derives them inside `seal_reply` and its siblings. Errors are one enum `CoreError { UnknownWord(index), Checksum, Count, BadLink, Expired, NewerVersion, BadProof, BadSignature, BadSealed, Replay, BadLabel, BadPlan, Internal }`; messages never contain key material.
+Proc-macro annotations only (no UDL), so the app can build `sealctl-core` together with its own crate in UniFFI library mode. **UniFFI 0.32.2**, pinned exactly (`uniffi = "=0.32.2"`) in `crates/sealctl-core/Cargo.toml` and in `Cargo.lock`; the app pins the same version for `uniffi` and `uniffi-bindgen`, and a mismatch fails its build. The crate builds as `lib` and `cdylib`, so `uniffi-bindgen generate --library` can read the library this repository builds. `#![forbid(unsafe_code)]` holds without the feature; with it, `deny(unsafe_code)` (the generated scaffolding is the exception). Secret-holding types are UniFFI objects that zeroise on drop. Object keys (the 16-byte keys) never cross the boundary: the core derives them inside `seal_reply` and its siblings. Errors are one enum `CoreError { UnknownWord { index }, Checksum, Count, BadLink, Expired, NewerVersion, BadProof, BadSignature, BadSealed, Replay, BadLabel, BadPlan, BadKey, WrongDecision, TooLarge, Internal }`; messages never contain key material. `BadKey`: bytes or text that are not a key of the right length; `WrongDecision`: an answer that does not fit the request's kind (keys for a `report`, `Plan` for `open`); `TooLarge`: a body that does not fit its sealed form.
 
 | Export | Returns | Notes |
 | --- | --- | --- |
@@ -96,24 +102,27 @@ Proc-macro annotations only (no UDL), so the app can build `sealctl-core` togeth
 | `complete_word(prefix)` | Matching BIP39 words | Unique after 4 letters |
 | `Root::from_words(words)`, `Root::from_bytes(b)`, `Root.to_bytes()` | `Root` | The seed never leaves Rust |
 | `fingerprint(root)` | 4 characters | |
-| `PhoneKeys::from_root(root)`, `PhoneKeys::from_bytes(b)`, `.to_bytes()`, `.public_id()` | `PhoneKeys`; 43-character id | 64-byte storage form (protocol.md, Phone storage formats) |
+| `PhoneKeys::from_root(root)`, `PhoneKeys::from_bytes(b)`, `.to_bytes()`, `.public_id()`, `.box_public_key()` | `PhoneKeys`; 43-character ids | 64-byte storage form (protocol.md, Phone storage formats) |
 | `relay_headers(keys, method, path_and_query, unix_time, body)` | `Sealctl-Key`, `Sealctl-Time`, `Sealctl-Signature` values | Relay API, Signing |
-| `PairingOffer::parse(text)` | Machine key, machine box key, code, name, OS, model, hint, relay origin, version, expiry | Accepts the link or the part after `#` |
+| `PairingOffer::parse(text)` | Machine key, machine box key, name, OS, model, hint, relay origin, version, expiry, tag | Accepts the link or the part after `#`; refuses an expired code (`Expired`). The pairing code stays inside the object |
 | `pairing_proof(keys, offer)` | 86-character proof | Needs the phone keys only |
 | `machine_tag(machine_key)` | 4 characters | |
-| `open_request(keys, relay_machine_key, id, sealed)` | `Request` | HPKE, machine signature, time, version, replay window |
+| `open_request(keys, relay_machine_key, id, sealed)` | `Request` | HPKE, machine signature, time window (`Expired`), version, plan rules (`BadPlan`), at most 4,096 characters (`BadSealed`). Answered ids are the app's to keep (protocol.md, Request) |
 | `Request` | `kind`, `ctx` (agent, repository id and name, command, cwd, user, subject, names), `items` (purpose, id, path or URL, size, words fingerprint, key check), `uses`, `old` (retired fingerprint), `status` (for `report`), `handback` (for `report`), `plan` (items, `all`, hash, part), `level()` (the confirmation level the phone applies: the kind's level or `lvl`, whichever is higher), `has_match`, `rq`, `version` | The number match is held inside `Request`; it never crosses the boundary |
-| `Request.match_choices()`, `Request.check_match(pick)` | Three numbers in display order; `bool` | The right number and two random others; a wrong pick is final for that request (protocol.md, Number match) |
-| `PlanAssembler::new()`, `.add(request)` | Complete plan or `None` | Collects the parts of a plan sent in several `unseal` requests and checks `h` (`CoreError::BadPlan`) |
-| `seal_reply(root_or_none, keys, request, decision)` | Sealed reply | `decision`: `Deny`, `Refuse { err }`, `Once { place }`, `Session { place }`, `Remember { place }`, `Plan { place, not_before }`; `place` is `Trusted`, `Other` or `NoLocation`. Needs the root only when the request asks for keys. `Plan` signs the plan hash (protocol.md, Plan and plan signature) and hands out only keys named by plan items |
-| `seal_plan_keys_reply(root, keys, request, approval)` | Sealed reply | Answers a later `unseal` request of an approved plan: keys named by plan items only, inside the 30 minutes after `not_before` |
-| `seal_rewrap_reply(old_root, new_root, keys, request)` | Sealed reply | Old and new key per item |
+| `Request.match_choices()`, `Request.check_match(pick)` | Three numbers (`u32`) in display order, the same on every call; `bool` | The right number and two random others; only an offered number can be right, and a wrong pick is final for that request (protocol.md, Number match) |
+| `PlanAssembler::new()`, `.add(request)` | Complete plan or `None` | Collects the parts of a plan sent in several `unseal` requests and checks `h` (`CoreError::BadPlan`); the whole plan is then attached to the request that completed it, which the `Plan` decision answers. A one-part plan is complete when opened |
+| `seal_plan_part_reply(keys, request)` | Sealed reply | `{"ok": true, "part": i}` for each part but the last |
+| `plan_approval(request, not_before)` | `PlanApproval { machine, hash, not_before, keys }` | What the app keeps after a `Plan` answer, for `seal_plan_keys_reply` |
+| `seal_reply(root_or_none, keys, request, decision)` | Sealed reply | `decision`: `Deny`, `Refuse { err }`, `Once { place }`, `Session { place }`, `Remember { place }`, `Plan { place, not_before }`; `place` is `Trusted`, `Other` or `NoLocation`. Needs the root only when the request asks for keys; without it such an approval is answered `phone_locked`. `Once`, `Session` and `Remember` fit `open`, `keys`, `agent` and `own`; `Plan` fits `unseal`; `Deny` and `Refuse` fit every kind (`WrongDecision` otherwise). An approval of a level 3 request without a right number pick is answered `no_match`. `Plan` signs the plan hash (protocol.md, Plan and plan signature) and hands out only keys named by plan items (`outside_plan` otherwise), as many as fit, with `more`. Items whose `w` is not the current fingerprint, or whose `c` does not match, get `wrong_key` |
+| `seal_reply_with_retired(root_or_none, keys, request, decision, retired)` | Sealed reply | As `seal_reply`; items sealed with words in `retired` (`{fingerprint, retired: "YYYY-MM-DD"}`) get `retired_words` |
+| `seal_plan_keys_reply(root, keys, request, approval)` | Sealed reply | Answers a later `unseal` request of an approved plan: keys named by plan items only (`outside_plan`), inside the 30 minutes after `not_before` (`plan_expired`, also before it); another machine or hash is `BadPlan` |
+| `seal_rewrap_reply(old_root, new_root, keys, request)` | Sealed reply | Old and new key per item, `grant: once`; an item's `c` is checked against the key of the words its `w` names |
 | `seal_old_words_reply(old_root, root, keys, request)` | Sealed reply | Derives only the listed objects' keys |
 | `seal_report_reply(keys, request, ack, messages)` | Sealed reply | Fallback channel |
 | `key_change_proof(old_keys, new_keys, machine_key)` | 128-character move proof | protocol.md, Phone key change |
 | `licence_move_proof(new_keys, old_public_id)` | Base64url signature | Relay API, Moving the licence |
-| `state_seal(root, plaintext)`, `state_open(root, blob)` | Blob, plaintext | |
-| `seal_machine_message(keys, machine_key, machine_box_key, message)` | Sealed message | `lock`, `answers`, `ack` |
+| `state_seal(root, plaintext)`, `state_open(root, blob)` | Blob as base64url (as the relay's `blob` field), plaintext | |
+| `seal_machine_message(keys, machine_key, machine_box_key, message)` | Sealed message | `MachineMessage { version, time, seq, kind }`, `kind` one of `Lock`, `Answers`, `Ack`, `Notice` |
 | `open_machine_status(keys, machine_key, sealed)` | `MachineStatus` | |
 | `backup_item_encode(words, fingerprint, created)`, `backup_item_decode(bytes)` | 45 bytes; fields | |
 | `core_version()`, `protocol_version()` | `"0.7.0"`, `"1"` | |
