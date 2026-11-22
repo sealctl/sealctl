@@ -189,25 +189,33 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
     let mut open: Vec<(char, bool)> = Vec::new();
     let cs: Vec<char> = text.chars().collect();
     let mut i = 0;
-    let end_word =
-        |word: &mut String, in_word: &mut bool, words: &mut Vec<String>, open: &mut Vec<(char, bool)>| {
-            if *in_word {
-                let w = std::mem::take(word);
-                if track_case && words.iter().all(|w| is_keyword(w)) {
-                    if w == "case" {
-                        open.push(('c', false));
-                    } else if w == "esac" && open.last() == Some(&('c', false)) {
-                        open.pop();
-                    }
+    // whether every word of the current command so far is a shell keyword (`if`, `do`, `time`, …),
+    // kept as a flag so each word costs O(1): a `case` or `esac` only counts in that position
+    let mut all_kw = true;
+    let end_word = |word: &mut String,
+                    in_word: &mut bool,
+                    words: &mut Vec<String>,
+                    open: &mut Vec<(char, bool)>,
+                    all_kw: &mut bool| {
+        if *in_word {
+            let w = std::mem::take(word);
+            if track_case && *all_kw {
+                if w == "case" {
+                    open.push(('c', false));
+                } else if w == "esac" && open.last() == Some(&('c', false)) {
+                    open.pop();
                 }
-                words.push(w);
-                *in_word = false;
             }
-        };
-    let end_cmd = |words: &mut Vec<String>, cmds: &mut Vec<Vec<String>>| {
+            *all_kw = *all_kw && is_keyword(&w);
+            words.push(w);
+            *in_word = false;
+        }
+    };
+    let end_cmd = |words: &mut Vec<String>, cmds: &mut Vec<Vec<String>>, all_kw: &mut bool| {
         if !words.is_empty() {
             cmds.push(std::mem::take(words));
         }
+        *all_kw = true;
     };
     while i < cs.len() {
         let c = cs[i];
@@ -229,15 +237,15 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
                 // resume after it
                 '`' => {
                     quote = None;
-                    end_word(&mut word, &mut in_word, &mut words, &mut open);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
                     open.push(('`', true));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     quote = None;
                     i += 1;
-                    end_word(&mut word, &mut in_word, &mut words, &mut open);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
                     open.push(('(', true));
                 }
                 c => word.push(c),
@@ -254,28 +262,28 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
                         in_word = true;
                     }
                 }
-                ' ' | '\t' => end_word(&mut word, &mut in_word, &mut words, &mut open),
+                ' ' | '\t' => end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw),
                 // `2>&1`, `>&2`, `&>file`: redirections, not separators
                 '&' if i > 0 && matches!(cs[i - 1], '>' | '<') => word.push(c),
                 '&' if cs.get(i + 1) == Some(&'>') => word.push(c),
                 '|' | ';' | '&' | '\n' | '{' | '}' => {
-                    end_word(&mut word, &mut in_word, &mut words, &mut open);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
                 }
                 '(' => {
-                    end_word(&mut word, &mut in_word, &mut words, &mut open);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
                     open.push(('(', false));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     i += 1;
-                    end_word(&mut word, &mut in_word, &mut words, &mut open);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
                     open.push(('(', false));
                 }
                 ')' | '`' => {
-                    end_word(&mut word, &mut in_word, &mut words, &mut open);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
                     let opener = if c == ')' { '(' } else { '`' };
                     match open.last() {
                         Some(&(o, dq)) if o == opener => {
@@ -298,8 +306,8 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
         }
         i += 1;
     }
-    end_word(&mut word, &mut in_word, &mut words, &mut open);
-    end_cmd(&mut words, &mut cmds);
+    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+    end_cmd(&mut words, &mut cmds, &mut all_kw);
     cmds
 }
 
@@ -824,6 +832,25 @@ mod tests {
         ] {
             assert!(bash(c).is_some(), "should deny: {c}");
         }
+    }
+
+    #[test]
+    fn keyword_only_lines_are_checked_in_linear_time() {
+        // a `case` counts only after keywords; that check must not rescan the command per word
+        let started = std::time::Instant::now();
+        let line = format!("{}; sealctl secret get k", "do ".repeat(100_000));
+        let why = bash(&line);
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("secret get") || w.contains(TOO_COMPLEX)),
+            "should deny: {why:?}"
+        );
+        let eval = format!("eval {}; sealctl secret get k", "do ".repeat(100_000));
+        assert!(bash(&eval).is_some(), "should deny the eval form");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+        // `case` after keywords still opens a case
+        assert!(bash("if case x in a) sealctl secret get k ;; esac").is_some());
     }
 
     #[test]
