@@ -173,17 +173,21 @@ impl Store {
                 if n.to_string_lossy().starts_with('.') {
                     continue;
                 }
-                if p.is_dir() {
+                // a symlink is never followed into a folder, so a symlink loop cannot make the
+                // walk grow; a symlink to a sealed file still counts
+                let Ok(ft) = e.file_type() else { continue };
+                if ft.is_dir() {
                     if depth > 0 {
                         go(&p, depth - 1, out);
                     }
+                } else if ft.is_symlink() && p.is_dir() {
+                    continue;
                 } else if p.extension().is_some_and(|x| x == "sealed") {
                     out.push(p);
                 }
             }
         }
-        // as deep as a valid name goes (`a/b/…`: 64 segments in 128 bytes), and no deeper, so a
-        // folder symlink loop still ends
+        // as deep as a valid name goes (`a/b/…`: 64 segments in 128 bytes), and no deeper
         let mut out = Vec::new();
         go(&self.dir, MAX_DEPTH, &mut out);
         out
@@ -390,5 +394,19 @@ mod tests {
         for n in wanted {
             s.header(n).unwrap();
         }
+    }
+
+    /// Folder symlinks are not followed, so symlinks back into the store end the walk at once.
+    #[test]
+    fn list_does_not_follow_folder_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let key = ObjectKey::from_bytes(&[7; 16]).unwrap();
+        s.write("a/b", Mode::StoreKey, &key, "4kPz", b"v", None).unwrap();
+        let a = s.dir.join("a");
+        for l in ["l1", "l2", "l3"] {
+            std::os::unix::fs::symlink(&s.dir, a.join(l)).unwrap();
+        }
+        assert_eq!(names(&s), ["a/b"]);
     }
 }
