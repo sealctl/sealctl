@@ -12,7 +12,7 @@ libfuzzer-sys = "0.4"
 sealctl-core = { path = "../crates/sealctl-core" }
 sealctl = { path = "../crates/sealctl" }
 serde_json = "1"
-toml = "0.9"
+toml = "1.1"
 
 # Not part of the main workspace: built with cargo fuzz on nightly.
 [workspace]
