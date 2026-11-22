@@ -157,7 +157,8 @@ jobs:
           sealctl --version
           sealctl --help | grep -q volume
           test -f /usr/share/bash-completion/completions/sealctl
-          test -s /usr/share/doc/sealctl/THIRD-PARTY-NOTICES.md
+          # the package ships the notices (minimal Ubuntu images skip /usr/share/doc on install)
+          dpkg-deb -c ./sealctl_*.deb | grep -F ./usr/share/doc/sealctl/THIRD-PARTY-NOTICES.md
           dpkg -s sealctl | grep -E '^(Version|Depends|Recommends)'
 
   rpm:
@@ -182,7 +183,8 @@ jobs:
           sealctl --version
           sealctl --help | grep -q volume
           test -f /usr/share/bash-completion/completions/sealctl
-          test -s /usr/share/licenses/sealctl/THIRD-PARTY-NOTICES.md
+          # the package ships the notices (container images install with tsflags=nodocs)
+          rpm -qlp ./sealctl-*.rpm | grep -Fx /usr/share/licenses/sealctl/THIRD-PARTY-NOTICES.md
           rpm -qi sealctl | head -5
 
   arch:
