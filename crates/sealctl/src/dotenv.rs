@@ -7,42 +7,61 @@ use zeroize::Zeroizing;
 
 /// Parse a `.env` file the way common dotenv libraries do: `KEY=value`, optional `export `,
 /// `#` comments (also after unquoted values), single quotes (literal), double quotes (escapes
-/// `\n \r \t \" \\`), and quoted values spanning several lines. Anything it can't read
-/// unambiguously is an error rather than a guess — the file may be deleted afterwards.
+/// `\n \r \t \" \\`), and quoted values spanning several lines. Lines end at `\n`, `\r\n` or a
+/// lone `\r`. Anything it can't read unambiguously is an error rather than a guess or a partial
+/// result — the file may be deleted afterwards.
+///
+/// The text is copied once into a character buffer that is wiped when parsing ends, and each
+/// value is built in a buffer sized up front, so no unwiped copy of a value is left behind.
 pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
+    let chars: Zeroizing<Vec<char>> = Zeroizing::new(text.chars().collect());
+    let chars: &[char] = &chars;
+    let n = chars.len();
     let mut out = BTreeMap::new();
-    let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     let mut line = 1;
-    let n = chars.len();
+    let is_eol = |c: char| c == '\n' || c == '\r';
     let skip_ws = |i: &mut usize| {
         while *i < n && (chars[*i] == ' ' || chars[*i] == '\t') {
             *i += 1;
         }
     };
+    // Consumes one line ending (`\n`, `\r\n` or `\r`) at `i`, if there is one.
+    let eol = |i: &mut usize, line: &mut usize| -> bool {
+        match chars.get(*i) {
+            Some('\r') => {
+                *i += if chars.get(*i + 1) == Some(&'\n') { 2 } else { 1 };
+            }
+            Some('\n') => *i += 1,
+            _ => return false,
+        }
+        *line += 1;
+        true
+    };
+    let skip_comment = |i: &mut usize| {
+        while *i < n && !is_eol(chars[*i]) {
+            *i += 1;
+        }
+    };
+    let bytes = |s: &[char]| s.iter().map(|c| c.len_utf8()).sum::<usize>();
     while i < n {
         skip_ws(&mut i);
         if i >= n {
             break;
         }
-        if chars[i] == '\n' || chars[i] == '\r' {
-            if chars[i] == '\n' {
-                line += 1;
-            }
-            i += 1;
+        if eol(&mut i, &mut line) {
             continue;
         }
         if chars[i] == '#' {
-            while i < n && chars[i] != '\n' {
-                i += 1;
-            }
+            skip_comment(&mut i);
             continue;
         }
         let start_line = line;
         // key
-        let rest: String = chars[i..n.min(i + 7)].iter().collect();
-        if rest == "export " {
-            i += 7;
+        if chars[i..].starts_with(&['e', 'x', 'p', 'o', 'r', 't'])
+            && matches!(chars.get(i + 6), Some(' ' | '\t'))
+        {
+            i += 6;
             skip_ws(&mut i);
         }
         let ks = i;
@@ -59,23 +78,30 @@ pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
         }
         i += 1;
         skip_ws(&mut i);
-        let mut val = Zeroizing::new(String::new());
-        if i < n && (chars[i] == '"' || chars[i] == '\'' || chars[i] == '`') {
+        let val = if i < n && matches!(chars[i], '"' | '\'' | '`') {
             let q = chars[i];
             i += 1;
+            // find the closing quote first, so the value's buffer never grows (and never
+            // leaves an unwiped copy behind); decoding escapes only makes it shorter
+            let vs = i;
+            let mut j = i;
             loop {
-                if i >= n {
+                if j >= n {
                     bail!("line {start_line}: {key}: closing {q} missing");
                 }
-                let c = chars[i];
-                if c == q {
-                    i += 1;
+                if chars[j] == q {
                     break;
                 }
-                if c == '\n' {
-                    line += 1;
-                }
-                if q == '"' && c == '\\' && i + 1 < n {
+                j += if q == '"' && chars[j] == '\\' && j + 1 < n {
+                    2
+                } else {
+                    1
+                };
+            }
+            let mut val = Zeroizing::new(String::with_capacity(bytes(&chars[vs..j])));
+            while i < j {
+                let c = chars[i];
+                if q == '"' && c == '\\' && i + 1 < j {
                     i += 1;
                     match chars[i] {
                         'n' => val.push('\n'),
@@ -90,31 +116,46 @@ pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
                             val.push(other);
                         }
                     }
-                    i += 1;
-                    continue;
+                } else {
+                    val.push(c);
                 }
-                val.push(c);
                 i += 1;
             }
-            // only a comment may follow a quoted value
-            skip_ws(&mut i);
-            if i < n && chars[i] != '\n' && chars[i] != '\r' && chars[i] != '#' {
-                bail!("line {line}: {key}: unexpected text after the closing quote");
-            }
+            // lines inside the quotes
+            line += chars[vs..j]
+                .iter()
+                .enumerate()
+                .filter(|&(k, &c)| c == '\n' || (c == '\r' && chars.get(vs + k + 1) != Some(&'\n')))
+                .count();
+            i = j + 1;
+            val
         } else {
-            while i < n && chars[i] != '\n' && chars[i] != '\r' {
+            let vs = i;
+            while i < n && !is_eol(chars[i]) {
                 // `#` starts a comment only after whitespace (URLs and tokens may contain #)
-                if chars[i] == '#' && (val.is_empty() || val.ends_with(' ') || val.ends_with('\t')) {
+                if chars[i] == '#' && (i == vs || chars[i - 1] == ' ' || chars[i - 1] == '\t') {
                     break;
                 }
-                val.push(chars[i]);
                 i += 1;
             }
-            let trimmed = Zeroizing::new(val.trim().to_string());
-            val = trimmed;
+            let (mut vs, mut ve) = (vs, i);
+            while ve > vs && chars[ve - 1].is_whitespace() {
+                ve -= 1;
+            }
+            while vs < ve && chars[vs].is_whitespace() {
+                vs += 1;
+            }
+            let mut val = Zeroizing::new(String::with_capacity(bytes(&chars[vs..ve])));
+            val.extend(chars[vs..ve].iter());
+            val
+        };
+        // only whitespace and a comment may follow the value on its line
+        skip_ws(&mut i);
+        if i < n && chars[i] == '#' {
+            skip_comment(&mut i);
         }
-        while i < n && chars[i] != '\n' {
-            i += 1;
+        if i < n && !eol(&mut i, &mut line) {
+            bail!("line {line}: {key}: unexpected text after the closing quote");
         }
         out.insert(key, val);
     }
@@ -151,5 +192,56 @@ mod tests {
             parse_dotenv("A=1\nbad line\n").is_err(),
             "unreadable lines are errors"
         );
+    }
+
+    #[test]
+    fn every_line_ending() {
+        for (text, what) in [
+            ("A=one\nB=two\n", "LF"),
+            ("A=one\r\nB=two\r\n", "CRLF"),
+            ("A=one\rB=two\r", "CR only"),
+            ("A=one\rB=two", "CR only, no final line end"),
+            ("A=one\r\nB=two\r", "mixed"),
+            ("# c\rA=one\r# c2\r\nB=two\n", "comments, CR only and mixed"),
+            ("A=one # c\rB=two", "trailing comment, CR"),
+            ("A=\"one\" # c\rB='two'\r", "quoted, CR"),
+            ("\r\r\nA=one\n\rB=two\r\n\r", "blank lines of every kind"),
+        ] {
+            let m = parse_dotenv(text).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(m.len(), 2, "{what}: {:?}", m.keys().collect::<Vec<_>>());
+            assert_eq!(m["A"].as_str(), "one", "{what}");
+            assert_eq!(m["B"].as_str(), "two", "{what}");
+        }
+        // a quoted value keeps its own line endings
+        let m = parse_dotenv("K=\"a\rb\r\nc\"\rL=2\r").unwrap();
+        assert_eq!(m["K"].as_str(), "a\rb\r\nc");
+        assert_eq!(m["L"].as_str(), "2");
+    }
+
+    #[test]
+    fn errors_name_the_right_line_and_never_return_part() {
+        for text in [
+            "A=1\rbad line\r",
+            "A=1\r\nbad\r\n",
+            "A=1\nbad\n",
+            "A=1\rB=\"x\" y\r",
+        ] {
+            assert!(parse_dotenv(text).is_err(), "{text:?}");
+        }
+        let e = parse_dotenv("A=1\rB=2\r\nC=3\nbad\r").unwrap_err().to_string();
+        assert!(e.starts_with("line 4:"), "{e}");
+        let e = parse_dotenv("A=\"x\ry\"\rbad").unwrap_err().to_string();
+        assert!(e.starts_with("line 3:"), "{e}");
+    }
+
+    #[test]
+    fn export_and_whitespace() {
+        let m = parse_dotenv("export\tA=1\r  export B = two words  \rexporter=3\r").unwrap();
+        assert_eq!(m["A"].as_str(), "1");
+        assert_eq!(m["B"].as_str(), "two words");
+        assert_eq!(m["exporter"].as_str(), "3");
+        let m = parse_dotenv("A=\"x\\\\\"\rB=\"\\\"q\\\"\"\r").unwrap();
+        assert_eq!(m["A"].as_str(), "x\\");
+        assert_eq!(m["B"].as_str(), "\"q\"");
     }
 }

@@ -504,7 +504,27 @@ pub fn seal_env(file: &Path, prefix: &str, delete: bool, force: bool) -> Result<
         names.len(),
         pfile.display()
     );
-    if delete {
+    // `--delete` only when every variable in the file is stored and read back, and the file
+    // is still what was read: an empty value is not stored, so its line would be lost
+    let empty: Vec<&str> = vars
+        .iter()
+        .filter(|(_, v)| v.is_empty())
+        .map(|(k, _)| k.as_str())
+        .collect();
+    let unchanged = || {
+        std::fs::read(file)
+            .map(|now| util::sha256_hex(&now) == util::sha256_hex(text.as_bytes()))
+            .unwrap_or(false)
+    };
+    if delete && !empty.is_empty() {
+        eprintln!(
+            "{} is kept: {} empty and not stored.",
+            file.display(),
+            empty.join(", ")
+        );
+    } else if delete && !unchanged() {
+        eprintln!("{} changed while it was read; it is kept.", file.display());
+    } else if delete {
         std::fs::remove_file(file)?;
         eprintln!("Removed {}.", file.display());
     } else {

@@ -225,3 +225,75 @@ fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// `seal env --delete` removes the file only when every variable in it is stored: CR-only and
+/// mixed line endings are read in full, and an unreadable or partly stored file is kept.
+#[test]
+fn seal_env_delete_never_drops_a_variable() {
+    let mut env = Env::new();
+    env.pair();
+    let a = canary();
+    let b = canary();
+    let c = canary();
+    let cases = [
+        ("cr", format!("A_KEY={a}\rB_KEY=\"{b}\"\r# note\rC_KEY={c}\r")),
+        ("mixed", format!("A_KEY={a}\r\nB_KEY='{b}'\rC_KEY={c}\n")),
+    ];
+    for (prefix, text) in &cases {
+        let file = env.h().join(format!("{prefix}.env"));
+        std::fs::write(&file, text).unwrap();
+        let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+            env.run(&[
+                "seal",
+                "env",
+                file.to_str().unwrap(),
+                "--prefix",
+                prefix,
+                "--delete",
+            ])
+        });
+        assert_eq!(code, 0, "{prefix}: {err}");
+        assert!(!file.exists(), "{prefix}: the file is removed once all is stored");
+        for (k, v) in [("a-key", &a), ("b-key", &b), ("c-key", &c)] {
+            let (code, out, err) = env.run(&["secret", "get", &format!("{prefix}/{k}")]);
+            assert_eq!(code, 0, "{prefix}/{k}: {err}");
+            assert_eq!(&out, v, "{prefix}/{k}");
+        }
+    }
+
+    // an unreadable line: nothing stored, the file kept
+    let file = env.h().join("bad.env");
+    let text = format!("X_KEY={a}\rnot an assignment\rY_KEY={b}\r");
+    std::fs::write(&file, &text).unwrap();
+    let (code, _, err) = env.run(&[
+        "seal",
+        "env",
+        file.to_str().unwrap(),
+        "--prefix",
+        "bad",
+        "--delete",
+    ]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Nothing was stored"), "{err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    let (_, out, _) = env.run(&["secret", "ls"]);
+    assert!(!out.contains("bad/"), "{out}");
+
+    // an empty value is not stored, so its line would be lost: the file is kept
+    let file = env.h().join("empty.env");
+    let text = format!("Z_KEY={a}\rEMPTY_KEY=\r");
+    std::fs::write(&file, &text).unwrap();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&[
+            "seal",
+            "env",
+            file.to_str().unwrap(),
+            "--prefix",
+            "empty",
+            "--delete",
+        ])
+    });
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("is kept: EMPTY_KEY empty and not stored"), "{err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+}
