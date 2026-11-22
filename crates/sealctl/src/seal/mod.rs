@@ -136,12 +136,24 @@ pub fn seal_volume_given(
     let path = (kind != Kind::Apfs)
         .then(|| std::fs::canonicalize(p))
         .transpose()?;
+    // a marker with no volume of this machine on the bundle: left by a seal that stopped
+    // before it finished; its id is used again if the passphrase still opens the bundle
+    let mut leftover = None;
     if kind == Kind::Sparsebundle {
         if let Some(f) = volume::read_marker(kind, target)? {
-            return Err(fail(
-                exit::USAGE,
-                format!("{target} is sealed already (words {}).", f.words),
-            ));
+            let ours = Volume::list()?.iter().any(|v| {
+                v.path
+                    .as_deref()
+                    .zip(path.as_deref())
+                    .is_some_and(|(a, b)| volume::same_path(a, b))
+            });
+            if ours {
+                return Err(fail(
+                    exit::USAGE,
+                    format!("{target} is sealed already (words {}).", f.words),
+                ));
+            }
+            leftover = Some(f);
         }
     }
     let old = match given {
@@ -156,13 +168,27 @@ pub fn seal_volume_given(
         }
     };
     if !opens(old.as_bytes())? {
+        if let Some(f) = &leftover {
+            return Err(fail(
+                exit::WRONG_KEY,
+                format!(
+                    "That passphrase does not open {target}. Check it and try again. The bundle has \
+                     the marker of a seal that did not finish (words {}): if your passphrase is right, \
+                     that seal changed it already, and sealctl recover opens it with those words.",
+                    f.words
+                ),
+            ));
+        }
         return Err(fail(
             exit::WRONG_KEY,
             format!("That passphrase does not open {target}."),
         ));
     }
     let id = match kind {
-        Kind::Sparsebundle => util::new_uuid()?,
+        Kind::Sparsebundle => match &leftover {
+            Some(f) => f.id.clone(),
+            None => util::new_uuid()?,
+        },
         Kind::Apfs => uuid_of_apfs(target)?,
         Kind::Luks => {
             let out = util::system_cmd("cryptsetup")
@@ -188,12 +214,41 @@ pub fn seal_volume_given(
     };
     let (key, fp) = takeover_key(&item, words)?;
     let new = key.hex();
+    let vol = Volume {
+        name: name.into(),
+        kind,
+        path: path.clone(),
+        id: id.clone(),
+        words: fp.clone(),
+        check: key.check(),
+        mountpoint: match mountpoint {
+            Some(m) => m,
+            None => volume::default_mountpoint(kind, name)?,
+        },
+        manual,
+    };
+    // a sparse bundle's id is random: it is on disk before the passphrase changes, since the
+    // key (from the words or the phone) cannot be found again without it
+    let unmark = || {
+        if let Some(p) = volume::sparsebundle::id_path(&vol) {
+            let _ = std::fs::remove_file(p);
+        }
+    };
+    if kind == Kind::Sparsebundle {
+        volume::write_marker(&vol)?;
+        journal::test_kill("seal-volume", "marked");
+    }
     match kind {
         Kind::Sparsebundle => volume::sparsebundle::change_passphrase(
             path.as_ref().expect("path"),
             old.as_bytes(),
             new.as_bytes(),
-        )?,
+        )
+        .inspect_err(|_| {
+            if opens(old.as_bytes()).unwrap_or(false) {
+                unmark();
+            }
+        })?,
         Kind::Apfs => volume::apfs::change_passphrase(&id, old.as_bytes(), new.as_bytes())?,
         Kind::Luks => {
             let out = util::run_with_fds(
@@ -220,7 +275,7 @@ pub fn seal_volume_given(
     // check before the old way in is gone: the new key opens it
     if !opens(new.as_bytes())? {
         if kind != Kind::Luks {
-            let _ = match kind {
+            let back = match kind {
                 Kind::Sparsebundle => volume::sparsebundle::change_passphrase(
                     path.as_ref().expect("path"),
                     new.as_bytes(),
@@ -228,25 +283,15 @@ pub fn seal_volume_given(
                 ),
                 _ => volume::apfs::change_passphrase(&id, new.as_bytes(), old.as_bytes()),
             };
+            if back.is_ok() && kind == Kind::Sparsebundle {
+                unmark();
+            }
         }
         return Err(fail(
             exit::ERROR,
             "The new key did not open the volume; your passphrase still does.",
         ));
     }
-    let vol = Volume {
-        name: name.into(),
-        kind,
-        path,
-        id,
-        words: fp.clone(),
-        check: key.check(),
-        mountpoint: match mountpoint {
-            Some(m) => m,
-            None => volume::default_mountpoint(kind, name)?,
-        },
-        manual,
-    };
     volume::write_marker(&vol)?;
     vol.save()?;
     eprintln!(
@@ -258,6 +303,19 @@ pub fn seal_volume_given(
 
 /// Validates a restic repository id taken from a URL.
 pub fn repo_id_of(url: &str) -> Result<String> {
+    let id = repo_id_in(url)?;
+    if Backup::list()?.iter().any(|b| b.repo_id == id) {
+        return Err(fail(
+            exit::USAGE,
+            format!("Another backup uses the repository id {id}."),
+        ));
+    }
+    Ok(id)
+}
+
+/// The id of a restic repository, its key's derivation id: the last segment of its URL after
+/// `/` or `:`. `seal backup` and `recover` both take it from here.
+pub fn repo_id_in(url: &str) -> Result<String> {
     let id = url
         .trim_end_matches('/')
         .rsplit(['/', ':'])
@@ -272,12 +330,6 @@ pub fn repo_id_of(url: &str) -> Result<String> {
         return Err(fail(
             exit::USAGE,
             "The repository's last path segment must be 1 to 64 of A-Z a-z 0-9 . _ -",
-        ));
-    }
-    if Backup::list()?.iter().any(|b| b.repo_id == id) {
-        return Err(fail(
-            exit::USAGE,
-            format!("Another backup uses the repository id {id}."),
         ));
     }
     Ok(id)
@@ -718,5 +770,25 @@ fn seal_one(stores: &mut store::Stores, o: &handback::Object, words: bool) -> Re
             Ok("stored, read back.".into())
         }
         other => Err(fail(exit::USAGE, format!("Unknown kind {other}."))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_id_in;
+
+    #[test]
+    fn repository_ids_from_every_url_form() {
+        for (url, id) in [
+            ("/srv/restic/safe-backup/", "safe-backup"),
+            ("rclone:gdrive:backups", "backups"),
+            ("sftp:user@nas:docs", "docs"),
+            ("sftp:user@nas:/srv/docs", "docs"),
+            ("s3:s3.amazonaws.com/bucket/repo", "repo"),
+            ("b2:bucket:repo.1", "repo.1"),
+        ] {
+            assert_eq!(repo_id_in(url).unwrap(), id, "{url}");
+        }
+        assert!(repo_id_in("rclone:remote:").is_err());
     }
 }

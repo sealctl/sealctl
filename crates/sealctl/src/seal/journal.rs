@@ -123,6 +123,17 @@ impl Run {
             .collect()
     }
 
+    /// The note of the last `state` line of `step`, from this run or an earlier attempt.
+    pub fn last_note(&self, step: &str, state: &str) -> Option<String> {
+        std::fs::read_to_string(self.dir.join("journal.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["step"] == step && v["state"] == state)
+            .find_map(|v| v["note"].as_str().map(str::to_owned))
+    }
+
     /// Copies a file into `files/<path under $HOME>` before its first edit.
     pub fn keep_copy(&self, file: &Path) -> Result<()> {
         if !file.exists() {
@@ -172,9 +183,10 @@ impl Run {
 /// Tests only (`test-hooks`): with `SEALCTL_TEST_KILL=<state>:<step>` (a step id such as
 /// `secrets:2 secrets`, or just its kind, `secrets`; for example `done:secrets`) the process
 /// kills itself with SIGKILL right after that journal line is on disk: a power cut at a known
-/// point of the run, for the resume tests.
+/// point of the run, for the resume tests. `seal volume` has one more point outside any
+/// journal: `marked:seal-volume`, a sparse bundle's marker on disk before its passphrase changes.
 #[allow(unused_variables)]
-fn test_kill(step: &str, state: &str) {
+pub(crate) fn test_kill(step: &str, state: &str) {
     #[cfg(feature = "test-hooks")]
     if let Ok(v) = std::env::var("SEALCTL_TEST_KILL") {
         let kind = step.split(':').next().unwrap_or(step);

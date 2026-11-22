@@ -301,31 +301,130 @@ pub fn find(roots: &[PathBuf], home: bool) -> Result<Vec<Finding>> {
     Ok(out)
 }
 
-/// Rewrites a file in place keeping its mode (temporary name, fsync, rename).
-fn rewrite(file: &Path, text: &str) -> Result<()> {
+/// Rewrites a file in place keeping its mode (temporary name, fsync, rename). A symlink
+/// (a dotfiles repository's `~/.zshrc`) stays: the file it points to is the one rewritten.
+fn rewrite(file: &Path, text: &[u8]) -> Result<()> {
     use anyhow::Context;
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(file)
+    let target = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let mode = std::fs::metadata(&target)
         .map(|m| m.permissions().mode() & 0o7777)
         .unwrap_or(0o600);
-    paths::write_mode(file, text.as_bytes(), mode).with_context(|| format!("rewriting {}", file.display()))
+    paths::write_mode(&target, text, mode).with_context(|| format!("rewriting {}", file.display()))
+}
+
+/// `hay` with every `needle` replaced by `****`, byte for byte (a zsh history is not UTF-8).
+fn mask_bytes(hay: &[u8], needle: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(hay.len()));
+    if needle.is_empty() {
+        out.extend_from_slice(hay);
+        return out;
+    }
+    let mut i = 0;
+    while i < hay.len() {
+        if hay[i..].starts_with(needle) {
+            out.extend_from_slice(b"****");
+            i += needle.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The secret a value goes to: its name, or `<name>-2`, `-3`, … when the store or this run
+/// has that name with another value; and whether the store still has to be written.
+fn place(
+    store: &crate::store::Store,
+    base: &str,
+    sum: &str,
+    taken: &std::collections::BTreeSet<String>,
+) -> Result<(String, bool)> {
+    let mut name = base.to_string();
+    let mut i = 2;
+    loop {
+        crate::store::check_name(&name)?;
+        if !taken.contains(&name) {
+            if !store.exists(&name) {
+                return Ok((name, true));
+            }
+            // already in the store: the same value is used as it is, another one is kept
+            let back = client::values(std::slice::from_ref(&name), None)?;
+            if back.first().is_some_and(|(_, v)| util::sha256_hex(v) == sum) {
+                return Ok((name, false));
+            }
+        }
+        name = format!("{base}-{i}");
+        i += 1;
+    }
 }
 
 /// Seals the findings: values into the store (one secret per distinct value), each read back,
 /// then the references written and the files changed.
 pub fn seal(findings: &[Finding]) -> Result<usize> {
-    // one secret per value: the first name it was found under
+    // every file is read before anything is stored or changed
+    let mut texts: BTreeMap<PathBuf, Zeroizing<Vec<u8>>> = BTreeMap::new();
+    for f in findings {
+        if !texts.contains_key(&f.file) {
+            let bytes = std::fs::read(&f.file).map_err(|e| {
+                fail(
+                    exit::ERROR,
+                    format!(
+                        "Cannot read {}: {e}. Nothing was stored and no file was changed.",
+                        f.file.display()
+                    ),
+                )
+            })?;
+            texts.insert(f.file.clone(), Zeroizing::new(bytes));
+        }
+    }
+    // a folder's .sealctl.toml maps a variable to one secret: .env files of one folder that
+    // give it different values stop the scan here, before anything is stored
+    let mut per_var: BTreeMap<(PathBuf, &str), Vec<(&Path, String)>> = BTreeMap::new();
+    for f in findings.iter().filter(|f| f.kind == "env file") {
+        let dir = f.file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        per_var
+            .entry((dir, f.source.as_str()))
+            .or_default()
+            .push((&f.file, util::sha256_hex(f.value.as_bytes())));
+    }
+    for ((dir, var), seen) in &per_var {
+        if seen.iter().any(|(_, s)| *s != seen[0].1) {
+            let files: Vec<String> = seen
+                .iter()
+                .map(|(f, _)| f.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                .collect();
+            return Err(fail(
+                exit::ERROR,
+                format!(
+                    "{var} has different values in {} in {}, and the folder's {} maps it to one \
+                     secret. Nothing was stored and no file was changed. Keep one value of {var} \
+                     in that folder, then scan again.",
+                    files.join(" and "),
+                    paths::tilde(dir),
+                    project::FILE
+                ),
+            ));
+        }
+    }
+    // one secret per value: the first name it was found under, never another value's
+    let store = crate::store::Store::configured()?;
     let mut by_value: BTreeMap<String, String> = BTreeMap::new();
+    let mut taken = std::collections::BTreeSet::new();
     let mut stored = 0;
     for f in findings {
-        let Some(name) = &f.name else { continue };
+        let Some(base) = &f.name else { continue };
         let sum = util::sha256_hex(f.value.as_bytes());
         if by_value.contains_key(&sum) {
             continue;
         }
-        crate::store::check_name(name)?;
-        client::store_set(name, f.value.as_bytes(), false, true)?;
-        by_value.insert(sum, name.clone());
+        let (name, write) = place(&store, base, &sum, &taken)?;
+        if write {
+            client::store_set(&name, f.value.as_bytes(), false, false)?;
+        }
+        taken.insert(name.clone());
+        by_value.insert(sum, name);
         stored += 1;
     }
     let names: Vec<String> = by_value.values().cloned().collect();
@@ -351,7 +450,21 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
         by_file.entry(f.file.clone()).or_default().push(f);
     }
     for (file, fs) in by_file {
-        let text = Zeroizing::new(std::fs::read_to_string(&file).unwrap_or_default());
+        let bytes = &texts[&file];
+        if fs[0].kind == "history" {
+            let mut t = Zeroizing::new(bytes.to_vec());
+            for f in &fs {
+                t = mask_bytes(&t, f.value.as_bytes());
+            }
+            rewrite(&file, &t)?;
+            continue;
+        }
+        let text = Zeroizing::new(String::from_utf8(bytes.to_vec()).map_err(|_| {
+            fail(
+                exit::ERROR,
+                format!("{} is not text. It was left as it is.", file.display()),
+            )
+        })?);
         match fs[0].kind {
             "env file" => {
                 let dir = file.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -397,7 +510,7 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
                     std::fs::remove_file(&file)
                         .map_err(|e| anyhow::anyhow!("removing {}: {e}", file.display()))?;
                 } else {
-                    rewrite(&file, &kept)?;
+                    rewrite(&file, kept.as_bytes())?;
                 }
             }
             "shell rc" => {
@@ -410,15 +523,7 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
                         );
                     }
                 }
-                rewrite(&file, &(lines.join("\n") + "\n"))?;
-            }
-            "history" => {
-                let mut t = Zeroizing::new(text.to_string());
-                for f in &fs {
-                    let masked = t.replace(f.value.as_str(), "****");
-                    *t = masked;
-                }
-                rewrite(&file, &t)?;
+                rewrite(&file, (lines.join("\n") + "\n").as_bytes())?;
             }
             "aws credentials" => {
                 let profiles: Vec<&str> = fs.iter().map(|f| f.source.as_str()).collect();
@@ -434,7 +539,7 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
                         keep.push('\n');
                     }
                 }
-                rewrite(&file, &keep)?;
+                rewrite(&file, keep.as_bytes())?;
                 let cfg = file.with_file_name("config");
                 let mut c = std::fs::read_to_string(&cfg).unwrap_or_default();
                 let exe = util::stable_exe()?.display().to_string();
@@ -465,7 +570,7 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
 
 fn rewrite_or_create(file: &Path, text: &str) -> Result<()> {
     if file.exists() {
-        rewrite(file, text)
+        rewrite(file, text.as_bytes())
     } else {
         paths::write_mode(file, text.as_bytes(), 0o600)
     }

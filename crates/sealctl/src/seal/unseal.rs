@@ -841,6 +841,57 @@ impl Ctx<'_> {
         }
     }
 
+    /// The new password of an object's step, stored and journalled before the object changes.
+    /// A resumed step takes the one an earlier attempt stored only when the object may hold it:
+    /// sealctl's key no longer opens the object, or the stored password already does. While
+    /// sealctl's key still opens an object that the stored password does not, nothing has
+    /// changed yet and a new password is made as on a first attempt, so a value read back
+    /// unchecked (a mistyped `show` passphrase) never becomes the object's passphrase.
+    /// `both`: the object can take a second passphrase beside sealctl's (LUKS slots, restic
+    /// keys); a sparse bundle or APFS volume cannot, so its stored password is not read back
+    /// while sealctl's key opens it.
+    fn step_password(
+        &mut self,
+        step: &str,
+        what: &str,
+        item: &Item,
+        recall: Recall<'_>,
+    ) -> Result<(Zeroizing<String>, Location)> {
+        if let Some(note) = self.run.last_note(step, "password") {
+            let loc: Location = serde_json::from_str(&note).context("the journal's password line")?;
+            if !recall.sealctl_opens || recall.both {
+                let v = self.stores.read(&loc).with_context(|| {
+                    format!(
+                        "reading the new password of {what} that an earlier attempt stored in {}",
+                        loc.describe()
+                    )
+                })?;
+                let pw = Zeroizing::new(String::from_utf8(v.to_vec()).context("passwords are text")?);
+                if (recall.opens)(pw.as_bytes())? {
+                    return Ok((pw, loc));
+                }
+                if !recall.sealctl_opens {
+                    return Err(fail(
+                        exit::ERROR,
+                        format!(
+                            "Neither sealctl's key nor the new password in {} opens {what}. \
+                             Nothing more is changed.",
+                            loc.describe()
+                        ),
+                    ));
+                }
+            }
+            eprintln!(
+                "sealctl's key still opens {what}, so the password an earlier attempt made was \
+                 not used. A new one replaces it."
+            );
+        }
+        let pw = self.new_password(what)?;
+        let loc = self.put(self.plan.stores.to, item, pw.as_bytes())?;
+        self.run.log(step, "password", &serde_json::to_string(&loc)?)?;
+        Ok((pw, loc))
+    }
+
     fn done(&mut self, kind: &str, name: &str, to: String, obj: hb::Object) -> Result<()> {
         self.handback.push(HandbackItem {
             kind: kind.into(),
@@ -851,6 +902,16 @@ impl Ctx<'_> {
         self.objects.push(obj);
         save_handback(self.run, &self.objects)
     }
+}
+
+/// What a resumed step knows about its object before it takes an earlier attempt's password.
+struct Recall<'a> {
+    /// sealctl's key opens the object now.
+    sealctl_opens: bool,
+    /// The object can hold another passphrase beside sealctl's.
+    both: bool,
+    /// Does this password open the object?
+    opens: &'a dyn Fn(&[u8]) -> Result<bool>,
 }
 
 fn save_handback(run: &Run, objects: &[hb::Object]) -> Result<()> {
@@ -938,11 +999,17 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         }
     }
     let derived = Repo::new(&b.repo, key, env.clone());
-    let pw = c.new_password(&format!("backup {}", b.name))?;
     // the new password and the credentials are saved before anything changes
+    let step = format!("backup:{}", b.name);
     let pw_name = format!("{}/password", b.name);
-    let loc = c.put(
-        c.plan.stores.to,
+    let resumed = c.run.last_note(&step, "password").is_some();
+    let recall_opens = |p: &[u8]| -> Result<bool> {
+        let p = Zeroizing::new(String::from_utf8_lossy(p).into_owned());
+        Repo::with_password(&b.repo, p, env.clone()).opens()
+    };
+    let (pw, loc) = c.step_password(
+        &step,
+        &format!("backup {}", b.name),
         &Item {
             kind: "backup",
             name: &pw_name,
@@ -950,7 +1017,12 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             credential: false,
             var: None,
         },
-        pw.as_bytes(),
+        Recall {
+            // only a resumed step asks
+            sealctl_opens: !resumed || derived.opens()?,
+            both: true,
+            opens: &recall_opens,
+        },
     )?;
     let mut creds = Vec::new();
     for (var, v) in &env {
@@ -993,37 +1065,41 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     }
     let own = Repo::with_password(&b.repo, pw.clone(), env.clone());
     let opens_already = own.opens().unwrap_or(false);
-    let ours = derived
-        .keys()?
-        .into_iter()
-        .find(|k| k.3)
-        .map(|k| k.0)
-        .context("sealctl's restic key")?;
-    let new_id = if opens_already {
-        own.keys()?
+    // a resumed step whose earlier attempt removed sealctl's key already has nothing to change
+    if !(opens_already && !derived.opens()?) {
+        let ours = derived
+            .keys()?
             .into_iter()
             .find(|k| k.3)
             .map(|k| k.0)
-            .context("key")?
-    } else {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        derived.key_add(pw.as_bytes(), &user, &hostname())?
-    };
-    if !own.opens()? {
-        return Err(fail(
-            exit::ERROR,
-            format!(
-                "The new password does not open backup {}. sealctl's key still does.",
-                b.name
-            ),
-        ));
-    }
-    own.key_remove(&ours, &new_id)?;
-    if derived.opens()? {
-        return Err(fail(
-            exit::ERROR,
-            format!("sealctl's key still opens backup {}.", b.name),
-        ));
+            .context("sealctl's restic key")?;
+        let new_id = if opens_already {
+            own.keys()?
+                .into_iter()
+                .find(|k| k.3)
+                .map(|k| k.0)
+                .context("key")?
+        } else {
+            let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+            derived.key_add(pw.as_bytes(), &user, &hostname())?
+        };
+        if !own.opens()? {
+            return Err(fail(
+                exit::ERROR,
+                format!(
+                    "The new password does not open backup {}. sealctl's key still does.",
+                    b.name
+                ),
+            ));
+        }
+        own.key_remove(&ours, &new_id)?;
+        c.run.log(&step, "changed", "")?;
+        if derived.opens()? {
+            return Err(fail(
+                exit::ERROR,
+                format!("sealctl's key still opens backup {}.", b.name),
+            ));
+        }
     }
     b.forget()?;
     if Backup::list()?.is_empty() {
@@ -1062,7 +1138,6 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             Kind::Luks => volume::luks::verify(path.as_ref().context("path")?, pass),
         }
     };
-    let pw = c.new_password(&format!("volume {}", v.name))?;
     let notes = match v.kind {
         Kind::Apfs => format!(
             "APFS volume {} (UUID {}). Open with: diskutil apfs unlockVolume {}",
@@ -1086,8 +1161,11 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             v.name
         ),
     };
-    let loc = c.put(
-        c.plan.stores.to,
+    let step = format!("volume:{}", v.name);
+    let resumed = c.run.last_note(&step, "password").is_some();
+    let (pw, loc) = c.step_password(
+        &step,
+        &format!("volume {}", v.name),
         &Item {
             kind: "volume",
             name: &v.name,
@@ -1095,7 +1173,12 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             credential: false,
             var: None,
         },
-        pw.as_bytes(),
+        Recall {
+            // only a resumed step asks
+            sealctl_opens: !resumed || opens(derived.as_bytes())?,
+            both: v.kind == Kind::Luks,
+            opens: &opens,
+        },
     )?;
     if !opens(pw.as_bytes())? {
         match v.kind {
@@ -1115,15 +1198,6 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
                     None,
                 )?;
                 util::check(out, "cryptsetup luksAddKey")?;
-                let out = util::run_with_stdin(
-                    util::system_cmd("cryptsetup")
-                        .args(["luksRemoveKey", "--key-file=-"])
-                        .arg(path.as_ref().context("path")?),
-                    derived.as_bytes(),
-                )?;
-                util::check(out, "cryptsetup luksRemoveKey")?;
-                // the words marker goes with sealctl's key slot (SPEC 18.2)
-                volume::luks::remove_tokens(path.as_ref().context("path")?);
             }
         }
     }
@@ -1146,6 +1220,19 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             ),
         ));
     }
+    // LUKS has slots: sealctl's goes only once the new passphrase is known to open it
+    if v.kind == Kind::Luks && opens(derived.as_bytes())? {
+        let out = util::run_with_stdin(
+            util::system_cmd("cryptsetup")
+                .args(["luksRemoveKey", "--key-file=-"])
+                .arg(path.as_ref().context("path")?),
+            derived.as_bytes(),
+        )?;
+        util::check(out, "cryptsetup luksRemoveKey")?;
+        // the words marker goes with sealctl's key slot (SPEC 18.2)
+        volume::luks::remove_tokens(path.as_ref().context("path")?);
+    }
+    c.run.log(&step, "changed", "")?;
     if opens(derived.as_bytes())? {
         return Err(fail(
             exit::ERROR,
@@ -1182,6 +1269,14 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         },
     )?;
     Ok("your passphrase works; sealctl's is removed.".into())
+}
+
+/// `<key file>.pub`: the name gets `.pub` added, so `work.laptop` has `work.laptop.pub`, never
+/// another key's `work.pub`.
+fn pub_of(key: &Path) -> PathBuf {
+    let mut p = key.as_os_str().to_owned();
+    p.push(".pub");
+    PathBuf::from(p)
 }
 
 fn step_ssh(c: &mut Ctx<'_>, name: &str) -> Result<String> {
@@ -1233,7 +1328,7 @@ fn step_ssh(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     };
     paths::write_private(&dest, text.as_bytes())?;
     paths::write_mode(
-        &dest.with_extension("pub"),
+        &pub_of(&dest),
         format!("{}\n", key.public_key().to_openssh()?).as_bytes(),
         0o644,
     )?;
@@ -1830,4 +1925,22 @@ pub fn newest_run() -> Option<PathBuf> {
         .collect();
     runs.sort();
     runs.pop()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pub_of;
+    use std::path::Path;
+
+    #[test]
+    fn a_dotted_key_name_keeps_its_own_public_file() {
+        assert_eq!(
+            pub_of(Path::new("/h/.ssh/work.laptop")),
+            Path::new("/h/.ssh/work.laptop.pub")
+        );
+        assert_eq!(
+            pub_of(Path::new("/h/.ssh/ed25519-2")),
+            Path::new("/h/.ssh/ed25519-2.pub")
+        );
+    }
 }
