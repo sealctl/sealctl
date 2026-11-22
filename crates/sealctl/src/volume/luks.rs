@@ -211,11 +211,27 @@ impl Backend for Luks {
             if force && !out.status.success() {
                 // after a lazy unmount, processes with files open still hold the device: have the
                 // kernel remove it as soon as they let go, and say that it is still open now
-                let _ = sudo()
+                let deferred = sudo()
                     .args(["cryptsetup", "close", "--deferred", &mapper])
-                    .output();
+                    .output()?;
+                if deferred.status.success() {
+                    bail!(
+                        "unmounted, but processes with files open still use the decrypted device; it closes when they exit"
+                    );
+                }
+                // the deferred close failed too: report why, and promise nothing
+                let why = |o: &std::process::Output| {
+                    String::from_utf8_lossy(&o.stderr)
+                        .trim()
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .to_string()
+                };
                 bail!(
-                    "unmounted, but processes with files open still use the decrypted device; it closes when they exit"
+                    "cryptsetup close failed: {}; cryptsetup close --deferred failed: {}",
+                    why(&out),
+                    why(&deferred)
                 );
             }
             check(out, "cryptsetup close")?;
