@@ -38,11 +38,76 @@ allow = [
     "CDLA-Permissive-2.0",
     "bzip2-1.0.6",
 ]
+# workspace-only crates that are never published (the fuzz targets)
+private = { ignore = true }
+exceptions = [
+    # LLVM's libFuzzer, in the fuzz workspace only (never in a release binary)
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
+deny = [
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+    { crate = "native-tls", use-instead = "rustls" },
+]
+
+# Build scripts run arbitrary code on the build machine (and on the release runners), so
+# only these crates may have one. A crate that adds a build script, or a new dependency
+# that has one, fails `cargo deny check` until it is reviewed and added here. Both
+# workspaces (the fuzz one adds libfuzzer-sys).
+[bans.build]
+allow-build-scripts = [
+    { crate = "anyhow" },
+    { crate = "async-io" },
+    { crate = "camino" },
+    { crate = "crossbeam-utils" },
+    { crate = "curve25519-dalek" },
+    { crate = "fs-err" },
+    { crate = "generic-array" },
+    { crate = "getrandom" },
+    { crate = "httparse" },
+    { crate = "icu_normalizer_data" },
+    { crate = "icu_properties_data" },
+    { crate = "jni" },
+    { crate = "jni-macros" },
+    { crate = "libc" },
+    { crate = "libfuzzer-sys" },
+    { crate = "libm" },
+    { crate = "memoffset" },
+    { crate = "nix" },
+    { crate = "num-bigint-dig" },
+    { crate = "num-traits" },
+    { crate = "portable-atomic" },
+    { crate = "portable-atomic-util" },
+    { crate = "proc-macro2" },
+    { crate = "quote" },
+    { crate = "ring" },
+    { crate = "rustix" },
+    { crate = "rustls" },
+    { crate = "rustversion" },
+    { crate = "serde" },
+    { crate = "serde_core" },
+    { crate = "serde_json" },
+    { crate = "signal-hook" },
+    { crate = "thiserror" },
+    { crate = "wasm-bindgen" },
+    { crate = "wasm-bindgen-shared" },
+    { crate = "windows_aarch64_gnullvm" },
+    { crate = "windows_aarch64_msvc" },
+    { crate = "windows_i686_gnu" },
+    { crate = "windows_i686_gnullvm" },
+    { crate = "windows_i686_msvc" },
+    { crate = "windows_x86_64_gnu" },
+    { crate = "windows_x86_64_gnullvm" },
+    { crate = "windows_x86_64_msvc" },
+    { crate = "wit-bindgen" },
+    { crate = "zerocopy" },
+    { crate = "zmij" },
+]
 
 [sources]
 unknown-registry = "deny"
