@@ -873,10 +873,10 @@ Journal line:
 {"v": 1, "t": "2026-11-21T10:14:02+01:00", "n": 7, "step": "volume:safe", "state": "done", "note": "passphrase changed; verify passed"}
 ```
 
-`state` is `start`, `done`, `failed` or `skipped`. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed.
+`state` is `start`, `done`, `failed` or `skipped`; a volume or backup step also writes `password` (its note: where the step's new password went, as in `handback.json`) before the object changes, and `changed` once the object opens only with that password. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed.
 
 - `--resume` takes the newest run folder that has a `plan.json` and no `done`; without one it exits 9 (`No unfinished run to resume.`).
-- For each step not `done`, the step's check runs first against the object (does the new password already open it? is sealctl's key already gone?), so a step interrupted after it took effect is recorded, not repeated.
+- For each step not `done`, the step's check runs first against the object (does the new password already open it? is sealctl's key already gone?), so a step interrupted after it took effect is recorded, not repeated. A resumed volume or backup step reads its new password back from where its `password` line says, never making another one.
 - Ctrl-C lets the current OS call finish, writes the journal line, and exits 13.
 - The final message names the folder and says to delete it once everything opens with the new passwords.
 

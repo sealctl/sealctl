@@ -292,3 +292,82 @@ fn seal_an_existing_sparse_bundle_and_restic_repository() {
     let (code, _, err) = env.run(&["backup", "run", "mine-b", "--quiet"]);
     assert_eq!(code, 0, "{err}");
 }
+
+/// `unseal backup` killed (SIGKILL) right after sealctl's restic key is removed, so that only
+/// the new password opens the repository: `--resume` reads that password back from the folder
+/// store instead of making another, and finishes with it.
+#[cfg(all(target_os = "macos", feature = "test-hooks"))]
+#[test]
+fn unseal_backup_resumed_after_the_key_change_keeps_the_new_password() {
+    use std::os::unix::process::ExitStatusExt;
+
+    if !have("restic") {
+        return;
+    }
+    let mut env = Env::new();
+    env.pair();
+    let repo = env.h().join("myrepo");
+    let rpw = canary();
+    assert!(restic(&repo, &rpw, &["init"]).status.success());
+    let src = env.h().join("data");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), "x").unwrap();
+    let mut c = env.cmd();
+    c.args([
+        "seal",
+        "backup",
+        "rb",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--from",
+        src.to_str().unwrap(),
+    ]);
+    let pty = Pty::spawn(c);
+    pty.expect("Password of the restic repository:", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line(&rpw);
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    drop(phone);
+
+    let mut c = env.cmd();
+    c.env("SEALCTL_TEST_KILL", "changed:backup")
+        .args(["unseal", "backup", "rb"]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("y");
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st;
+        }
+        if start.elapsed() > Duration::from_secs(180) {
+            let _ = pty.child.kill();
+            panic!("not killed; screen:\n{}", pty.screen.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let screen = pty.screen.lock().unwrap().clone();
+    assert_eq!(status.signal(), Some(9), "killed at the hook: {screen}");
+    drop(phone);
+    let run = run_dir(&env);
+    let first = password_in(&run, "backup rb");
+    let keys = restic(&repo, &first, &["key", "list", "--json"]);
+    assert!(keys.status.success(), "the new password opens it");
+    let ks: serde_json::Value = serde_json::from_slice(&keys.stdout).unwrap();
+    assert_eq!(ks.as_array().unwrap().len(), 1, "sealctl's key is gone already");
+
+    let mut c = env.cmd();
+    c.args(["unseal", "--resume"]);
+    let pty = Pty::spawn(c);
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    let (code, _, screen) = pty.wait(Duration::from_secs(180));
+    assert_eq!(code, 0, "{screen}");
+    assert!(run.join("done").exists());
+    assert_eq!(password_in(&run, "backup rb"), first, "the same password");
+    let envfile = std::fs::read_to_string(run.join("backup-rb.env")).unwrap();
+    assert!(envfile.contains(&first), "backup-rb.env has the same password");
+    let o = restic(&repo, &first, &["snapshots", "--json"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}

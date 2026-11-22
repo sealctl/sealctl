@@ -123,6 +123,17 @@ impl Run {
             .collect()
     }
 
+    /// The note of the last `state` line of `step`, from this run or an earlier attempt.
+    pub fn last_note(&self, step: &str, state: &str) -> Option<String> {
+        std::fs::read_to_string(self.dir.join("journal.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["step"] == step && v["state"] == state)
+            .find_map(|v| v["note"].as_str().map(str::to_owned))
+    }
+
     /// Copies a file into `files/<path under $HOME>` before its first edit.
     pub fn keep_copy(&self, file: &Path) -> Result<()> {
         if !file.exists() {
