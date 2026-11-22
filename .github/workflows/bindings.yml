@@ -13,12 +13,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # one run per pull request (a new push cancels the old run); push, tag, schedule and manual
+  # runs get a group of their own, so a run on main or a tag is never cancelled or replaced
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   swift:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,6 +46,7 @@ jobs:
 
   kotlin:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

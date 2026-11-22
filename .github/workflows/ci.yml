@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # one run per pull request (a new push cancels the old run); push, tag, schedule and manual
+  # runs get a group of their own, so a run on main or a tag is never cancelled or replaced
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -19,6 +25,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,6 +85,7 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       # overrides rust-toolchain.toml: the declared rust-version must keep building
       RUSTUP_TOOLCHAIN: "1.89"
@@ -91,6 +99,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -106,10 +115,8 @@ jobs:
           echo "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903  $RUNNER_TEMP/$f.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$f.tar.gz" -C "$RUNNER_TEMP"
           install -m 755 "$RUNNER_TEMP/$f/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
-      - name: cargo deny (workspace)
-        run: cargo deny --locked check
-      - name: cargo deny (fuzz workspace)
-        run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check
+      # one Cargo.lock for the workspace and the fuzz targets
+      - run: cargo deny --locked check
 
   # cargo-vet (SPEC.md section 21): every crate is audited by us, covered by an imported audit
   # set (Mozilla, Google, Bytecode Alliance, ISRG, Zcash, Embark), or listed as an exemption in
@@ -117,12 +124,18 @@ jobs:
   # locally and its audit or exemption is reviewed in the pull request.
   vet:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Toolchain (rust-toolchain.toml)
         run: rustup toolchain install
+      # keeps the compiled cargo-vet in ~/.cargo/bin between runs (cache-bin)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: cargo-vet
+          cache-targets: false
       # from crates.io (checksummed by the registry index), with its own Cargo.lock
       - name: Install cargo-vet 0.10.3
         run: cargo install cargo-vet --version 0.10.3 --locked

@@ -6,8 +6,8 @@ version: 2
 
 updates:
   - package-ecosystem: cargo
-    # the workspace and the separate fuzz workspace (its own Cargo.lock)
-    directories: ["/", "/fuzz"]
+    # one workspace and one Cargo.lock, the fuzz targets included
+    directory: /
     schedule:
       interval: weekly
     cooldown:
@@ -30,6 +30,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    open-pull-requests-limit: 5
 
   # rust-toolchain.toml (the pinned release compiler)
   - package-ecosystem: rust-toolchain
@@ -38,6 +39,7 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    open-pull-requests-limit: 5
 
   # flake.lock (nixpkgs for `nix build` / `nix profile install`)
   - package-ecosystem: nix
@@ -46,3 +48,4 @@ updates:
       interval: monthly
     cooldown:
       default-days: 7
+    open-pull-requests-limit: 5

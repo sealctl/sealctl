@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/sealctl", "crates/sealctl-core", "crates/sealctl-fakerelay"]
+members = ["crates/sealctl", "crates/sealctl-core", "crates/sealctl-fakerelay", "fuzz"]
+# The fuzz targets share this workspace's Cargo.lock (one lockfile for Dependabot, cargo deny
+# and cargo vet) but are only built by `cargo fuzz` on nightly, never by plain cargo commands.
+default-members = ["crates/sealctl", "crates/sealctl-core", "crates/sealctl-fakerelay"]
 
 [workspace.package]
 version = "0.7.0"
