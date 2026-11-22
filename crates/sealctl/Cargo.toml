@@ -47,6 +47,7 @@ keyring = { version = "3", features = ["apple-native", "async-secret-service", "
 [target.'cfg(target_os = "macos")'.dependencies]
 # Keychain items with a readable label (keyring can't set one)
 security-framework = "3"
+core-foundation = "0.10"
 
 [features]
 # Tests only: the keychain service name can be overridden (SEALCTL_TEST_KEYCHAIN_SERVICE).

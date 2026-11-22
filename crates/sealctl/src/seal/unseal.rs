@@ -1519,12 +1519,7 @@ pub fn unseal(o: Opts) -> Result<()> {
             no_ssh_passphrase: o.no_ssh_passphrase || to == StoreKind::Folder,
         };
         let mut plan = plan;
-        if !plan.no_ssh_passphrase {
-            let with = format!("with a passphrase in {}", to.describe());
-            for s in plan.steps.iter_mut().filter(|s| s.kind == "ssh") {
-                s.text = s.text.replace("with no passphrase", &with);
-            }
-        }
+        retext(&mut plan);
         show_plan(&plan);
         if o.dry_run {
             if o.json {
@@ -1702,6 +1697,78 @@ pub fn unseal(o: Opts) -> Result<()> {
         println!("{}", json!({"run": dir, "done": total}));
     }
     Ok(())
+}
+
+/// Where a secret goes, for its plan row: the chosen store, not always the folder.
+fn secrets_destination(stores: &store::Config) -> String {
+    match stores.secrets_to {
+        StoreKind::Folder => "secrets.env in the folder, plain".into(),
+        StoreKind::Env => format!(
+            "{} (a .env file), plain",
+            stores
+                .env_file
+                .as_ref()
+                .map(|f| paths::tilde(f))
+                .unwrap_or_else(|| "~/sealctl-secrets.env".into())
+        ),
+        StoreKind::Keychain => format!(
+            "{}, labels \"sealctl: secret <name>\"",
+            StoreKind::Keychain.describe()
+        ),
+        StoreKind::Op => "1Password, titles \"sealctl: secret <name>\"".into(),
+        StoreKind::Bw => "Bitwarden, names \"sealctl: secret <name>\"".into(),
+        StoreKind::Show => StoreKind::Show.describe().into(),
+    }
+}
+
+/// Plan rows that depend on the chosen stores: secrets, own-approval secrets, backup
+/// passwords and credentials, volume passphrases, SSH keys.
+pub fn retext(plan: &mut PlanFile) {
+    let to = plan.stores.to;
+    let dest = secrets_destination(&plan.stores);
+    let pw_in = match to {
+        StoreKind::Folder => "passwords.txt".to_string(),
+        k => k.describe().to_string(),
+    };
+    let ssh_plain = plan.no_ssh_passphrase;
+    for s in plan.steps.iter_mut() {
+        let n = s
+            .text
+            .find(&s.name)
+            .map(|i| i + s.name.len())
+            .unwrap_or(s.text.len());
+        let head = s.text[..n].to_string();
+        let pad = |head: &str| format!("{head:<41} ");
+        let new = match s.kind.as_str() {
+            "secrets" => Some(format!("→ {dest}")),
+            "secret" => Some(format!(
+                "→ {dest}{}",
+                if s.text.contains("own approval") {
+                    " (own approval)"
+                } else {
+                    ""
+                }
+            )),
+            "backup" if s.name.ends_with(" credentials") => Some(format!("storage credentials → {dest}")),
+            "backup" => Some(format!(
+                "stays encrypted; it will open with a new password ({pw_in}). sealctl's key is removed."
+            )),
+            "volume" => Some(format!(
+                "{} stays encrypted; it will open with a new passphrase ({pw_in}).",
+                s.name
+            )),
+            "ssh" if ssh_plain => Some(format!("→ ~/.ssh/{} with no passphrase", s.name)),
+            "ssh" => Some(format!(
+                "→ ~/.ssh/{} with a passphrase in {}",
+                s.name,
+                to.describe()
+            )),
+            _ => None,
+        };
+        if let Some(what) = new {
+            s.text = format!("{}{what}", pad(&head));
+        }
+    }
 }
 
 fn show_plan(plan: &PlanFile) {

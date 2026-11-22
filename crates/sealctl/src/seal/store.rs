@@ -394,8 +394,10 @@ impl Stores {
             StoreKind::Keychain => {
                 let service = keychain_service();
                 let account = item.account();
+                log::debug!("keychain: writing {account} of {service}");
                 keychain_set(&service, &account, &item.label(), value)
                     .with_context(|| format!("writing {} to the keychain", item.label()))?;
+                log::debug!("keychain: wrote {account}");
                 let mut l = Location::new(kind);
                 l.service = Some(service);
                 l.account = Some(account);
@@ -425,13 +427,12 @@ impl Stores {
         match loc.store {
             StoreKind::Folder => folder::read(loc),
             StoreKind::Keychain => {
-                let e = keyring::Entry::new(
-                    loc.service.as_deref().unwrap_or(SERVICE),
-                    loc.account.as_deref().context("keychain account")?,
-                )?;
-                Ok(Zeroizing::new(
-                    e.get_secret().context("reading from the keychain")?,
-                ))
+                let service = loc.service.as_deref().unwrap_or(SERVICE);
+                let account = loc.account.as_deref().context("keychain account")?;
+                log::debug!("keychain: reading {account} of {service}");
+                let v = keychain_get(service, account).context("reading from the keychain")?;
+                log::debug!("keychain: read {account}");
+                Ok(v)
             }
             StoreKind::Op => {
                 let field = loc.field.as_deref().unwrap_or("password");
@@ -673,6 +674,47 @@ fn env_upsert(file: &Path, var: &str, value: &[u8]) -> Result<()> {
     crate::paths::write_private(file, text.as_bytes())
 }
 
+/// Tests only (`test-hooks`): a keychain file given by `SEALCTL_TEST_KEYCHAIN_PATH`, created and
+/// unlocked by the test, so nothing depends on the default or login keychain. Keychain calls
+/// there never show a dialog: one that would needs to fail, not wait.
+#[cfg(target_os = "macos")]
+fn test_keychain() -> Option<security_framework::os::macos::keychain::SecKeychain> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(p) = std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH").filter(|p| !p.is_empty()) {
+        return security_framework::os::macos::keychain::SecKeychain::open(p).ok();
+    }
+    None
+}
+
+/// Reads a keychain item into memory.
+#[cfg(target_os = "macos")]
+fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    if let Some(kc) = test_keychain() {
+        let _no_ui = security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()?;
+        let found = ItemSearchOptions::new()
+            .keychains(&[kc])
+            .class(ItemClass::generic_password())
+            .service(service)
+            .account(account)
+            .load_data(true)
+            .search()?;
+        return match found.into_iter().next() {
+            Some(SearchResult::Data(d)) => Ok(Zeroizing::new(d)),
+            _ => bail!("no keychain item {account}"),
+        };
+    }
+    let e = keyring::Entry::new(service, account)?;
+    Ok(Zeroizing::new(e.get_secret()?))
+}
+
+/// Reads a keychain item into memory.
+#[cfg(not(target_os = "macos"))]
+fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let e = keyring::Entry::new(service, account)?;
+    Ok(Zeroizing::new(e.get_secret()?))
+}
+
 /// macOS: the Keychain item with a readable label (`sealctl: volume safe`); Keychain Access
 /// shows the label, and every item of `sealctl unseal` had the same name before. An item that
 /// already exists under another label keeps that label and gets the new value.
@@ -681,6 +723,19 @@ fn keychain_set(service: &str, account: &str, label: &str, value: &[u8]) -> Resu
     use security_framework::passwords::{
         set_generic_password, set_generic_password_options, PasswordOptions,
     };
+    if let Some(kc) = test_keychain() {
+        use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass, Location};
+        let _no_ui = security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()?;
+        let mut add = ItemAddOptions::new(ItemAddValue::Data {
+            class: ItemClass::generic_password(),
+            data: core_foundation::data::CFData::from_buffer(value),
+        });
+        add.set_service(service)
+            .set_account_name(account)
+            .set_label(label)
+            .set_location(Location::FileKeychain(kc));
+        return Ok(add.add()?);
+    }
     let mut o = PasswordOptions::new_generic_password(service, account);
     o.set_label(label);
     match set_generic_password_options(value, o) {

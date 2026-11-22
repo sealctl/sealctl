@@ -253,26 +253,87 @@ fn ctrl_c_stops_between_steps_and_resume_finishes() {
         .contains(&a));
 }
 
-/// The real keychain, under a test service name: CI only (`--features test-hooks` and
-/// `SEALCTL_TEST_KEYCHAIN=1` on the macOS runner); items are removed afterwards.
+#[test]
+fn plan_rows_name_the_chosen_store() {
+    let (env, _, _) = setup();
+    let rows = |args: &[&str]| {
+        let mut c = env.cmd();
+        c.env(
+            "PATH",
+            format!("{}:{}", fixtures(), std::env::var("PATH").unwrap()),
+        )
+        .env("FAKE_STORE", env.h().join("fake-store"))
+        .args(["unseal", "--all", "--dry-run"])
+        .args(args);
+        let (code, _, screen) = Pty::spawn(c).wait(Duration::from_secs(30));
+        assert_eq!(code, 0, "{screen}");
+        screen
+    };
+    let s = rows(&[]);
+    assert!(s.contains("→ secrets.env in the folder, plain"), "{s}");
+    let s = rows(&["--secrets-to", "keychain"]);
+    let row = s
+        .lines()
+        .find(|l| l.contains(" secrets ") && l.contains('→'))
+        .unwrap();
+    assert!(
+        row.contains("Keychain") && row.contains("sealctl: secret <name>") && !row.contains("secrets.env"),
+        "{row}"
+    );
+    let s = rows(&["--secrets-to", "op", "--to", "bw"]);
+    assert!(s.contains("→ 1Password"), "{s}");
+    assert!(
+        s.contains("→ ~/.ssh/deploy with a passphrase in Bitwarden"),
+        "{s}"
+    );
+    let s = rows(&["--secrets-to", "env", "--env-file", "/tmp/x.env"]);
+    assert!(s.contains("→ /tmp/x.env (a .env file), plain"), "{s}");
+}
+
+/// The keychain, CI only: `--features test-hooks` with `SEALCTL_TEST_KEYCHAIN_PATH`, a keychain
+/// file the CI job creates and unlocks in $RUNNER_TEMP (no default or login keychain involved).
+/// The command runs with SEALCTL_LOG=debug; on a time-out the screen (its log) and the requests
+/// the phone answered are printed.
 #[cfg(all(feature = "test-hooks", target_os = "macos"))]
 #[test]
 fn secrets_to_the_keychain_with_readable_labels() {
     use std::process::Command;
-    if std::env::var_os("SEALCTL_TEST_KEYCHAIN").is_none() {
+    let Some(keychain) = std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH") else {
         return;
-    }
+    };
     let (env, _, _) = setup();
     let service = format!("sealctl-test-{}", &canary()[6..14]);
-    let (code, screen) = unseal(
-        &env,
-        &["secrets", "--keep-store", "--secrets-to", "keychain"],
-        &[("SEALCTL_TEST_KEYCHAIN_SERVICE", service.clone())],
-    );
+    let mut c = env.cmd();
+    c.env("SEALCTL_TEST_KEYCHAIN_SERVICE", &service)
+        .env("SEALCTL_TEST_KEYCHAIN_PATH", &keychain)
+        .env("SEALCTL_LOG", "debug")
+        .args(["unseal", "secrets", "--keep-store", "--secrets-to", "keychain"]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("y");
+    let start = std::time::Instant::now();
+    let code = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st.code().unwrap_or(-1);
+        }
+        if start.elapsed() > Duration::from_secs(90) {
+            let _ = pty.child.kill();
+            panic!(
+                "timed out; the phone answered {:?}\nscreen (with the debug log):\n{}",
+                phone.kinds(),
+                pty.screen.lock().unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = pty.screen.lock().unwrap().clone();
     assert_eq!(code, 0, "{screen}");
     for account in ["secret/shop/api-key", "secret/shop/db.url"] {
         let o = Command::new("/usr/bin/security")
             .args(["find-generic-password", "-s", &service, "-a", account])
+            .arg(&keychain)
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&o.stdout);
@@ -281,8 +342,5 @@ fn secrets_to_the_keychain_with_readable_labels() {
             text.contains(&format!("\"labl\"<blob>=\"sealctl: secret {name}\"")),
             "{text}"
         );
-        let _ = Command::new("/usr/bin/security")
-            .args(["delete-generic-password", "-s", &service, "-a", account])
-            .output();
     }
 }

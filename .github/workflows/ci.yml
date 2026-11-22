@@ -42,8 +42,9 @@ jobs:
       - name: macOS dependencies (restic)
         if: runner.os == 'macOS'
         run: brew install restic
-      # The runner's login keychain can be locked, and then the first keychain write waits
-      # for an unlock dialog nobody sees. Use a fresh, unlocked default keychain instead.
+      # A keychain file of its own for the keychain test (SEALCTL_TEST_KEYCHAIN_PATH, test-hooks
+      # only): created and unlocked here, not added to the search list, not the default, so
+      # nothing depends on the runner's login or default keychain.
       - name: macOS test keychain
         if: runner.os == 'macOS'
         run: |
@@ -52,8 +53,7 @@ jobs:
           security create-keychain -p "$pw" "$kc"
           security set-keychain-settings "$kc"
           security unlock-keychain -p "$pw" "$kc"
-          security list-keychains -d user -s "$kc"
-          security default-keychain -d user -s "$kc"
+          echo "SEALCTL_TEST_KEYCHAIN_PATH=$kc" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -62,11 +62,27 @@ jobs:
       # Integration tests run the real binary in temporary HOMEs against the in-process fake
       # relay and a scripted phone, with the real OS tools (hdiutil on macOS, restic).
       - run: cargo test --locked
-      # the real keychain under a test service name (macOS runner only; items removed after)
+      # the keychain store, in the keychain file made above (macOS runner only)
       - if: runner.os == 'macOS'
-        run: cargo test --locked -p sealctl --features test-hooks --test stores keychain
-        env:
-          SEALCTL_TEST_KEYCHAIN: "1"
+        run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture
+
+  # TEMPORARY: only the store tests with test-hooks on macOS, to iterate on the keychain test
+  keychain-fast:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: macOS test keychain
+        run: |
+          kc="$RUNNER_TEMP/sealctl-test.keychain-db"
+          pw="$(uuidgen)"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          echo "SEALCTL_TEST_KEYCHAIN_PATH=$kc" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p sealctl --features test-hooks --test stores -- --nocapture
 
   msrv:
     runs-on: ubuntu-latest
