@@ -151,6 +151,21 @@ fn run_masked(mut cmd: Command, prog: &str, secrets: Vec<Vec<u8>>) -> Result<()>
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| fail(127, format!("Cannot start {prog}: {e}")))?;
+    // sealctl stays until the program exits, so its last output still passes the filter: Ctrl-C
+    // and Ctrl-\ reach the program from the terminal anyway, and SIGTERM and SIGHUP are passed on
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGQUIT, SIGTERM, SIGHUP]) {
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                if sig == SIGTERM || sig == SIGHUP {
+                    if let Ok(s) = nix::sys::signal::Signal::try_from(sig) {
+                        let _ = nix::sys::signal::kill(pid, s);
+                    }
+                }
+            }
+        });
+    }
     let out = child.stdout.take().context("stdout")?;
     let err = child.stderr.take().context("stderr")?;
     let s2 = secrets.clone();
