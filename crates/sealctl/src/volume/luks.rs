@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
 use super::{Backend, Volume};
-use crate::derive;
+
 use crate::util::{check, run_with_stdin};
 
 pub struct Luks;
@@ -69,7 +69,7 @@ impl Backend for Luks {
         let path = v.path.clone().context("luks needs a path")?;
         let path = &path;
         // We choose the LUKS UUID, so the key can be derived before formatting.
-        let id = derive::new_uuid()?;
+        let id = crate::util::new_uuid()?;
         let pass = key_for(&id)?;
         let passphrase = pass.as_bytes();
         check(
@@ -242,6 +242,38 @@ fn users_gid() -> String {
     )
     .trim()
     .to_string()
+}
+
+/// The words marker while locked: a LUKS2 token of type `sealctl` (best effort: needs sudo).
+pub fn import_token(v: &Volume, id: &sealctl_core::ids::IdFile) -> Result<()> {
+    let Some(path) = v.path.as_ref() else {
+        return Ok(());
+    };
+    let mut token = serde_json::to_value(id)?;
+    token["type"] = "sealctl".into();
+    token["keyslots"] = serde_json::json!([]);
+    let out = run_with_stdin(
+        sudo()
+            .args(["cryptsetup", "token", "import", "--json-file=-"])
+            .arg(path),
+        token.to_string().as_bytes(),
+    );
+    match out {
+        Ok(o) if o.status.success() => {}
+        _ => log::info!("could not import the sealctl LUKS token into {}", path.display()),
+    }
+    Ok(())
+}
+
+/// Does `passphrase` open the LUKS file? (`cryptsetup open --test-passphrase`.)
+pub fn verify(path: &Path, passphrase: &[u8]) -> Result<bool> {
+    let out = run_with_stdin(
+        crate::util::system_cmd("cryptsetup")
+            .args(["open", "--test-passphrase", "--key-file=-"])
+            .arg(path),
+        passphrase,
+    )?;
+    Ok(out.status.success())
 }
 
 #[cfg(test)]

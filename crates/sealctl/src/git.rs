@@ -1,14 +1,16 @@
-//! Git commit/tag signing with an SSH key file unlocked by the Ledger (SSH signatures).
+//! Git commit and tag signing with an SSH key from the store (SSH signatures), and the git
+//! credential helper for tokens stored as `git/<host>`.
 //!
 //! Git calls `gpg.ssh.program` (normally `ssh-keygen -Y sign`). We point it at
 //! `sealctl git ssh-keygen`, which runs the real `ssh-keygen` with `SSH_AUTH_SOCK` set to the
-//! sealctl agent — so signing works regardless of the shell's SSH_AUTH_SOCK.
+//! daemon's agent, so signing works regardless of the shell's SSH_AUTH_SOCK.
 
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::{cert, paths, ssh};
+use crate::exit::{self, fail};
+use crate::{paths, ssh};
 
 fn git_config(scope: &str, key: &str, value: &str) -> Result<()> {
     let out = Command::new("git")
@@ -63,35 +65,38 @@ pub fn undo(local: bool) -> Result<()> {
     if !local {
         let _ = std::fs::remove_file(shim_path()?);
     }
-    println!(
-        "✅ git ({}) no longer signs with sealctl",
+    eprintln!(
+        "git ({}) no longer signs with sealctl.",
         scope.trim_start_matches("--")
     );
     Ok(())
 }
 
 pub fn setup(local: bool, key: Option<&str>) -> Result<()> {
-    let cert = cert::own()?;
     let name = key.unwrap_or("ed25519");
-    let path = ssh::key_path(name)?;
-    if !path.exists() {
-        bail!(
-            "no SSH key {} — create it first: `sealctl ssh keygen {name}`",
-            path.display()
-        );
-    }
-    let line = ssh::read_public(&path)?.to_openssh()?;
-    let uid = cert::primary_user_id(&cert);
-    let email = uid
-        .split_once('<')
-        .and_then(|(_, r)| r.split_once('>'))
-        .map(|(e, _)| e.to_string())
-        .unwrap_or_else(|| uid.clone());
+    let public = ssh::read_public(name).map_err(|_| {
+        fail(
+            exit::NOT_FOUND,
+            format!("No SSH key {name}. Create it first: sealctl ssh keygen {name}"),
+        )
+    })?;
+    let line = public.to_openssh()?;
+    let email = Command::new("git")
+        .args(["config", "--get", "user.email"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| "*".into());
 
     // allowed_signers lets `git log --show-signature` verify our own signatures.
     let allowed = paths::config_dir()?.join("allowed_signers");
-    std::fs::create_dir_all(paths::config_dir()?)?;
-    std::fs::write(&allowed, format!("{email} namespaces=\"git\" {line}\n"))?;
+    paths::ensure_private_dir(&paths::config_dir()?)?;
+    paths::write_mode(
+        &allowed,
+        format!("{email} namespaces=\"git\" {line}\n").as_bytes(),
+        0o644,
+    )?;
 
     let exe = crate::util::stable_exe()?;
     let scope = if local { "--local" } else { "--global" };
@@ -102,13 +107,74 @@ pub fn setup(local: bool, key: Option<&str>) -> Result<()> {
     git_config(scope, "gpg.ssh.allowedSignersFile", &allowed.to_string_lossy())?;
     git_config(scope, "commit.gpgsign", "true")?;
     git_config(scope, "tag.gpgsign", "true")?;
-    println!(
-        "✅ git ({}) signs commits and tags with ~/.ssh/sealctl_{name}",
+    eprintln!(
+        "git ({}) signs commits and tags with ssh/{name}.",
         scope.trim_start_matches("--")
     );
-    println!("   Requires the agent: `sealctl ssh install` (once).");
-    println!("   Add this key on GitHub → Settings → SSH and GPG keys → New SSH key → type *Signing Key*:");
-    println!("   {line}");
+    eprintln!("Add this key on GitHub as a Signing Key: Settings, SSH and GPG keys, New SSH key:");
+    println!("{line}");
+    Ok(())
+}
+
+/// `sealctl git credentials <host>`: git asks `sealctl git credential` for `https://<host>`.
+pub fn credentials(host: &str, undo: bool) -> Result<()> {
+    if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
+        return Err(fail(exit::USAGE, "Give a host name, e.g. github.com."));
+    }
+    let key = format!("credential.https://{host}.helper");
+    if undo {
+        let _ = Command::new("git")
+            .args(["config", "--global", "--unset", &key])
+            .status();
+        eprintln!("git no longer asks sealctl for {host}.");
+        return Ok(());
+    }
+    let exe = crate::util::stable_exe()?;
+    git_config(
+        "--global",
+        &key,
+        &format!(
+            "!'{}' git credential",
+            exe.to_string_lossy().replace('\'', r"'\''")
+        ),
+    )?;
+    eprintln!("git asks sealctl for {host} (token: secret git/{host}).");
+    Ok(())
+}
+
+/// The git credential helper protocol: `get` prints `username=` and `password=` for
+/// `host=` from the secret `git/<host>` (a token, or `user` and token on two lines).
+pub fn credential(action: &str) -> Result<()> {
+    if action != "get" {
+        return Ok(());
+    }
+    if crate::guard::ai_agent().is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Err(exit::agent_refusal("sealctl git credential"));
+    }
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let host = input
+        .lines()
+        .find_map(|l| l.strip_prefix("host="))
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if host.is_empty() {
+        return Ok(());
+    }
+    let name = format!("git/{host}");
+    let store = crate::store::Store::configured()?;
+    if !store.exists(&name) {
+        return Ok(());
+    }
+    let vals = crate::daemon::client::values(std::slice::from_ref(&name), Some(("secret", &name)))?;
+    let text = zeroize::Zeroizing::new(String::from_utf8_lossy(&vals[0].1).into_owned());
+    let (user, token) = match text.split_once('\n') {
+        Some((u, t)) => (u.trim(), t.trim()),
+        None => ("x-access-token", text.trim()),
+    };
+    let out = zeroize::Zeroizing::new(format!("username={user}\npassword={token}\n"));
+    std::io::Write::write_all(&mut std::io::stdout(), out.as_bytes())?;
     Ok(())
 }
 
@@ -116,9 +182,11 @@ pub fn setup(local: bool, key: Option<&str>) -> Result<()> {
 pub fn ssh_keygen_shim(args: &[String]) -> Result<()> {
     let sock = ssh::socket_path()?;
     if !sock.exists() {
-        bail!(
-            "sealctl ssh-agent is not running — start it with `sealctl ssh install` (or `sealctl ssh agent`)"
-        );
+        // the daemon serves the agent; start it
+        let _ = crate::daemon::client::call(serde_json::json!({"op": "status"}));
+    }
+    if !sock.exists() {
+        bail!("The sealctl SSH agent is not running. Run: sealctl status");
     }
     let mut cmd = Command::new("ssh-keygen");
     cmd.args(args).env("SSH_AUTH_SOCK", &sock);

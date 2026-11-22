@@ -6,8 +6,61 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
+/// A new UUID v4 (lower case).
+pub fn new_uuid() -> Result<String> {
+    sealctl_core::ids::new_uuid().map_err(|e| anyhow::anyhow!("system RNG failed: {e}"))
+}
+
+/// Runs `cmd` with each `(fd, bytes)` written to a pipe that the child sees as that file
+/// descriptor (`/dev/fd/3`, `/dev/fd/4`). Values never go through argv or the environment.
+pub fn run_with_fds(
+    cmd: &mut Command,
+    fds: &[(i32, &[u8])],
+    stdin_data: Option<&[u8]>,
+) -> Result<std::process::Output> {
+    use command_fds::{CommandFdExt, FdMapping};
+    use std::os::fd::OwnedFd;
+    let mut mappings = Vec::new();
+    let mut writers = Vec::new();
+    for (fd, data) in fds {
+        let (r, w) = std::io::pipe().context("pipe")?;
+        mappings.push(FdMapping {
+            parent_fd: OwnedFd::from(r),
+            child_fd: *fd,
+        });
+        writers.push((w, data.to_vec()));
+    }
+    cmd.fd_mappings(mappings)
+        .map_err(|e| anyhow::anyhow!("fd mapping: {e:?}"))?;
+    cmd.stdin(if stdin_data.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let name = format!("{:?}", cmd.get_program());
+    let mut child = cmd.spawn().with_context(|| format!("starting {name}"))?;
+    // the parent's read ends were moved into the mappings; write and close each pipe
+    let mut threads = Vec::new();
+    for (mut w, data) in writers {
+        let data = Zeroizing::new(data);
+        threads.push(std::thread::spawn(move || {
+            let _ = w.write_all(&data);
+        }));
+    }
+    if let Some(d) = stdin_data {
+        let mut stdin = child.stdin.take().context("stdin")?;
+        stdin.write_all(d)?;
+    }
+    let out = child.wait_with_output()?;
+    for t in threads {
+        let _ = t.join();
+    }
+    Ok(out)
+}
+
 /// A random secret of `n` bytes, hex-encoded (`2n` characters, no newline).
-/// Used for volume passphrases and restic passwords.
 pub fn random_secret(n: usize) -> Result<Zeroizing<String>> {
     let mut buf = Zeroizing::new(vec![0u8; n]);
     getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("system RNG failed: {e}"))?;
@@ -135,9 +188,8 @@ pub fn read_hidden(prompt: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
-/// Tell the user what to do on the Ledger: on stderr, and as a desktop notification (useful when
-/// sealctl runs in the background — SSH agent, git signing, scheduled backups). The same
-/// message is repeated at most once a minute.
+/// A desktop notification (SPEC 5.2: when nobody watches a terminal): `osascript` on macOS,
+/// `notify-send` on Linux, silently skipped if missing. The same message at most once a minute.
 pub fn notify(msg: &str) {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -150,7 +202,6 @@ pub fn notify(msg: &str) {
         }
         shown.push((msg.to_string(), Instant::now()));
     }
-    eprintln!("👉 {msg}");
     if std::env::var_os("SEALCTL_NO_NOTIFY").is_some() {
         return;
     }

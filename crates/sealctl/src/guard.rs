@@ -119,6 +119,25 @@ fn preview(s: &str) -> String {
     format!("{head}…({} chars)", chars.len())
 }
 
+/// `text` with every secret-looking substring replaced by `****` (commands shown on the phone).
+pub fn mask_command(text: &str) -> String {
+    let mut out = text.to_string();
+    for (kind, re) in patterns() {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for cap in re.captures_iter(&out) {
+            let m = cap.get(1).unwrap_or_else(|| cap.get(0).expect("match"));
+            if *kind == "credential" && entropy(m.as_str()) < 3.5 {
+                continue;
+            }
+            spans.push((m.start(), m.end()));
+        }
+        for (a, b) in spans.into_iter().rev() {
+            out.replace_range(a..b, "****");
+        }
+    }
+    out
+}
+
 /// Secret-looking strings in `text`. Known token formats always count; a generic
 /// `key = value` only when the value looks random (so `password = hunter2` or a path doesn't).
 pub fn find_secrets(text: &str) -> Vec<Finding> {

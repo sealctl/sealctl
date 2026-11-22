@@ -24,7 +24,7 @@ pub fn prompt(text: &str) -> Option<String> {
         .map(|f| format!("{} {}", f.kind, f.preview))
         .collect();
     Some(format!(
-        "🔐 sealctl: this prompt was NOT sent — it seems to contain a secret ({}).\n\
+        "sealctl: this prompt was NOT sent — it seems to contain a secret ({}).\n\
          Store it instead: copy the key and ask \"store it as <project>/<name>\" — the assistant \
          runs `sealctl secret set <project>/<name> --from-clipboard` and never sees the value.\n\
          Not a secret? Send the prompt again starting with #nosecret.\n\
@@ -43,8 +43,16 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
                 "`sealctl secret get` would put the secret into the conversation. Use `sealctl run -- <command>` so only the program sees it.",
             ),
             (
-                r"\bsealctl\b[^|;&]*\bssh\s+passphrase\b",
-                "the SSH key passphrase must not enter the conversation; the user runs this in their own terminal.",
+                r"\bsealctl\b[^|;&]*\b(?:aws\s+credentials|git\s+credential)\b",
+                "the credential helpers print values for git and the AWS CLI, not for the conversation. Run `git push` or `aws` itself.",
+            ),
+            (
+                r"\bsealctl\b[^|;&]*\b(?:seal|unseal|buy|unpair)\b",
+                "only the user runs this, in their own terminal. Tell the user the command to run.",
+            ),
+            (
+                r"(?:^|[\s|;&(])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|awk|sed|cut|cp|base64)\s[^|;&]*(?:\.sealed\b|machine\.json|\.local/state/sealctl|\.local/share/sealctl)",
+                "sealctl's own files are not for the conversation. Use `sealctl secret ls` for names and `sealctl run` for values.",
             ),
             (
                 r"\bsealctl\b[^|;&]*\brecover\b",
@@ -80,7 +88,7 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
             ),
             (
                 r"<\s*\.env\b",
-                "`.env` files hold secrets. Use `sealctl secret import-env` and `sealctl run`.",
+                "`.env` files hold secrets. Use `sealctl seal env` and `sealctl run`.",
             ),
             (
                 r"\b(?:pbpaste|wl-paste|xclip\b[^|;&]*-o|xsel\b[^|;&]*-o)",
@@ -195,6 +203,16 @@ pub fn read(path: &str) -> Option<String> {
             "sealctl: this file holds credentials and must not be read into the conversation.".into(),
         );
     }
+    if name.ends_with(".sealed")
+        || (name == "machine.json" && path.contains("sealctl"))
+        || path.contains("/.local/state/sealctl/")
+        || path.contains("/.local/share/sealctl/")
+    {
+        return Some(
+            "sealctl: sealctl's own files are not for the conversation. Use `sealctl secret ls` for names."
+                .into(),
+        );
+    }
     let private_key = (name.starts_with("id_") && !name.ends_with(".pub"))
         || name.ends_with(".pem")
         || name.ends_with(".key")
@@ -202,7 +220,7 @@ pub fn read(path: &str) -> Option<String> {
     if secret_env {
         Some(
             "sealctl: `.env` files hold secrets and must not be read into the conversation. \
-             Move it into sealctl: `sealctl secret import-env <file> --prefix <project> --delete`; \
+             Move it into sealctl: `sealctl secret import-env <file> --prefix <project> --delete` (the user runs it); \
              programs then get the values via `sealctl run`."
                 .into(),
         )
@@ -215,7 +233,10 @@ pub fn read(path: &str) -> Option<String> {
 
 /// One line of context for a new session: that sealctl exists, and which secrets (names only).
 pub fn session_context() -> String {
-    let names = crate::secrets::list().unwrap_or_default();
+    let names: Vec<String> = crate::store::Store::configured()
+        .and_then(|s| s.list())
+        .map(|l| l.into_iter().map(|x| x.name).collect())
+        .unwrap_or_default();
     let shown: Vec<&str> = names.iter().take(40).map(String::as_str).collect();
     let more = if names.len() > shown.len() {
         format!(" (+{} more)", names.len() - shown.len())
@@ -223,10 +244,7 @@ pub fn session_context() -> String {
         String::new()
     };
     format!(
-        "Secrets on this machine are managed by sealctl (Ledger-encrypted). Never read or print \
-         secret values or .env files; programs get secrets with `sealctl run -- <command>`, new \
-         keys are stored with `sealctl secret set <name> --from-clipboard` (see the \
-         sealctl-secrets skill). Stored secret names: {}{more}.",
+        "sealctl: secrets are available by name through sealctl run (names: {}{more}). Values are never shown.",
         if shown.is_empty() {
             "none yet".to_string()
         } else {
@@ -250,9 +268,13 @@ mod tests {
     fn leaking_commands_are_denied() {
         for c in [
             "sealctl secret get myapp/openai",
-            "cd x && sealctl -t ble secret get k",
-            "sealctl ssh passphrase",
+            "cd x && sealctl -v secret get k",
             "sealctl recover",
+            "sealctl unseal --all",
+            "sealctl seal volume safe disk3s5",
+            "sealctl buy",
+            "sealctl git credential get",
+            "cat ~/.local/share/sealctl/store/x/a.sealed",
             "printenv",
             "env | grep KEY",
             "echo $OPENAI_API_KEY",

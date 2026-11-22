@@ -23,8 +23,16 @@ pub fn hook(input: &Value) -> Option<Value> {
 /// Deny rules: a second line of defence when a hook can't run (hooks fail open).
 pub const DENY: &[&str] = &[
     "Bash(sealctl secret get *)",
-    "Bash(sealctl ssh passphrase *)",
     "Bash(sealctl recover *)",
+    "Bash(sealctl aws credentials *)",
+    "Bash(sealctl git credential *)",
+    "Bash(sealctl buy *)",
+    "Bash(sealctl unpair *)",
+    "Bash(sealctl seal *)",
+    "Bash(sealctl unseal *)",
+    "Read(**/*.sealed)",
+    "Read(~/.config/sealctl/machine.json)",
+    "Read(~/.local/state/sealctl/**)",
 ];
 
 const MARKER: &str = " hook claude";

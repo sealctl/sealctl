@@ -1,84 +1,90 @@
-//! sealctl command-line interface.
+//! sealctl command-line interface (SPEC 10).
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::ExitCode;
 
-use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use sealctl::volume::{self, Kind};
-use sealctl::{
-    agent, backup, card, cert, crypto, doctor, git, kit, pin, project, secrets, setup, ssh, util, Ctx,
-};
-use sealctl_ledger::Select;
+use anyhow::Result;
+use clap::{CommandFactory, Parser, Subcommand};
+use sealctl::seal::unseal::{self, Target};
+use sealctl::volume::{CreateOpts, Kind};
+use sealctl::{cli, exit, git, pair, seal, ssh, status};
 
 #[derive(Parser)]
 #[command(
     name = "sealctl",
     version,
-    about = "Your hardware wallet as an everyday developer key",
-    long_about = "Unlock encrypted volumes, run encrypted backups, keep API keys and sign with SSH — \
-                  using the OpenPGP app on a Ledger over USB or Bluetooth.",
+    about = "Keys for your developer machine, approved on your phone",
+    long_about = "Keeps API keys away from AI agents, signs SSH logins and git commits, opens \
+                  encrypted volumes and runs restic backups. Keys come from 24 words held by the \
+                  sealctl phone app, which approves their use.",
     propagate_version = true
 )]
 struct Cli {
-    /// How to reach the Ledger.
-    #[arg(long, short = 't', global = true, value_enum, default_value_t = TransportArg::Auto, env = "SEALCTL_TRANSPORT")]
-    transport: TransportArg,
-
-    /// Bluetooth scan timeout in seconds.
-    #[arg(long, global = true, default_value_t = 30, env = "SEALCTL_BLE_SCAN")]
-    ble_scan: u64,
-
-    /// More logging (-v, -vv for raw APDUs).
+    /// More logging on stderr (never values).
     #[arg(long, short, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Relay origin (also SEALCTL_RELAY); recorded at pairing.
+    #[arg(long, global = true, value_name = "ORIGIN")]
+    relay: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
 }
 
-#[derive(Copy, Clone, ValueEnum)]
-enum TransportArg {
-    /// USB first, then Bluetooth.
-    Auto,
-    Usb,
-    #[value(alias = "bluetooth")]
-    Ble,
-}
-
 #[derive(Subcommand)]
 enum Cmd {
-    /// Overview: key, volumes (locked/unlocked, last backup), services. No device needed.
-    Status,
-
-    /// Unlock a volume (decrypts its key on the Ledger).
-    Unlock { name: String },
-    /// Lock a volume (backs it up first if configured). Without a name: lock all volumes and
-    /// stop the agent.
-    Lock {
-        name: Option<String>,
-        /// Skip the backup before locking.
+    /// The session and this machine; never asks the phone.
+    Status {
         #[arg(long)]
-        no_backup: bool,
+        json: bool,
+    },
+    /// Open the session now (store key, auto volumes, backup keys).
+    Open,
+    /// Lock now: wipe keys, back up, close volumes.
+    Lock {
+        /// A volume name (0.5): use `sealctl volume close <name>`.
+        #[arg(hide = true)]
+        volume: Option<String>,
         /// Unmount even if files are open.
         #[arg(long)]
         force: bool,
+        /// Skip the on-lock backups.
+        #[arg(long)]
+        no_backup: bool,
     },
-
-    /// Encrypted volumes.
-    #[command(subcommand)]
-    Volume(VolumeCmd),
-
-    /// Encrypted, versioned backups of volumes (restic).
-    #[command(subcommand)]
-    Backup(BackupCmd),
-
-    /// API keys and tokens (pass-compatible store, local only).
+    /// Removed in 0.7: use `sealctl volume open <name>`.
+    #[command(hide = true)]
+    Unlock { name: Option<String> },
+    /// Pair this machine with the sealctl app on your phone.
+    Pair {
+        /// Name shown on the phone (default user@full-hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace an existing pairing without asking.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Unpair this machine.
+    Unpair {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Cancel a delayed level 3 action approved on the phone.
+    Cancel {
+        id: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Check the setup.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// API keys and tokens in the store.
     #[command(subcommand)]
     Secret(SecretCmd),
-
-    /// Run a command with secrets in its environment (from .sealctl.toml and --env).
+    /// Run a command with secrets in its environment (.sealctl.toml and -e).
     Run {
         /// NAME=secret, repeatable.
         #[arg(long = "env", short = 'e')]
@@ -89,132 +95,249 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
-
-    /// Encrypt a file (or stdin) to yourself and/or other certificates.
-    Encrypt {
-        input: Option<PathBuf>,
-        /// Additional recipient certificate files.
-        #[arg(long, short)]
-        recipient: Vec<PathBuf>,
-        /// Don't encrypt to your own key.
-        #[arg(long)]
-        no_self: bool,
-        #[arg(long, short)]
-        output: Option<PathBuf>,
-        /// ASCII armor (default when writing to a terminal or .asc).
-        #[arg(long, short)]
-        armor: bool,
-    },
-    /// Decrypt a file (or stdin) on the Ledger.
-    Decrypt {
-        input: Option<PathBuf>,
-        #[arg(long, short)]
-        output: Option<PathBuf>,
-    },
-
-    /// The session agent: remembers Ledger results after one PIN entry, exits when idle.
+    /// AI coding agents: skill, hooks and deny rules.
     #[command(subcommand)]
-    Agent(AgentCmd),
-
-    /// SSH agent and public key.
+    Ai(AiCmd),
+    /// Remembered agent answers on this machine.
+    Rules {
+        #[arg(long)]
+        json: bool,
+    },
+    /// (internal) Hook entry point called by AI agents.
+    #[command(hide = true)]
+    Hook { tool: String },
+    /// SSH keys from the store, served by the daemon's agent.
     #[command(subcommand)]
     Ssh(SshCmd),
-
-    /// Git commit signing with the Ledger.
+    /// Git commit signing and credentials.
     #[command(subcommand)]
     Git(GitCmd),
-
-    /// One-time: create seed-derived keys on the Ledger OpenPGP app.
-    Setup {
-        /// OpenPGP User ID, e.g. "Jane Doe <jane@example.org>".
+    /// (internal) AWS credential_process helper.
+    #[command(subcommand, hide = true)]
+    Aws(AwsCmd),
+    /// Encrypted volumes.
+    #[command(subcommand)]
+    Volume(VolumeCmd),
+    /// Encrypted, versioned backups (restic).
+    #[command(subcommand)]
+    Backup(BackupCmd),
+    /// Objects this machine knows.
+    Inventory {
         #[arg(long)]
-        uid: Option<String>,
-        /// Regenerate keys even if the card already has some.
+        json: bool,
+    },
+    /// Take over something you already have: a volume, backup, SSH key, secret or .env file.
+    #[command(subcommand)]
+    Seal(SealCmd),
+    /// Hand objects back in plain, standard form (into ~/sealctl-unsealed-<date>).
+    Unseal(UnsealArgs),
+    /// Open an object with the 24 words alone (no phone, no relay).
+    Recover {
+        /// Store folder, .sealed file, sparse bundle or restic repository.
+        target: String,
+        /// Write every secret into this folder.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// One secret to stdout.
+        #[arg(long)]
+        name: Option<String>,
+        /// Print to a terminal.
+        #[arg(long)]
+        show: bool,
+        /// restic arguments (default: snapshots).
+        #[arg(last = true)]
+        restic: Vec<String>,
+    },
+    /// $5.99 once keeps the relay running.
+    Buy {
+        /// Seats for a team (2 to 1,000).
+        #[arg(long)]
+        seats: Option<u32>,
+        /// Claim a seat from a team code.
+        #[arg(long)]
+        code: Option<String>,
+    },
+    /// Shell completions.
+    Completions { shell: clap_complete::Shell },
+    /// (internal) The session daemon.
+    #[command(hide = true)]
+    Daemon {
+        #[arg(long)]
+        spawned: bool,
+        /// Lock and stop a running daemon.
+        #[arg(long)]
+        stop: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// Store a value: clipboard, stdin when piped, or a hidden prompt.
+    Set {
+        name: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        from_clipboard: bool,
+        /// Ask the phone on every use.
+        #[arg(long)]
+        own_approval: bool,
+    },
+    /// Print a value (not inside an AI agent; to a terminal only with --show).
+    Get {
+        name: String,
+        #[arg(long)]
+        clip: bool,
+        #[arg(long)]
+        show: bool,
+    },
+    /// Names, no key needed.
+    #[command(alias = "list")]
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a secret.
+    Rm {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rename a secret.
+    Mv { old: String, new: String },
+    /// Alias of `sealctl seal env`.
+    ImportEnv {
+        #[arg(default_value = ".env")]
+        file: PathBuf,
+        #[arg(long)]
+        prefix: String,
+        #[arg(long)]
+        delete: bool,
         #[arg(long)]
         force: bool,
     },
-    /// Change the user or admin PIN (entered on the Ledger).
-    Pin {
-        #[arg(value_enum)]
-        which: pin::Which,
-    },
-    /// Check that the card keys match the certificate and seed-derived keys are reproducible.
-    Doctor {
-        /// Also do a test decryption on the device.
+    /// Show the store folder, or use another one.
+    Store {
+        #[arg(long = "use")]
+        use_dir: Option<PathBuf>,
         #[arg(long)]
-        full: bool,
+        json: bool,
     },
-    /// Recovery kit (public / encrypted files needed besides the seed).
-    #[command(subcommand)]
-    Kit(KitCmd),
+}
 
-    /// AI coding agents: install a skill (how to use sealctl), hooks (block pasted keys, deny
-    /// commands/files that would reveal secrets) and deny rules, for every agent found.
-    #[command(subcommand)]
-    Ai(AiCmd),
+#[derive(Subcommand)]
+enum AiCmd {
+    /// Install for every detected tool (or the named ones).
+    Install { tools: Vec<String> },
+    /// Remove.
+    Uninstall { tools: Vec<String> },
+    /// What is installed.
+    Status { tools: Vec<String> },
+}
 
-    /// (internal) Hook entry point called by AI agents; reads the hook JSON on stdin.
+#[derive(Subcommand)]
+enum SshCmd {
+    /// New Ed25519 key stored as ssh/<name>.
+    Keygen {
+        #[arg(default_value = "ed25519")]
+        name: String,
+        #[arg(long, default_value = "sealctl")]
+        comment: String,
+    },
+    /// Public key line.
+    Pubkey {
+        #[arg(default_value = "ed25519")]
+        name: String,
+    },
+    /// The ~/.ssh/config lines.
+    Setup,
+    /// Alias of `sealctl seal ssh`.
+    Import {
+        file: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GitCmd {
+    /// Commit signing with ssh/<key> through the daemon's agent.
+    Setup {
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        undo: bool,
+    },
+    /// git asks sealctl for https://<host> tokens (secret git/<host>).
+    Credentials {
+        host: String,
+        #[arg(long)]
+        undo: bool,
+    },
+    /// (internal) git credential helper.
     #[command(hide = true)]
-    Hook { tool: String },
-
-    /// Disaster recovery without a Ledger: recompute your decryption key from the 24 words and
-    /// serve it through the agent, so unlock / backup restore / secrets work. Verified against
-    /// your certificate. Exposes the phrase to this computer — use only to recover, offline.
-    Recover {
-        /// OpenPGP app key slot (1–3).
-        #[arg(long, default_value_t = 1)]
-        slot: u32,
-        /// Ask for a BIP39 passphrase (only if you set one up on the Ledger).
-        #[arg(long)]
-        passphrase: bool,
-        /// Stop after this many idle minutes.
-        #[arg(long, default_value_t = 60)]
-        idle: u64,
+    Credential { action: String },
+    /// (internal) gpg.ssh.program wrapper.
+    #[command(hide = true, name = "ssh-keygen")]
+    SshKeygen {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
+}
 
-    /// List Ledger devices on USB and Bluetooth.
-    Devices,
-    /// Show the OpenPGP card state on the device.
-    Card,
-    /// Print shell completions.
-    Completions { shell: clap_complete::Shell },
+#[derive(Subcommand)]
+enum AwsCmd {
+    /// credential_process output for a profile.
+    Credentials {
+        #[arg(long)]
+        profile: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum VolumeCmd {
-    /// Create an encrypted volume (mounted right away).
+    /// Create a volume (mounted right away).
     Create {
         name: String,
-        /// Maximum size, e.g. 50g (sparse: uses space only as it fills).
-        #[arg(long, default_value = "50g")]
-        size: String,
         #[arg(long, value_enum)]
         kind: Option<Kind>,
-        /// Image/container file (default ~/Vaults/<name>.sparsebundle or .luks).
-        #[arg(long)]
-        path: Option<PathBuf>,
-        /// APFS container for --kind apfs-volume, e.g. disk3.
+        #[arg(long, default_value = "50g")]
+        size: String,
         #[arg(long)]
         container: Option<String>,
         #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
         mountpoint: Option<PathBuf>,
+        /// Not mounted when the session opens.
+        #[arg(long)]
+        manual: bool,
     },
     /// List volumes.
-    Ls,
-    /// Register an existing sealctl volume on this machine (e.g. after recovery):
-    /// a .sparsebundle / .luks path, or an APFS volume UUID.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mount one volume.
+    Open { name: String },
+    /// Unmount one volume.
+    Close {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Register a sealed volume, or take over one of your own (alias of `seal volume`).
     Import {
         name: String,
-        /// Path of the image file, or the APFS volume UUID.
         target: String,
         #[arg(long, value_enum)]
-        kind: Kind,
+        kind: Option<Kind>,
         #[arg(long)]
         mountpoint: Option<PathBuf>,
     },
-    /// Convert a volume made by an older sealctl (stored key file) to a seed-derived key.
-    Rekey { name: String },
-    /// Forget a volume (keeps the encrypted data unless --delete-data).
+    /// Forget a volume; --delete-data destroys it.
     Rm {
         name: String,
         #[arg(long)]
@@ -224,60 +347,51 @@ enum VolumeCmd {
 
 #[derive(Subcommand)]
 enum BackupCmd {
-    /// Configure restic backups for an unlocked volume.
+    /// New restic repository for a volume or folder.
     Init {
-        volume: String,
-        /// restic repository, e.g. s3:https://<account>.r2.cloudflarestorage.com/<bucket>/<path>
+        name: String,
+        #[arg(long)]
+        from: String,
         #[arg(long)]
         repo: String,
-        /// Extra environment for restic, KEY=VALUE (credentials are asked for if missing).
-        #[arg(long = "env", short = 'e')]
+        #[arg(short = 'e')]
         env: Vec<String>,
-        /// Id the repository password is derived from (default: the volume name).
-        #[arg(long)]
-        key_id: Option<String>,
     },
-    /// Switch an existing repository to the password derived from a key id (default: the
-    /// volume name) — e.g. repositories created by sealctl 0.2.0, which used the URL.
-    Rekey {
-        volume: String,
-        #[arg(long)]
-        key_id: Option<String>,
-    },
-    /// Back up volumes now.
+    /// Back up now.
     Run {
-        volumes: Vec<String>,
+        names: Vec<String>,
         #[arg(long)]
         all: bool,
-        /// Silently skip locked volumes (for schedules).
         #[arg(long)]
-        if_unlocked: bool,
-        #[arg(long, short)]
+        if_open: bool,
+        #[arg(long)]
         quiet: bool,
     },
-    /// List snapshots (works while locked: uses the Ledger).
-    Snapshots { volume: String },
-    /// Restore files from a snapshot.
+    /// List snapshots.
+    Snapshots {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a snapshot.
     Restore {
-        volume: String,
+        name: String,
+        #[arg(long)]
+        target: PathBuf,
         #[arg(long, default_value = "latest")]
         snapshot: String,
         #[arg(long)]
-        target: PathBuf,
-        /// Paths to restore (relative to the volume), repeatable.
-        #[arg(long)]
         include: Vec<String>,
     },
-    /// Verify repository integrity.
+    /// restic check.
     Check {
-        volume: String,
-        /// Also read this percentage of the data.
+        name: String,
         #[arg(long)]
         read_data: Option<u8>,
     },
-    /// Change backup behaviour of a volume.
+    /// When backups run and what they keep.
     Policy {
-        volume: String,
+        name: String,
         #[arg(long)]
         on_lock: Option<bool>,
         #[arg(long)]
@@ -289,643 +403,432 @@ enum BackupCmd {
         #[arg(long)]
         keep_monthly: Option<u32>,
     },
-    /// Periodic backups of unlocked volumes (launchd / systemd).
+    /// The backup schedule.
     #[command(subcommand)]
     Schedule(ScheduleCmd),
 }
 
 #[derive(Subcommand)]
 enum ScheduleCmd {
+    /// Install: sealctl backup run --all --if-open --quiet.
     Install {
-        /// Interval in minutes.
         #[arg(long, default_value_t = 60)]
         every: u64,
     },
+    /// Remove.
     Uninstall,
 }
 
 #[derive(Subcommand)]
-enum SecretCmd {
-    /// Store a secret (value asked without echo, from stdin, or from the clipboard).
-    Set {
+enum SealCmd {
+    /// An APFS volume UUID, sparse bundle or LUKS file with your own passphrase.
+    Volume {
+        name: String,
+        target: String,
+        #[arg(long)]
+        mountpoint: Option<PathBuf>,
+        #[arg(long)]
+        manual: bool,
+        /// Keys from the 24 words instead of the phone.
+        #[arg(long)]
+        words: bool,
+    },
+    /// A restic repository with your own password.
+    Backup {
         name: String,
         #[arg(long)]
-        force: bool,
-        /// Take the value from the clipboard and clear it — safe with AI agents: the value is
-        /// never typed, printed or seen by the agent.
+        repo: String,
         #[arg(long)]
-        from_clipboard: bool,
-    },
-    /// Copy a secret to the clipboard (-c, cleared after 30 s), or print it into a pipe.
-    /// Never prints inside an AI agent's session, nor to a terminal without --show.
-    Get {
-        name: String,
-        #[arg(long, short)]
-        clip: bool,
-        /// Print to the terminal anyway.
+        from: Option<String>,
+        #[arg(short = 'e')]
+        env: Vec<String>,
         #[arg(long)]
-        show: bool,
+        keep_old_password: bool,
+        #[arg(long)]
+        words: bool,
     },
-    /// List secret names.
-    Ls,
-    /// Delete a secret.
-    Rm { name: String },
-    /// Move a .env file into the store and write .sealctl.toml for `sealctl run`.
-    ImportEnv {
-        #[arg(default_value = ".env")]
+    /// An OpenSSH private key file.
+    Ssh {
         file: PathBuf,
-        /// Name prefix, e.g. the project name.
-        #[arg(long)]
-        prefix: String,
-        /// Delete the .env file afterwards (only after every value read back correctly).
-        #[arg(long)]
-        delete: bool,
-        /// Replace secrets that already exist under these names.
-        #[arg(long)]
-        force: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum AgentCmd {
-    /// Run the agent in the foreground (normally started automatically).
-    Run {
-        /// Exit after this many minutes without requests.
-        #[arg(long, default_value_t = 60)]
-        idle: u64,
-        /// Exit this many hours after starting, even while in use (PIN needed again).
-        #[arg(long, default_value_t = 24)]
-        max_hours: u64,
-    },
-    /// Forget everything now and exit.
-    Stop,
-    /// Is it running, how much is cached, when does it expire.
-    Status,
-}
-
-#[derive(Subcommand)]
-enum SshCmd {
-    /// New SSH key: random Ed25519, saved as ~/.ssh/sealctl_<name> (standard OpenSSH format),
-    /// encrypted with a passphrase derived on the Ledger from its fingerprint. The agent keeps it
-    /// unlocked for the session (1 h idle, 24 h max) — no Ledger round trip per signature.
-    Keygen {
-        #[arg(default_value = "ed25519")]
-        name: String,
-        /// Key comment (default: your certificate's user id).
-        #[arg(long)]
-        comment: Option<String>,
-    },
-    /// Re-encrypt an existing unencrypted SSH key (e.g. ~/.ssh/id_ed25519) with a passphrase
-    /// derived on the Ledger; saved as ~/.ssh/sealctl_<name>. Same key — no server changes.
-    Import {
-        file: PathBuf,
-        /// Name for ~/.ssh/sealctl_<NAME> (default: the file name).
         #[arg(long)]
         name: Option<String>,
     },
-    /// Print the public key of an encrypted key file (authorized_keys / GitHub format).
-    Pubkey {
-        #[arg(default_value = "ed25519")]
-        name: String,
-    },
-    /// Copy the passphrase of an encrypted key file (for ssh-keygen -p / other agents) to the
-    /// clipboard, cleared after 30 s; --show prints it, or pipe it.
-    Passphrase {
-        #[arg(default_value = "ed25519")]
+    /// A secret (clipboard, stdin or a hidden prompt).
+    Secret {
         name: String,
         #[arg(long)]
-        show: bool,
-    },
-    /// Run the agent in the foreground.
-    Agent {
+        from_clipboard: bool,
         #[arg(long)]
-        socket: Option<PathBuf>,
+        force: bool,
     },
-    /// Install the agent as a login service.
-    Install,
-    /// Remove the login service.
-    Uninstall,
+    /// A .env file.
+    Env {
+        #[arg(default_value = ".env")]
+        file: PathBuf,
+        #[arg(long)]
+        prefix: String,
+        #[arg(long)]
+        delete: bool,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct UnsealArgs {
+    #[command(subcommand)]
+    what: Option<UnsealWhat>,
+    /// Everything on this machine, then sealctl's settings, services, hooks and pairing.
+    #[arg(long)]
+    all: bool,
+    /// Continue the newest unfinished run.
+    #[arg(long)]
+    resume: bool,
+    /// Keys from the 24 words instead of the phone.
+    #[arg(long)]
+    words: bool,
+    /// Show the plan only.
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    json: bool,
+    /// Leave the store folder in place.
+    #[arg(long)]
+    keep_store: bool,
+    /// Leave one object out: <kind>/<name>.
+    #[arg(long)]
+    skip: Vec<String>,
+    /// Where new passwords go (this build: folder).
+    #[arg(long)]
+    to: Option<String>,
 }
 
 #[derive(Subcommand)]
-enum AiCmd {
-    /// Install for every AI agent found (or only the named ones).
-    Install { tools: Vec<String> },
-    /// Remove everything `ai install` added.
-    Uninstall { tools: Vec<String> },
-    /// Show what is installed where.
-    Status { tools: Vec<String> },
+enum UnsealWhat {
+    /// One secret.
+    Secret { name: String },
+    /// The whole store.
+    Secrets,
+    /// One volume.
+    Volume { name: String },
+    /// One backup.
+    Backup { name: String },
+    /// One SSH key.
+    Ssh { name: String },
+    /// Git signing.
+    Git,
+    /// AI integrations.
+    Ai { tools: Vec<String> },
 }
 
-#[derive(Subcommand)]
-enum GitCmd {
-    /// Configure git to sign commits and tags with an SSH key file (default: ed25519).
-    Setup {
-        /// Only for the current repository.
-        #[arg(long)]
-        local: bool,
-        /// Sign with the encrypted key file ~/.ssh/sealctl_<NAME> (default: ed25519).
-        #[arg(long)]
-        key: Option<String>,
-        /// Remove the signing settings sealctl made.
-        #[arg(long)]
-        undo: bool,
-    },
-    /// (internal) ssh-keygen wrapper used as gpg.ssh.program.
-    #[command(hide = true, name = "ssh-keygen")]
-    SshKeygen {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum KitCmd {
-    Export { dir: PathBuf },
-    Import { dir: PathBuf },
-}
-
-fn main() {
-    let cli = Cli::parse();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(match cli.verbose {
-        // btleplug logs a spurious error on macOS disconnect; hide it unless verbose
-        // ssh_agent_lib logs every unsupported optional request (e.g. OpenSSH's extension query)
-        0 => "warn,btleplug=off,ssh_agent_lib=off",
-        1 => "debug",
-        _ => "trace",
-    }))
-    .format_timestamp(None)
-    .init();
-
-    if let Err(e) = real_main(cli) {
-        eprintln!("Error: {e:#}");
-        std::process::exit(1);
+fn print_reports(reports: Vec<sealctl::ai::Report>) {
+    for r in reports {
+        eprintln!("{}{}", r.tool, if r.detected { "" } else { " (not found)" });
+        for l in r.lines {
+            eprintln!("  {l}");
+        }
     }
 }
 
-fn transport_args(cli: &Cli) -> Vec<String> {
-    let t = match cli.transport {
-        TransportArg::Auto => "auto",
-        TransportArg::Usb => "usb",
-        TransportArg::Ble => "ble",
-    };
-    vec!["--transport".into(), t.into()]
-}
-
-fn real_main(cli: Cli) -> Result<()> {
-    let ctx = Ctx {
-        select: match cli.transport {
-            TransportArg::Auto => Select::Auto,
-            TransportArg::Usb => Select::Usb,
-            TransportArg::Ble => Select::Ble,
-        },
-        scan: Duration::from_secs(cli.ble_scan),
-    };
-    let targs = transport_args(&cli);
+fn run(cli: Cli) -> Result<i32> {
+    let relay = cli.relay.clone();
+    let r = relay.as_deref();
     match cli.cmd {
-        Cmd::Status => card::overview(),
-        Cmd::Unlock { name } => {
-            if volume::Volume::load(&name)?.is_unlocked()? {
-                println!("'{name}' is already unlocked");
-                return Ok(());
-            }
-            volume::unlock(agent::oracle(&ctx)?.as_mut(), &name).map(|_| ())
+        Cmd::Status { json } => status::status(json),
+        Cmd::Open => cli::open().map(|_| 0),
+        Cmd::Lock { volume: Some(v), .. } => {
+            Err(exit::fail(exit::USAGE, format!("Use sealctl volume close {v}")))
         }
-        Cmd::Lock {
-            name: Some(n),
-            no_backup,
-            force,
-        } => volume::lock(&n, no_backup, force),
-        Cmd::Lock {
-            name: None,
-            no_backup,
-            force,
-        } => {
-            // forget cached keys even if a volume refuses to lock
-            let locked = volume::lock_all(no_backup, force);
-            if ssh::forget() {
-                println!("🔒 SSH keys forgotten by the agent");
-            }
-            if agent::stop()? {
-                println!("🔒 agent stopped — the Ledger is needed again next time");
-            }
-            locked
-        }
-        Cmd::Hook { tool } => sealctl::ai::run_hook(&tool),
-        Cmd::Ai(a) => {
-            let (reports, verb) = match a {
-                AiCmd::Install { tools } => (sealctl::ai::install(&tools)?, "installed"),
-                AiCmd::Uninstall { tools } => (sealctl::ai::uninstall(&tools)?, "removed"),
-                AiCmd::Status { tools } => (sealctl::ai::status(&tools)?, ""),
-            };
-            for r in &reports {
-                println!("{} {}", if r.detected { "●" } else { "○" }, r.tool);
-                for l in &r.lines {
-                    println!("    {l}");
-                }
-            }
-            if verb == "installed" {
-                println!("\nRestart running AI sessions to load the skill and hooks.");
-                println!("Store keys by copying them and asking: \"store it as myapp/openai\".");
-            }
-            Ok(())
-        }
-        Cmd::Recover {
-            slot,
-            passphrase,
-            idle,
-        } => {
-            if !(1..=3).contains(&slot) {
-                anyhow::bail!("slot must be 1, 2 or 3");
-            }
-            let expected = sealctl::recover::expected_public()?;
-            let words = sealctl::recover::read_phrase()?;
-            let pass = if passphrase {
-                sealctl::util::read_hidden("BIP39 passphrase: ")?
-            } else {
-                zeroize::Zeroizing::new(String::new())
-            };
-            let key = sealctl::recover::recover_key(&words, &pass, slot - 1, &expected)?;
-            drop((words, pass));
-            println!("✅ recovered the decryption key — it matches your certificate");
-            println!("   Recovery agent running. In another terminal: sealctl unlock <name>,");
-            println!("   sealctl backup restore …, sealctl secret get …   (Ctrl-C to stop)");
-            agent::run_with(
-                ctx,
-                agent::Limits {
-                    idle: Duration::from_secs(idle.max(1) * 60),
-                    max_life: Duration::from_secs(24 * 3600),
-                },
-                Some(Box::new(sealctl::recover::SeedOracle(key))),
-            )
-        }
-        Cmd::Agent(AgentCmd::Run { idle, max_hours }) => agent::run(
-            ctx,
-            agent::Limits {
-                idle: Duration::from_secs(idle.max(1) * 60),
-                max_life: Duration::from_secs(max_hours.max(1) * 3600),
-            },
-        ),
-        Cmd::Agent(AgentCmd::Stop) => {
-            println!(
-                "{}",
-                if agent::stop()? {
-                    "agent stopped"
-                } else {
-                    "agent was not running"
-                }
-            );
-            Ok(())
-        }
-        Cmd::Agent(AgentCmd::Status) => {
-            match agent::AgentClient::connect() {
-                Ok(mut c) => {
-                    let (n, idle_left, life_left) = c.status()?;
-                    println!(
-                        "running — {n} cached result(s); exits after {} min idle, at the latest in {}h{:02}m",
-                        idle_left / 60,
-                        life_left / 3600,
-                        (life_left % 3600) / 60
-                    );
-                }
-                Err(_) => println!("not running (starts automatically when needed)"),
-            }
-            Ok(())
-        }
-
-        Cmd::Volume(VolumeCmd::Create {
-            name,
-            size,
-            kind,
-            path,
-            container,
-            mountpoint,
-        }) => {
-            let v = volume::create(
-                agent::oracle(&ctx)?.as_mut(),
-                volume::CreateOpts {
-                    name,
-                    kind: kind.unwrap_or_else(Kind::default_for_os),
-                    size,
-                    path,
-                    container,
-                    mountpoint,
-                },
-            )?;
-            println!(
-                "✅ volume '{}' created and unlocked at {}",
-                v.name,
-                v.mountpoint.display()
-            );
-            println!(
-                "   Its key is derived from your Ledger seed and the volume id {} — nothing to back up.",
-                v.id
-            );
-            Ok(())
-        }
-        Cmd::Volume(VolumeCmd::Ls) => {
-            for v in volume::Volume::list()? {
-                let (icon, err) = match v.is_unlocked() {
-                    Ok(true) => ("🔓", None),
-                    Ok(false) => ("🔒", None),
-                    Err(e) => ("❓", Some(e)),
-                };
-                println!(
-                    "{:<14} {:<13} {} {}",
-                    v.name,
-                    format!("{:?}", v.kind).to_lowercase(),
-                    icon,
-                    v.mountpoint.display()
-                );
-                if let Some(e) = err {
-                    println!("               state unknown: {e:#}");
-                }
-            }
-            Ok(())
-        }
-        Cmd::Volume(VolumeCmd::Import {
-            name,
-            target,
-            kind,
-            mountpoint,
-        }) => volume::import(&name, kind, &target, mountpoint).map(|_| ()),
-        Cmd::Volume(VolumeCmd::Rekey { name }) => volume::rekey(&ctx, agent::oracle(&ctx)?.as_mut(), &name),
-        Cmd::Volume(VolumeCmd::Rm { name, delete_data }) => {
-            if delete_data && !util::confirm(&format!("Permanently delete the encrypted data of '{name}'?"))?
-            {
-                return Ok(());
-            }
-            volume::remove(&name, delete_data)
-        }
-
-        Cmd::Backup(b) => match b {
-            BackupCmd::Init {
-                volume,
-                repo,
-                env,
-                key_id,
-            } => backup::init(
-                agent::oracle(&ctx)?.as_mut(),
-                &volume,
-                &repo,
-                key_id.as_deref(),
-                &env,
+        Cmd::Lock { force, no_backup, .. } => cli::lock(force, no_backup),
+        Cmd::Unlock { name } => Err(exit::fail(
+            exit::USAGE,
+            format!(
+                "Use sealctl volume open {}",
+                name.unwrap_or_else(|| "<name>".into())
             ),
-            BackupCmd::Rekey { volume, key_id } => {
-                backup::rekey(agent::oracle(&ctx)?.as_mut(), &volume, key_id.as_deref())
-            }
-            BackupCmd::Run {
-                volumes,
-                all,
-                if_unlocked,
-                quiet,
-            } => backup::run(&volumes, all, if_unlocked, quiet),
-            BackupCmd::Snapshots { volume } => backup::snapshots(agent::oracle(&ctx)?.as_mut(), &volume),
-            BackupCmd::Restore {
-                volume,
-                snapshot,
-                target,
-                include,
-            } => backup::restore(
-                agent::oracle(&ctx)?.as_mut(),
-                &volume,
-                &snapshot,
-                &target,
-                &include,
-            ),
-            BackupCmd::Check { volume, read_data } => {
-                backup::check(agent::oracle(&ctx)?.as_mut(), &volume, read_data)
-            }
-            BackupCmd::Policy {
-                volume,
-                on_lock,
-                scheduled,
-                keep_daily,
-                keep_weekly,
-                keep_monthly,
-            } => backup::set_policy(&volume, |p| {
-                if let Some(x) = on_lock {
-                    p.on_lock = x;
-                }
-                if let Some(x) = scheduled {
-                    p.scheduled = x;
-                }
-                if let Some(x) = keep_daily {
-                    p.keep_daily = x;
-                }
-                if let Some(x) = keep_weekly {
-                    p.keep_weekly = x;
-                }
-                if let Some(x) = keep_monthly {
-                    p.keep_monthly = x;
-                }
-            }),
-            BackupCmd::Schedule(ScheduleCmd::Install { every }) => backup::schedule_install(every),
-            BackupCmd::Schedule(ScheduleCmd::Uninstall) => backup::schedule_uninstall(),
-        },
-
-        Cmd::Secret(s) => match s {
+        )),
+        Cmd::Pair { name, force } => {
+            pair::pair(pair::PairOpts { name, force, relay })?;
+            sealctl::licence::maybe_ask();
+            Ok(0)
+        }
+        Cmd::Unpair { yes } => pair::unpair(yes, r).map(|_| 0),
+        Cmd::Cancel { id, yes } => status::cancel(id, yes, r).map(|_| 0),
+        Cmd::Doctor { json } => status::doctor(json),
+        Cmd::Secret(c) => match c {
             SecretCmd::Set {
                 name,
                 force,
                 from_clipboard,
-            } => {
-                let v = if from_clipboard {
-                    util::take_clipboard()?
-                } else {
-                    secrets::read_value(&name)?
-                };
-                for f in sealctl::guard::find_secrets(&String::from_utf8_lossy(&v)) {
-                    eprintln!("   looks like: {} {}", f.kind, f.preview);
-                }
-                secrets::set(agent::oracle(&ctx)?.as_mut(), &name, &v, force)?;
-                eprintln!("✅ stored {name}");
-                Ok(())
-            }
-            SecretCmd::Get { name, clip, show } => {
-                if let (true, Some(agent)) = (clip, sealctl::guard::ai_agent()) {
-                    // the agent could read the clipboard right back
-                    anyhow::bail!("refusing to copy a secret inside {agent}; use `sealctl run -- <command>`");
-                }
-                if !clip {
-                    sealctl::guard::may_print_secret(show).map_err(anyhow::Error::msg)?;
-                }
-                let v = secrets::get(agent::oracle(&ctx)?.as_mut(), &name)?;
-                if clip {
-                    util::copy_to_clipboard_with_clear(&v, 30)?;
-                    eprintln!("📋 copied {name} (clears in 30 s)");
-                } else {
-                    println!("{}", v.as_str());
-                }
-                Ok(())
-            }
-            SecretCmd::Ls => {
-                for n in secrets::list()? {
-                    println!("{n}");
-                }
-                Ok(())
-            }
-            SecretCmd::Rm { name } => secrets::remove(&name),
+                own_approval,
+            } => cli::secret_set(&name, force, from_clipboard, own_approval),
+            SecretCmd::Get { name, clip, show } => cli::secret_get(&name, clip, show),
+            SecretCmd::Ls { json } => cli::secret_ls(json),
+            SecretCmd::Rm { name, yes } => cli::secret_rm(&name, yes),
+            SecretCmd::Mv { old, new } => sealctl::daemon::client::store_mv(&old, &new),
             SecretCmd::ImportEnv {
                 file,
                 prefix,
                 delete,
                 force,
-            } => project::import_dotenv(agent::oracle(&ctx)?.as_mut(), &file, &prefix, delete, force),
-        },
+            } => seal::seal_env(&file, &prefix, delete, force),
+            SecretCmd::Store { use_dir, json } => cli::secret_store(use_dir, json),
+        }
+        .map(|_| 0),
         Cmd::Run {
             env,
             no_project,
             command,
-        } => project::run(agent::oracle(&ctx)?.as_mut(), &env, !no_project, &command),
-
-        Cmd::Encrypt {
-            input,
-            recipient,
-            no_self,
-            output,
-            armor,
-        } => {
-            let mut certs = recipient
-                .iter()
-                .map(|p| cert::read(p))
-                .collect::<Result<Vec<_>>>()?;
-            if !no_self {
-                certs.push(cert::own()?);
+        } => sealctl::project::run(&env, !no_project, &command).map(|_| 0),
+        Cmd::Ai(c) => {
+            match c {
+                AiCmd::Install { tools } => print_reports(sealctl::ai::install(&tools)?),
+                AiCmd::Uninstall { tools } => print_reports(sealctl::ai::uninstall(&tools)?),
+                AiCmd::Status { tools } => print_reports(sealctl::ai::status(&tools)?),
             }
-            let data = read_input(input.as_ref())?;
-            let armor = armor
-                || output
-                    .as_ref()
-                    .is_some_and(|p| p.extension().is_some_and(|e| e == "asc"))
-                || (output.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdout()));
-            let ct = crypto::encrypt(&certs, &data, armor)?;
-            write_output(output.as_ref(), &ct, false)
+            Ok(0)
         }
-        Cmd::Decrypt { input, output } => {
-            let data = read_input(input.as_ref())?;
-            let pt = crypto::decrypt(&ctx, &data)?;
-            write_output(output.as_ref(), &pt, true)
-        }
-
-        Cmd::Ssh(s) => match s {
+        Cmd::Rules { json } => status::rules(json).map(|_| 0),
+        Cmd::Hook { tool } => sealctl::ai::run_hook(&tool).map(|_| 0),
+        Cmd::Ssh(c) => match c {
             SshCmd::Keygen { name, comment } => {
-                let comment = match comment {
-                    Some(c) => c,
-                    None => cert::own()
-                        .map(|c| cert::primary_user_id(&c))
-                        .unwrap_or_else(|_| format!("sealctl {name}")),
-                };
-                let path = ssh::keygen(agent::oracle(&ctx)?.as_mut(), &name, &comment)?;
-                let public = ssh::read_public(&path)?;
-                println!(
-                    "✅ {} (encrypted; passphrase derived from your Ledger seed)",
-                    path.display()
-                );
-                println!("   {}", public.fingerprint(ssh_key::HashAlg::Sha256));
-                println!("   Back up this file — the 24 words alone cannot recreate a random key.");
-                println!(
-                    "   Public key ({}.pub) — add it to GitHub / authorized_keys:",
-                    path.display()
-                );
-                println!("   {}", public.to_openssh()?);
-                Ok(())
-            }
-            SshCmd::Import { file, name } => {
-                let name = match name {
-                    Some(n) => n,
-                    None => file
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("imported")
-                        .trim_start_matches('.')
-                        .to_string(),
-                };
-                let path = ssh::import(agent::oracle(&ctx)?.as_mut(), &file, &name)?;
-                let public = ssh::read_public(&path)?;
-                println!(
-                    "✅ {} (encrypted; passphrase derived from your Ledger seed)",
-                    path.display()
-                );
-                println!("   {}", public.fingerprint(ssh_key::HashAlg::Sha256));
-                println!("   The agent offers it now. Once logins work, delete the unencrypted original:");
-                println!("   rm {}", file.display());
-                Ok(())
+                let line = ssh::keygen(&name, &comment)?;
+                println!("{line}");
+                Ok(0)
             }
             SshCmd::Pubkey { name } => {
-                println!("{}", ssh::read_public(&ssh::key_path(&name)?)?.to_openssh()?);
-                Ok(())
+                println!("{}", ssh::read_public(&name)?.to_openssh()?);
+                Ok(0)
             }
-            SshCmd::Passphrase { name, show } => {
-                use std::io::IsTerminal;
-                let to_clipboard = std::io::stdout().is_terminal() && !show;
-                if !to_clipboard {
-                    sealctl::guard::may_print_secret(show).map_err(anyhow::Error::msg)?;
-                } else if let Some(agent) = sealctl::guard::ai_agent() {
-                    anyhow::bail!("refusing inside {agent}: run it in your own terminal");
-                }
-                let public = ssh::read_public(&ssh::key_path(&name)?)?;
-                let pass = ssh::passphrase_for(agent::oracle(&ctx)?.as_mut(), &public)?;
-                if to_clipboard {
-                    util::copy_to_clipboard_with_clear(&pass, 30)?;
-                    eprintln!("📋 passphrase copied (clears in 30 s)");
-                } else {
-                    println!("{}", *pass);
-                }
-                Ok(())
+            SshCmd::Setup => {
+                print!("{}", ssh::setup_text()?);
+                eprintln!("Add these lines to ~/.ssh/config. The sealctl daemon serves the agent.");
+                Ok(0)
             }
-            SshCmd::Agent { socket } => ssh::run_agent(ctx, socket),
-            SshCmd::Install => ssh::install(targs),
-            SshCmd::Uninstall => sealctl::service::uninstall(ssh::AGENT_LABEL),
+            SshCmd::Import { file, name } => seal::seal_ssh(&file, name).map(|_| 0),
         },
-        Cmd::Git(GitCmd::Setup { local, key, undo }) => {
-            if undo {
-                git::undo(local)
-            } else {
-                git::setup(local, key.as_deref())
-            }
+        Cmd::Git(c) => match c {
+            GitCmd::Setup {
+                local, undo: true, ..
+            } => git::undo(local).map(|_| 0),
+            GitCmd::Setup { local, key, .. } => git::setup(local, key.as_deref()).map(|_| 0),
+            GitCmd::Credentials { host, undo } => git::credentials(&host, undo).map(|_| 0),
+            GitCmd::Credential { action } => git::credential(&action).map(|_| 0),
+            GitCmd::SshKeygen { args } => git::ssh_keygen_shim(&args).map(|_| 0),
+        },
+        Cmd::Aws(AwsCmd::Credentials { profile }) => cli::aws_credentials(&profile).map(|_| 0),
+        Cmd::Volume(c) => match c {
+            VolumeCmd::Create {
+                name,
+                kind,
+                size,
+                container,
+                path,
+                mountpoint,
+                manual,
+            } => cli::volume_create(CreateOpts {
+                name,
+                kind: kind.unwrap_or_else(Kind::default_for_os),
+                size,
+                path,
+                container,
+                mountpoint,
+                manual,
+            }),
+            VolumeCmd::Ls { json } => cli::volume_ls(json),
+            VolumeCmd::Open { name } => cli::volume_open(&name),
+            VolumeCmd::Close { name, force } => cli::volume_close(&name, force),
+            VolumeCmd::Import {
+                name,
+                target,
+                kind,
+                mountpoint,
+            } => cli::volume_import(&name, &target, kind, mountpoint),
+            VolumeCmd::Rm { name, delete_data } => cli::volume_rm(&name, delete_data),
         }
-        Cmd::Git(GitCmd::SshKeygen { args }) => git::ssh_keygen_shim(&args),
-
-        Cmd::Setup { uid, force } => setup::setup(&ctx, uid, force),
-        Cmd::Pin { which } => pin::change(&ctx, which),
-        Cmd::Doctor { full } => doctor::run(&ctx, full),
-        Cmd::Kit(KitCmd::Export { dir }) => kit::export(&dir),
-        Cmd::Kit(KitCmd::Import { dir }) => kit::import(&dir),
-        Cmd::Devices => card::devices(ctx.select, ctx.scan),
-        Cmd::Card => card::status(&ctx),
+        .map(|_| 0),
+        Cmd::Backup(c) => match c {
+            BackupCmd::Init {
+                name,
+                from,
+                repo,
+                env,
+            } => cli::backup_init(&name, &from, &repo, &env),
+            BackupCmd::Run {
+                names,
+                all,
+                if_open,
+                quiet,
+            } => cli::backup_run(&names, all, if_open, quiet),
+            BackupCmd::Snapshots { name, json } => {
+                let mut a = vec!["snapshots"];
+                if json {
+                    a.push("--json");
+                }
+                cli::backup_restic(&name, &a)
+            }
+            BackupCmd::Restore {
+                name,
+                target,
+                snapshot,
+                include,
+            } => {
+                let t = target.to_string_lossy().into_owned();
+                let mut a = vec!["restore", snapshot.as_str(), "--target", t.as_str()];
+                for i in &include {
+                    a.push("--include");
+                    a.push(i);
+                }
+                cli::backup_restic(&name, &a)
+            }
+            BackupCmd::Check { name, read_data } => {
+                let pct = read_data.map(|p| format!("--read-data-subset={p}%"));
+                let mut a = vec!["check"];
+                if let Some(p) = &pct {
+                    a.push(p);
+                }
+                cli::backup_restic(&name, &a)
+            }
+            BackupCmd::Policy {
+                name,
+                on_lock,
+                scheduled,
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+            } => cli::backup_policy(&name, on_lock, scheduled, keep_daily, keep_weekly, keep_monthly),
+            BackupCmd::Schedule(ScheduleCmd::Install { every }) => sealctl::backup::schedule_install(every),
+            BackupCmd::Schedule(ScheduleCmd::Uninstall) => sealctl::backup::schedule_uninstall(),
+        }
+        .map(|_| 0),
+        Cmd::Inventory { json } => status::inventory(json).map(|_| 0),
+        Cmd::Seal(c) => match c {
+            SealCmd::Volume {
+                name,
+                target,
+                mountpoint,
+                manual,
+                words,
+            } => seal::seal_volume(&name, &target, mountpoint, manual, words),
+            SealCmd::Backup {
+                name,
+                repo,
+                from,
+                env,
+                keep_old_password,
+                words,
+            } => seal::seal_backup(&name, &repo, from.as_deref(), &env, keep_old_password, words),
+            SealCmd::Ssh { file, name } => seal::seal_ssh(&file, name),
+            SealCmd::Secret {
+                name,
+                from_clipboard,
+                force,
+            } => {
+                sealctl::term::refuse_agent("sealctl seal")?;
+                cli::secret_set(&name, force, from_clipboard, false)
+            }
+            SealCmd::Env {
+                file,
+                prefix,
+                delete,
+                force,
+            } => seal::seal_env(&file, &prefix, delete, force),
+        }
+        .map(|_| 0),
+        Cmd::Unseal(a) => {
+            let target = if a.all {
+                Some(Target::All)
+            } else {
+                a.what.map(|w| match w {
+                    UnsealWhat::Secret { name } => Target::Secret(name),
+                    UnsealWhat::Secrets => Target::Secrets,
+                    UnsealWhat::Volume { name } => Target::Volume(name),
+                    UnsealWhat::Backup { name } => Target::Backup(name),
+                    UnsealWhat::Ssh { name } => Target::Ssh(name),
+                    UnsealWhat::Git => Target::Git,
+                    UnsealWhat::Ai { tools } => Target::Ai(tools),
+                })
+            };
+            if target.is_none() && !a.resume {
+                return Err(exit::fail(
+                    exit::USAGE,
+                    "Say what to unseal (see sealctl unseal --help), or --all.",
+                ));
+            }
+            unseal::unseal(unseal::Opts {
+                target,
+                resume: a.resume,
+                words: a.words,
+                dry_run: a.dry_run,
+                json: a.json,
+                keep_store: a.keep_store,
+                skip: a.skip,
+                to: a.to,
+                relay,
+            })
+            .map(|_| 0)
+        }
+        Cmd::Recover {
+            target,
+            out,
+            name,
+            show,
+            restic,
+        } => sealctl::recover::recover(&target, out, name, show, restic).map(|_| 0),
+        Cmd::Buy { seats, code } => sealctl::licence::buy(seats, code, r).map(|_| 0),
         Cmd::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "sealctl", &mut std::io::stdout());
-            Ok(())
+            Ok(0)
         }
+        Cmd::Daemon { stop: true, .. } => {
+            sealctl::daemon::client::stop_running();
+            Ok(0)
+        }
+        Cmd::Daemon { spawned, .. } => sealctl::daemon::run(spawned).map(|_| 0),
     }
 }
 
-fn read_input(p: Option<&PathBuf>) -> Result<Vec<u8>> {
-    match p {
-        Some(p) if p.as_os_str() != "-" => {
-            std::fs::read(p).with_context(|| format!("reading {}", p.display()))
-        }
-        _ => {
-            let mut v = Vec::new();
-            std::io::stdin().read_to_end(&mut v)?;
-            Ok(v)
-        }
-    }
-}
-
-fn write_output(p: Option<&PathBuf>, data: &[u8], private: bool) -> Result<()> {
-    match p {
-        Some(p) if p.as_os_str() != "-" => {
-            if private {
-                sealctl::paths::write_private(p, data)
-            } else {
-                std::fs::write(p, data).with_context(|| format!("writing {}", p.display()))
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let level = match (cli.verbose, std::env::var("SEALCTL_LOG").ok().as_deref()) {
+        (0, Some("info")) | (1, _) => "info",
+        (0, Some("debug")) | (2.., _) => "debug",
+        _ => "warn",
+    };
+    env_logger::Builder::new()
+        .parse_filters(level)
+        .format_timestamp(None)
+        .init();
+    // panics print only the location, never a value
+    std::panic::set_hook(Box::new(|info| {
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        eprintln!("sealctl: internal error at {at}. Please report it.");
+    }));
+    if let Some(r) = &cli.relay {
+        match sealctl::config::validate_origin(r) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("sealctl: {}", exit::message_of(&e));
+                return ExitCode::from(exit::USAGE as u8);
             }
         }
-        _ => {
-            std::io::stdout().write_all(data)?;
-            Ok(())
+        // one place reads the relay: the environment, as SEALCTL_RELAY
+        std::env::set_var("SEALCTL_RELAY", r);
+    }
+    match run(cli) {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(e) => {
+            let code = exit::code_of(&e);
+            let msg = exit::message_of(&e);
+            if code == 0 {
+                eprintln!("{msg}");
+            } else {
+                eprintln!("sealctl: {msg}");
+            }
+            ExitCode::from(code as u8)
         }
     }
 }

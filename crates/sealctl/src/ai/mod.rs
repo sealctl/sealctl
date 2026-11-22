@@ -199,12 +199,12 @@ fn claude_status() -> Result<Vec<String>> {
         format!(
             "skill {}",
             if skill_installed(&home.join("skills")) {
-                "✅"
+                "yes"
             } else {
-                "—"
+                "no"
             }
         ),
-        format!("hooks {}", if hooked { "✅" } else { "—" }),
+        format!("hooks {}", if hooked { "yes" } else { "no" }),
     ])
 }
 
@@ -234,7 +234,7 @@ fn skill_only_uninstall(dir: fn() -> Result<PathBuf>) -> Result<Vec<String>> {
 fn skill_only_status(dir: fn() -> Result<PathBuf>) -> Result<Vec<String>> {
     Ok(vec![format!(
         "skill {}",
-        if skill_installed(&dir()?) { "✅" } else { "—" }
+        if skill_installed(&dir()?) { "yes" } else { "no" }
     )])
 }
 
@@ -343,7 +343,7 @@ fn apply(only: &[String], pick: fn(&Tool) -> Action, require_detected: bool) -> 
         let lines = if detected || !only.is_empty() || !require_detected {
             match (pick(&t))() {
                 Ok(l) => l,
-                Err(e) => vec![format!("❌ {e:#}")],
+                Err(e) => vec![format!("error: {e:#}")],
             }
         } else {
             vec!["not found — skipped".into()]

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/sealctl-ledger", "crates/sealctl", "crates/sealctl-core"]
+members = ["crates/sealctl", "crates/sealctl-core", "crates/sealctl-fakerelay"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -14,17 +14,14 @@ authors = ["Oleksiy Pylypenko"]
 anyhow = "1"
 thiserror = "2"
 log = "0.4"
-card-backend = "0.2"
-openpgp-card = "0.7"
-openpgp-card-rpgp = "0.9"
-pgp = "0.21"
-hidapi = "2.6"
-btleplug = "0.13"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
-futures = "0.3"
-uuid = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "net", "macros", "io-util", "signal"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 
 [profile.release]
 lto = true

@@ -1,254 +1,297 @@
-//! Recovery without a Ledger: recompute the OpenPGP app's seed-derived **decryption** key from
-//! the 24-word recovery phrase, in software.
-//!
-//! This reproduces `app-openpgp` (LedgerHQ) seed mode "v2" — the mode its GENERATE uses by
-//! default when Seed mode is on (`src/gpg_gen.c`):
-//!
-//! ```text
-//! seed  = BIP39(words, passphrase)                         (PBKDF2-HMAC-SHA512, 2048 rounds)
-//! Sn    = BIP32-secp256k1(seed, m/0x80475047'/(slot+1)')   (private key, 32 bytes)
-//! h     = SHA-256("kdf2" ‖ Sn ‖ "dec " ‖ u16be(1) ‖ u8(len A) ‖ A)
-//!         A = the key's algorithm attributes, 12 2B060104019755010501 for cv25519 ECDH
-//! d     = (SHAKE-256(h, 64 bytes) as big-endian) mod ℓ, clamped (RFC 7748), big-endian
-//! k     = d little-endian                                  (the X25519 scalar)
-//! ```
-//!
-//! The result is checked against the decryption subkey of your certificate, so a wrong word,
-//! passphrase or slot can never silently produce a wrong key.
-//!
-//! Typing the recovery phrase into a computer exposes it to that computer. This is for disaster
-//! recovery (Ledger lost or the app gone), ideally on an offline machine.
+//! `sealctl recover` (SPEC 17) and the `--words` path of `seal` and `unseal`: keys from the
+//! 24 words alone, with no phone, relay, pairing or config. The words are typed by a person,
+//! without echo, one at a time; never accepted as an argument, from a pipe or the environment.
 
-use anyhow::{bail, Context, Result};
-use curve25519_dalek::montgomery::MontgomeryPoint;
-use hmac::{Hmac, Mac};
-use num_bigint::BigUint;
-use sha2::{Digest, Sha256, Sha512};
-use sha3::digest::{ExtendableOutput, Update, XofReader};
-use zeroize::{Zeroize, Zeroizing};
+use std::path::{Path, PathBuf};
 
-/// Algorithm attributes sealctl sets for the decryption key: ECDH (0x12) over cv25519.
-pub const ATTR_CV25519_ECDH: [u8; 11] = [0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01];
+use anyhow::{Context, Result};
+use sealctl_core::ids::{IdFile, IdFileContent};
+use sealctl_core::{complete_word, ObjectKey, Purpose, Root, Words};
+use zeroize::Zeroizing;
 
-const APP_PATH: u32 = 0x8047_5047;
-const HARDENED: u32 = 0x8000_0000;
+use crate::exit::{self, fail};
+use crate::{paths, term};
 
-/// secp256k1 group order n.
-const SECP256K1_N: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
-/// Curve25519 prime-subgroup order ℓ = 2^252 + 27742317777372353535851937790883648493.
-const CURVE25519_L: &str = "1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed";
-
-fn big(hex_str: &str) -> BigUint {
-    BigUint::parse_bytes(hex_str.as_bytes(), 16).expect("constant")
+fn read_word(i: usize) -> Result<Zeroizing<String>> {
+    use std::io::Write;
+    eprint!("Word {i} of 24: ");
+    std::io::stderr().flush()?;
+    Ok(Zeroizing::new(rpassword::read_password()?.trim().to_lowercase()))
 }
 
-/// BIP39 seed from a recovery phrase (the checksum is verified).
-pub fn bip39_seed(words: &str, passphrase: &str) -> Result<Zeroizing<[u8; 64]>> {
-    let mut normalized = Zeroizing::new(String::with_capacity(words.len()));
-    for (i, w) in words.split_whitespace().enumerate() {
-        if i > 0 {
-            normalized.push(' ');
+/// Asks for the 24 words (three tries) and returns the root.
+pub fn read_root() -> Result<Root> {
+    term::require_person("typing the 24 words", None)?;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            eprintln!("These words do not add up (checksum). Start again from word 1.");
         }
-        normalized.extend(w.chars().flat_map(char::to_lowercase));
+        let mut list: Vec<String> = Vec::with_capacity(24);
+        let mut i = 1;
+        while i <= 24 {
+            let w = read_word(i)?;
+            let matches = complete_word(w.chars().take(4).collect());
+            let exact = matches.iter().find(|m| **m == *w).cloned();
+            let pick = match (exact, matches.len()) {
+                (Some(e), _) => Some(e),
+                (None, 1) if w.len() >= 4 => Some(matches[0].clone()),
+                (None, 1) if w.len() >= 3 && matches[0].starts_with(w.as_str()) => Some(matches[0].clone()),
+                _ => None,
+            };
+            match pick {
+                Some(p) if p.starts_with(w.as_str()) => {
+                    list.push(p);
+                    i += 1;
+                }
+                _ => eprintln!("Not a word from the list. Type it again (the first 4 letters are enough)."),
+            }
+        }
+        let words = Words::parse(list);
+        if let Ok(w) = words {
+            return Ok(Root::from_words(&w));
+        }
     }
-    let m = bip39::Mnemonic::parse_in(bip39::Language::English, normalized.as_str())
-        .map_err(|e| anyhow::anyhow!("not a valid recovery phrase: {e}"))?;
-    Ok(Zeroizing::new(m.to_seed(passphrase)))
+    Err(fail(
+        exit::WRONG_KEY,
+        "These words do not add up. Nothing was opened.",
+    ))
 }
 
-fn to32(n: &BigUint) -> Zeroizing<[u8; 32]> {
-    let b = n.to_bytes_be();
-    let mut out = Zeroizing::new([0u8; 32]);
-    out[32 - b.len()..].copy_from_slice(&b);
-    out
-}
-
-/// BIP32 private derivation on secp256k1, hardened steps only (all the app uses in v2).
-pub fn bip32_hardened(seed: &[u8], path: &[u32]) -> Result<Zeroizing<[u8; 32]>> {
-    let n = big(SECP256K1_N);
-    let mut mac = Hmac::<Sha512>::new_from_slice(b"Bitcoin seed").expect("any key length");
-    Mac::update(&mut mac, seed);
-    let i = Zeroizing::new(mac.finalize().into_bytes());
-    let mut k = Zeroizing::new([0u8; 32]);
-    let mut c = Zeroizing::new([0u8; 32]);
-    k.copy_from_slice(&i[..32]);
-    c.copy_from_slice(&i[32..]);
-    let kn = BigUint::from_bytes_be(&k[..]);
-    if kn == BigUint::ZERO || kn >= n {
-        bail!("invalid BIP32 master key");
+/// Checks the root's fingerprint against the object's (exit 10).
+pub fn check_fingerprint(root: &Root, words: &str) -> Result<()> {
+    let fp = root.fingerprint();
+    if fp != words {
+        return Err(fail(
+            exit::WRONG_KEY,
+            format!("These words have fingerprint {fp}; this object was sealed with words {words}."),
+        ));
     }
-    for &index in path {
-        if index & HARDENED == 0 {
-            bail!("only hardened derivation is supported");
+    Ok(())
+}
+
+/// Derives an object key and checks it against `check` (exit 10).
+pub fn derive_checked(root: &Root, purpose: Purpose, id: &str, check: Option<&str>) -> Result<ObjectKey> {
+    let k = ObjectKey::derive(root, purpose, id)
+        .map_err(|_| fail(exit::USAGE, format!("{id} is not an object id.")))?;
+    if let Some(c) = check {
+        if k.check() != c {
+            return Err(fail(
+                exit::WRONG_KEY,
+                "The key from these words does not match the object's check.",
+            ));
         }
-        let mut mac = Hmac::<Sha512>::new_from_slice(&c[..]).expect("any key length");
-        Mac::update(&mut mac, &[0]);
-        Mac::update(&mut mac, &k[..]);
-        Mac::update(&mut mac, &index.to_be_bytes());
-        let i = Zeroizing::new(mac.finalize().into_bytes());
-        let il = BigUint::from_bytes_be(&i[..32]);
-        if il >= n {
-            bail!("invalid BIP32 child (index {index:#x})");
-        }
-        let child = (il + BigUint::from_bytes_be(&k[..])) % &n;
-        if child == BigUint::ZERO {
-            bail!("invalid BIP32 child (index {index:#x})");
-        }
-        k = to32(&child);
-        c.copy_from_slice(&i[32..]);
     }
     Ok(k)
 }
 
-/// The X25519 decryption scalar (little-endian) of OpenPGP-app key slot `slot` (0-based).
-pub fn decryption_key(seed: &[u8], slot: u32, attributes: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    let sn = bip32_hardened(seed, &[APP_PATH, (HARDENED | slot) + 1])?;
-    let mut h = Sha256::new();
-    Digest::update(&mut h, b"kdf2");
-    Digest::update(&mut h, &sn[..]);
-    Digest::update(&mut h, b"dec ");
-    Digest::update(&mut h, [0x00, 0x01, attributes.len() as u8]);
-    Digest::update(&mut h, attributes);
-    let mut h = h.finalize();
-
-    let mut shake = sha3::Shake256::default();
-    shake.update(&h);
-    h.zeroize();
-    let mut wide = Zeroizing::new([0u8; 64]);
-    shake.finalize_xof().read(&mut wide[..]);
-    let d = BigUint::from_bytes_be(&wide[..]) % big(CURVE25519_L);
-    let mut d = to32(&d);
-    d[31] &= 0xF8;
-    d[0] = (d[0] & 0x7F) | 0x40;
-    d.reverse();
-    Ok(d)
+enum Target {
+    Store(PathBuf),
+    Sealed(PathBuf, String),
+    Bundle(PathBuf),
+    Restic(String),
 }
 
-/// X25519 public key (little-endian) of a scalar.
-pub fn public_key(k: &[u8; 32]) -> [u8; 32] {
-    MontgomeryPoint::mul_base_clamped(*k).to_bytes()
+fn find_store_of(file: &Path) -> Option<(PathBuf, String)> {
+    let mut d = file.parent();
+    while let Some(dir) = d {
+        let id = dir.file_name()?.to_string_lossy().into_owned();
+        if sealctl_core::ids::parse_uuid(&id).is_some() && dir.join(format!("{id}.id")).exists() {
+            let rel = file
+                .strip_prefix(dir)
+                .ok()?
+                .to_string_lossy()
+                .trim_end_matches(".sealed")
+                .to_string();
+            return Some((dir.to_path_buf(), rel));
+        }
+        d = dir.parent();
+    }
+    None
 }
 
-/// The cv25519 public key of the certificate's decryption subkey.
-pub fn cert_decryption_key(cert: &pgp::composed::SignedPublicKey) -> Option<[u8; 32]> {
-    use pgp::types::{EcdhPublicParams, KeyDetails, PublicParams};
-    cert.public_subkeys
-        .iter()
-        .find_map(|s| match s.key.public_params() {
-            PublicParams::ECDH(EcdhPublicParams::Curve25519Legacy { p, .. }) => Some(*p.as_bytes()),
-            _ => None,
-        })
-}
-
-/// Derive the decryption key from the phrase and make sure it is the one in `cert`.
-/// Tries the attribute encodings a card may have stored (with and without import format 0xFF).
-pub fn recover_key(
-    words: &str,
-    passphrase: &str,
-    slot: u32,
-    expected_public: &[u8; 32],
-) -> Result<Zeroizing<[u8; 32]>> {
-    let seed = bip39_seed(words, passphrase)?;
-    let mut with_ff = ATTR_CV25519_ECDH.to_vec();
-    with_ff.push(0xFF);
-    for attrs in [&ATTR_CV25519_ECDH[..], &with_ff[..]] {
-        let k = decryption_key(&seed[..], slot, attrs)?;
-        if &public_key(&k) == expected_public {
-            return Ok(k);
+fn classify(target: &str) -> Result<Target> {
+    let p = Path::new(target);
+    if p.is_dir() {
+        if p.join("sealctl.id").is_file() {
+            return Ok(Target::Bundle(p.to_path_buf()));
+        }
+        let id = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if p.join(format!("{id}.id")).is_file() {
+            return Ok(Target::Store(p.to_path_buf()));
+        }
+        if p.join("config").is_file() && p.join("keys").is_dir() {
+            return Ok(Target::Restic(target.to_string()));
         }
     }
-    bail!(
-        "the phrase does not produce the decryption key of your certificate.\n   \
-         Check the words, the passphrase (if you use one), and the key slot."
-    )
-}
-
-/// Read a recovery phrase without echo.
-pub fn read_phrase() -> Result<Zeroizing<String>> {
-    eprintln!(
-        "⚠️  Typing the recovery phrase exposes it to this computer. Do this only to recover\n   \
-         (Ledger lost or broken), ideally offline. Words are not shown while you type."
-    );
-    let words = crate::util::read_hidden("Recovery phrase (24 words, separated by spaces): ")?;
-    if words.split_whitespace().count() < 12 {
-        bail!("expected 12–24 words");
+    if p.is_file() && target.ends_with(".sealed") {
+        let abs = std::fs::canonicalize(p)?;
+        let (store, name) = find_store_of(&abs)
+            .ok_or_else(|| fail(exit::NOT_FOUND, "This .sealed file is not inside a store folder."))?;
+        return Ok(Target::Sealed(store, name));
     }
-    Ok(words)
+    if target.contains(':') && !p.exists() {
+        return Ok(Target::Restic(target.to_string()));
+    }
+    Err(fail(
+        exit::NOT_FOUND,
+        format!("{target} is not a store, .sealed file, sparse bundle or restic repository."),
+    ))
 }
 
-/// A software oracle holding the recovered key, for the agent.
-pub struct SeedOracle(pub Zeroizing<[u8; 32]>);
-
-impl crate::derive::Oracle for SeedOracle {
-    fn x25519(&mut self, u: &[u8; 32]) -> Result<[u8; 32]> {
-        let s = MontgomeryPoint(*u).mul_clamped(*self.0);
-        Ok(s.to_bytes())
+fn read_id_file(p: &Path) -> Result<IdFile> {
+    let t = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+    match IdFile::parse(&t) {
+        Ok(IdFileContent::V1(f)) => Ok(f),
+        Ok(IdFileContent::Legacy(_)) => Err(fail(exit::WRONG_KEY, crate::legacy::MESSAGE)),
+        Err(_) => Err(fail(exit::ERROR, format!("{} is damaged.", p.display()))),
     }
 }
 
-/// Recovered-key checks run against `cert` if present.
-pub fn expected_public() -> Result<[u8; 32]> {
-    let cert = crate::cert::own().context(
-        "your certificate is needed to verify the recovered key — restore it first \
-         (`sealctl kit import`), or regenerate it on a new Ledger with `sealctl setup`",
-    )?;
-    cert_decryption_key(&cert).context("the certificate has no cv25519 decryption subkey")
+/// The words fingerprint of a local restic repository, from its key's host `sealctl-<fp>`.
+pub fn restic_words(repo: &str) -> Option<String> {
+    let dir = Path::new(repo).join("keys");
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+        if let Some(h) = v["hostname"].as_str().and_then(|h| h.strip_prefix("sealctl-")) {
+            return Some(h.to_string());
+        }
+    }
+    None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// BIP32 test vector 1 (seed 000102…0f): m/0' private key.
-    #[test]
-    fn bip32_vector_1() {
-        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
-        let k = bip32_hardened(&seed, &[HARDENED]).unwrap();
-        assert_eq!(
-            hex::encode(&k[..]),
-            "edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea"
-        );
+fn write_out(dir: &Path, name: &str, value: &[u8]) -> Result<()> {
+    let p = dir.join(name);
+    let mut d = p.parent().map(Path::to_path_buf);
+    while let Some(x) = d {
+        if x.starts_with(dir) && !x.exists() {
+            paths::ensure_private_dir(&x)?;
+        }
+        if x == dir {
+            break;
+        }
+        d = x.parent().map(Path::to_path_buf);
     }
+    paths::write_private(&p, value)
+}
 
-    /// BIP39 test vector (TREZOR passphrase), "abandon … about".
-    #[test]
-    fn bip39_vector() {
-        let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-                     abandon abandon about";
-        let seed = bip39_seed(words, "TREZOR").unwrap();
-        assert_eq!(
-            hex::encode(&seed[..]),
-            "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553\
-             1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"
-        );
-    }
+fn give_value(value: &[u8], show: bool) -> Result<()> {
+    use std::io::Write;
+    crate::guard::may_print_secret(show).map_err(|m| fail(exit::REFUSED, m))?;
+    std::io::stdout().write_all(value)?;
+    Ok(())
+}
 
-    #[test]
-    fn bad_checksum_is_rejected() {
-        let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-                     abandon abandon abandon";
-        assert!(bip39_seed(words, "").is_err());
-    }
-
-    /// Run by scripts/speculos-recover-check.sh with the emulator's phrase and the public key
-    /// the OpenPGP app generated from it; skipped otherwise.
-    #[test]
-    fn matches_device() {
-        let (Ok(words), Ok(want)) = (
-            std::env::var("SEALCTL_TEST_PHRASE"),
-            std::env::var("SEALCTL_EXPECT_DEC_PUB"),
-        ) else {
-            return;
-        };
-        let want: [u8; 32] = hex::decode(want.trim()).unwrap().try_into().unwrap();
-        let k = recover_key(&words, "", 0, &want).expect("software key equals the device key");
-        println!("software decryption public key: {}", hex::encode(public_key(&k)));
-    }
-
-    #[test]
-    fn decryption_key_is_clamped() {
-        let k = decryption_key(&[1u8; 64], 0, &ATTR_CV25519_ECDH).unwrap();
-        assert_eq!(k[0] & 7, 0);
-        assert_eq!(k[31] & 0xC0, 0x40);
+/// `sealctl recover <target> [--out DIR | --name N [--show]] [-- restic args]`.
+pub fn recover(
+    target: &str,
+    out: Option<PathBuf>,
+    name: Option<String>,
+    show: bool,
+    restic_args: Vec<String>,
+) -> Result<()> {
+    term::require_person("sealctl recover", None)?;
+    let t = classify(target)?;
+    match t {
+        Target::Store(ref dir) | Target::Sealed(ref dir, _)
+            if out.is_some() || name.is_some() || matches!(t, Target::Sealed(..)) =>
+        {
+            let store = crate::store::Store::at(dir)?;
+            let idf = read_id_file(&store.id_path())?;
+            let root = read_root()?;
+            check_fingerprint(&root, &idf.words)?;
+            let key = derive_checked(&root, Purpose::Secrets, &store.id, Some(&idf.check))?;
+            let one = match &t {
+                Target::Sealed(_, n) => Some(n.clone()),
+                _ => name,
+            };
+            let open = |n: &str| -> Result<Zeroizing<Vec<u8>>> {
+                let h = store.header(n)?;
+                if h.mode == sealctl_core::sealed::Mode::OwnApproval {
+                    let own = derive_checked(
+                        &root,
+                        Purpose::Secret,
+                        &h.file_id,
+                        idf.own
+                            .as_ref()
+                            .and_then(|o| o.get(&h.file_id))
+                            .map(String::as_str),
+                    )?;
+                    store.read(n, &own)
+                } else {
+                    store.read(n, &key)
+                }
+            };
+            if let Some(n) = one {
+                let v = open(&n)?;
+                return give_value(&v, show);
+            }
+            let dir_out = out.expect("checked");
+            paths::ensure_private_dir(&dir_out)?;
+            let list = store.list()?;
+            for s in &list {
+                let v = open(&s.name)?;
+                write_out(&dir_out, &s.name, &v)?;
+            }
+            eprintln!(
+                "Wrote {} secrets to {} (0600 files). Delete them when done.",
+                list.len(),
+                dir_out.display()
+            );
+            Ok(())
+        }
+        Target::Store(_) | Target::Sealed(..) => Err(fail(
+            exit::USAGE,
+            "Give --out <dir> for every secret, or --name <secret> for one.",
+        )),
+        Target::Bundle(b) => {
+            let idf = read_id_file(&b.join("sealctl.id"))?;
+            let root = read_root()?;
+            check_fingerprint(&root, &idf.words)?;
+            let key = derive_checked(&root, Purpose::Volume, &idf.id, Some(&idf.check))?;
+            let out = crate::util::run_with_stdin(
+                crate::util::system_cmd("hdiutil")
+                    .args(["attach", "-stdinpass", "-owners", "on"])
+                    .arg(&b),
+                key.hex().as_bytes(),
+            )?;
+            crate::util::check(out, "hdiutil attach")?;
+            let mounts = crate::volume::sparsebundle::attached_mounts(&b)?;
+            let mp = mounts.into_iter().find(|m| !m.is_empty()).unwrap_or_default();
+            println!("{mp}");
+            eprintln!("Mounted. Eject with: diskutil eject {mp}");
+            Ok(())
+        }
+        Target::Restic(url) => {
+            let id = url
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let words = restic_words(&url);
+            let root = read_root()?;
+            if let Some(w) = &words {
+                check_fingerprint(&root, w)?;
+            }
+            let key = derive_checked(&root, Purpose::Backup, &id, None)?;
+            let env = crate::backup::collect_env(&url, &[])?;
+            let repo = crate::backup::Repo::new(&url, &key, env);
+            if !repo.opens()? {
+                return Err(fail(
+                    exit::WRONG_KEY,
+                    "The key from these words does not open this repository.",
+                ));
+            }
+            let args: Vec<String> = if restic_args.is_empty() {
+                vec!["snapshots".into()]
+            } else {
+                restic_args
+            };
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            repo.run(&a, false)
+        }
     }
 }

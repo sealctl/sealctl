@@ -153,3 +153,34 @@ impl Backend for ApfsVolume {
         Ok(())
     }
 }
+
+/// The words marker while locked: the passphrase hint `sealctl <fp>`.
+pub fn set_hint(v: &Volume, hint: &str) -> Result<()> {
+    check(
+        crate::util::system_cmd("diskutil")
+            .args(["apfs", "setPassphraseHint", &v.id, "-user", "disk", "-hint", hint])
+            .output()?,
+        "diskutil apfs setPassphraseHint",
+    )?;
+    Ok(())
+}
+
+/// Does `passphrase` open the volume? (`diskutil apfs unlockVolume -verify`.)
+pub fn verify(uuid: &str, passphrase: &[u8]) -> Result<bool> {
+    let out = run_with_stdin(
+        crate::util::system_cmd("diskutil").args([
+            "apfs",
+            "unlockVolume",
+            uuid,
+            "-verify",
+            "-stdinpassphrase",
+        ]),
+        passphrase,
+    )?;
+    Ok(out.status.success())
+}
+
+/// Replaces the passphrase.
+pub fn change_passphrase(uuid: &str, old: &[u8], new: &[u8]) -> Result<()> {
+    change(uuid, old, new)
+}
