@@ -22,6 +22,8 @@ bin=${SEALCTL_BIN:-$repo/target/debug/sealctl}
 if [ ! -x "$bin" ] || [ -z "${SEALCTL_BIN:-}" ]; then
     (cd "$repo" && cargo build -q -p sealctl)
 fi
+# an absolute path: the env file puts its folder on PATH and then changes directory
+bin=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
 
 tmp=$(mktemp -d /tmp/sealctl-pairtest.XXXXXX)
 home="$tmp/home"

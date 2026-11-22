@@ -154,7 +154,9 @@ pub fn mask_command(text: &str) -> String {
         )
         .expect("valid pattern")
     });
-    let mut out = pem.replace_all(text, "****").into_owned();
+    // The scratch copy holds the unmasked text while it is being masked: wipe it on drop, and
+    // return a separate copy of the masked result.
+    let mut out = zeroize::Zeroizing::new(pem.replace_all(text, "****").into_owned());
     for (kind, re) in patterns() {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for cap in re.captures_iter(&out) {
@@ -168,7 +170,7 @@ pub fn mask_command(text: &str) -> String {
             out.replace_range(a..b, "****");
         }
     }
-    out
+    out.as_str().to_owned()
 }
 
 /// Secret-looking strings in `text`. Known token formats always count; a generic

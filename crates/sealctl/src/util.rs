@@ -198,12 +198,19 @@ pub fn read_hidden(prompt: &str) -> Result<Zeroizing<String>> {
     eprint!("{prompt}");
     std::io::stderr().flush()?;
     let stdin = std::io::stdin();
-    let orig = tcgetattr(stdin.as_fd()).ok();
+    // Not a terminal (piped input): nothing to hide. Any other failure to turn echo off stops
+    // here, before anything is read, so a hidden prompt never reads with echo on.
+    let orig = match tcgetattr(stdin.as_fd()) {
+        Ok(o) => Some(o),
+        Err(nix::errno::Errno::ENOTTY) => None,
+        Err(e) => anyhow::bail!("cannot turn off echo on this terminal: {e}"),
+    };
     if let Some(o) = &orig {
         let mut t = o.clone();
         t.local_flags.remove(LocalFlags::ECHO);
         t.local_flags.insert(LocalFlags::ECHONL);
-        let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &t);
+        tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &t)
+            .map_err(|e| anyhow::anyhow!("cannot turn off echo on this terminal: {e}"))?;
     }
     let mut line = Zeroizing::new(String::new());
     let r = stdin.lock().read_line(&mut line);
