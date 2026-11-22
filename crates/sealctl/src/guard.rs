@@ -144,8 +144,17 @@ pub fn find_secret_values(text: &str) -> Vec<(&'static str, String)> {
 }
 
 /// `text` with every secret-looking substring replaced by `****` (commands shown on the phone).
+/// A PEM private key goes whole, from its BEGIN line through its END line (or to the end of
+/// the text when the END line is missing), not just its header.
 pub fn mask_command(text: &str) -> String {
-    let mut out = text.to_string();
+    static PEM: OnceLock<Regex> = OnceLock::new();
+    let pem = PEM.get_or_init(|| {
+        Regex::new(
+            r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?s:.*?)(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|\z)",
+        )
+        .expect("valid pattern")
+    });
+    let mut out = pem.replace_all(text, "****").into_owned();
     for (kind, re) in patterns() {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for cap in re.captures_iter(&out) {
@@ -356,6 +365,20 @@ mod tests {
             find_secrets("commit 5baf0dc2a7c4e1f9 and 0dc23bb, id fa5a93d5-28d9-4c08-b608-c2b6f344b4d8")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn private_keys_are_masked_whole() {
+        let body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2g";
+        let key = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\nQyNTUxOQ\n-----END OPENSSH PRIVATE KEY-----"
+        );
+        let m = mask_command(&format!("printf '%s' '{key}' | ssh-add -"));
+        assert_eq!(m, "printf '%s' '****' | ssh-add -");
+        // no END line: everything after BEGIN goes
+        let m = mask_command(&format!("echo '-----BEGIN RSA PRIVATE KEY-----\n{body}"));
+        assert_eq!(m, "echo '****");
+        assert!(!mask_command(&format!("x -----BEGIN PRIVATE KEY----- {body}")).contains(body));
     }
 
     #[test]
