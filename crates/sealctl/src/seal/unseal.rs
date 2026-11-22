@@ -842,24 +842,49 @@ impl Ctx<'_> {
     }
 
     /// The new password of an object's step, stored and journalled before the object changes.
-    /// A resumed step takes the one an earlier attempt stored instead of making another: that
-    /// attempt may have got as far as making it the only password that opens the object.
+    /// A resumed step takes the one an earlier attempt stored only when the object may hold it:
+    /// sealctl's key no longer opens the object, or the stored password already does. While
+    /// sealctl's key still opens an object that the stored password does not, nothing has
+    /// changed yet and a new password is made as on a first attempt, so a value read back
+    /// unchecked (a mistyped `show` passphrase) never becomes the object's passphrase.
+    /// `both`: the object can take a second passphrase beside sealctl's (LUKS slots, restic
+    /// keys); a sparse bundle or APFS volume cannot, so its stored password is not read back
+    /// while sealctl's key opens it.
     fn step_password(
         &mut self,
         step: &str,
         what: &str,
         item: &Item,
+        recall: Recall<'_>,
     ) -> Result<(Zeroizing<String>, Location)> {
         if let Some(note) = self.run.last_note(step, "password") {
             let loc: Location = serde_json::from_str(&note).context("the journal's password line")?;
-            let v = self.stores.read(&loc).with_context(|| {
-                format!(
-                    "reading the new password of {what} that an earlier attempt stored in {}",
-                    loc.describe()
-                )
-            })?;
-            let pw = Zeroizing::new(String::from_utf8(v.to_vec()).context("passwords are text")?);
-            return Ok((pw, loc));
+            if !recall.sealctl_opens || recall.both {
+                let v = self.stores.read(&loc).with_context(|| {
+                    format!(
+                        "reading the new password of {what} that an earlier attempt stored in {}",
+                        loc.describe()
+                    )
+                })?;
+                let pw = Zeroizing::new(String::from_utf8(v.to_vec()).context("passwords are text")?);
+                if (recall.opens)(pw.as_bytes())? {
+                    return Ok((pw, loc));
+                }
+                if !recall.sealctl_opens {
+                    return Err(fail(
+                        exit::ERROR,
+                        format!(
+                            "Neither sealctl's key nor the new password in {} opens {what}. \
+                             Nothing more is changed.",
+                            loc.describe()
+                        ),
+                    ));
+                }
+            }
+            eprintln!(
+                "sealctl's key still opens {what}, so the password an earlier attempt made was \
+                 not used. A new one replaces it."
+            );
         }
         let pw = self.new_password(what)?;
         let loc = self.put(self.plan.stores.to, item, pw.as_bytes())?;
@@ -877,6 +902,16 @@ impl Ctx<'_> {
         self.objects.push(obj);
         save_handback(self.run, &self.objects)
     }
+}
+
+/// What a resumed step knows about its object before it takes an earlier attempt's password.
+struct Recall<'a> {
+    /// sealctl's key opens the object now.
+    sealctl_opens: bool,
+    /// The object can hold another passphrase beside sealctl's.
+    both: bool,
+    /// Does this password open the object?
+    opens: &'a dyn Fn(&[u8]) -> Result<bool>,
 }
 
 fn save_handback(run: &Run, objects: &[hb::Object]) -> Result<()> {
@@ -967,6 +1002,11 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     // the new password and the credentials are saved before anything changes
     let step = format!("backup:{}", b.name);
     let pw_name = format!("{}/password", b.name);
+    let resumed = c.run.last_note(&step, "password").is_some();
+    let recall_opens = |p: &[u8]| -> Result<bool> {
+        let p = Zeroizing::new(String::from_utf8_lossy(p).into_owned());
+        Repo::with_password(&b.repo, p, env.clone()).opens()
+    };
     let (pw, loc) = c.step_password(
         &step,
         &format!("backup {}", b.name),
@@ -976,6 +1016,12 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             notes: format!("restic repository {}", b.repo),
             credential: false,
             var: None,
+        },
+        Recall {
+            // only a resumed step asks
+            sealctl_opens: !resumed || derived.opens()?,
+            both: true,
+            opens: &recall_opens,
         },
     )?;
     let mut creds = Vec::new();
@@ -1116,6 +1162,7 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         ),
     };
     let step = format!("volume:{}", v.name);
+    let resumed = c.run.last_note(&step, "password").is_some();
     let (pw, loc) = c.step_password(
         &step,
         &format!("volume {}", v.name),
@@ -1125,6 +1172,12 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             notes,
             credential: false,
             var: None,
+        },
+        Recall {
+            // only a resumed step asks
+            sealctl_opens: !resumed || opens(derived.as_bytes())?,
+            both: v.kind == Kind::Luks,
+            opens: &opens,
         },
     )?;
     if !opens(pw.as_bytes())? {

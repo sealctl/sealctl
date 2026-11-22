@@ -372,6 +372,102 @@ fn unseal_backup_resumed_after_the_key_change_keeps_the_new_password() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
+/// The passphrase shown by `unseal volume --to show` on the terminal (no controlling terminal
+/// for the run, so the `show` store writes to the pseudo-terminal it reads from).
+fn shown_passphrase(screen: &str, name: &str) -> String {
+    let head = format!("New passphrase for volume {name}: ");
+    let at = screen.rfind(&head).expect("a shown passphrase") + head.len();
+    screen[at..].split(['\r', '\n']).next().unwrap().to_string()
+}
+
+fn last4(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    c[c.len() - 4..].iter().collect()
+}
+
+/// `unseal volume --to show` killed (SIGKILL) right after its new passphrase is shown and
+/// journalled, before the bundle changes. sealctl's key still opens the bundle, so `--resume`
+/// never asks for that passphrase back (a mistyped one would become the bundle's): it shows a
+/// new one, and only that one opens the bundle at the end.
+#[cfg(all(target_os = "macos", feature = "test-hooks"))]
+#[test]
+fn unseal_volume_to_show_resumed_before_the_change_shows_a_new_passphrase() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    let mut env = Env::new();
+    env.pair();
+    let bundle = env.h().join("sv.sparsebundle");
+    let mnt = env.h().join("mnt/sv");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&[
+            "volume",
+            "create",
+            "sv",
+            "--kind",
+            "sparsebundle",
+            "--size",
+            "32m",
+            "--path",
+            bundle.to_str().unwrap(),
+            "--mountpoint",
+            mnt.to_str().unwrap(),
+        ])
+    });
+    assert_eq!(code, 0, "{err}");
+    let no_tty = |c: &mut Command| unsafe {
+        c.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    };
+
+    let mut c = env.cmd();
+    c.env("SEALCTL_TEST_KILL", "password:volume")
+        .args(["unseal", "volume", "sv", "--to", "show"]);
+    no_tty(&mut c);
+    let pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("y");
+    let screen = pty.expect("Type its last 4 characters", Duration::from_secs(120));
+    let first = shown_passphrase(&screen, "sv");
+    pty.line(&last4(&first));
+    let mut pty = pty;
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st;
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = pty.child.kill();
+            panic!("not killed; screen:\n{}", pty.screen.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.signal(), Some(9), "killed at the hook");
+    drop(phone);
+    assert!(!hdiutil_opens(&bundle, &first), "the bundle has not changed yet");
+
+    let mut c = env.cmd();
+    c.args(["unseal", "--resume"]);
+    no_tty(&mut c);
+    let pty = Pty::spawn(c);
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    let screen = pty.expect("Type its last 4 characters", Duration::from_secs(120));
+    assert!(!screen.contains("Type the passphrase you wrote down"), "{screen}");
+    assert!(screen.contains("A new one replaces it."), "{screen}");
+    let second = shown_passphrase(&screen, "sv");
+    assert_ne!(second, first);
+    pty.line(&last4(&second));
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    assert!(
+        hdiutil_opens(&bundle, &second),
+        "the passphrase shown last opens it"
+    );
+    assert!(!hdiutil_opens(&bundle, &first), "the first one does not");
+}
+
 /// A sparse bundle's id is on disk before its passphrase changes. A seal that stopped before
 /// the change leaves that marker on a bundle the user's passphrase still opens: sealing it
 /// again uses the same id instead of refusing it as sealed.
