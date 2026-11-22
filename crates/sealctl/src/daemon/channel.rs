@@ -13,12 +13,56 @@ use super::Daemon;
 use crate::approve;
 use crate::relay::{self, WaitEnd};
 
+/// How long the machine socket waits before the next upgrade.
+///
+/// Every reconnect waits, whatever ended the last socket; the wait doubles from 2 s up to
+/// 300 s and starts over only after a socket stayed open for a minute. A relay that accepts
+/// and drops at once (two daemons sharing a machine key evict each other's socket; a relay
+/// restart) therefore cannot make a reconnect every 2 s forever, each of which costs the
+/// phone's daily limit. Waits get ±20% jitter so that daemons do not reconnect in step, and
+/// a `429` is waited out for at least its `retryAfter` (staging incident 2026-11-22).
+#[derive(Debug, Clone)]
+pub struct Reconnect {
+    next: u64,
+}
+
+impl Default for Reconnect {
+    fn default() -> Self {
+        Reconnect { next: Self::FIRST }
+    }
+}
+
+impl Reconnect {
+    const FIRST: u64 = 2;
+    const MAX: u64 = 300;
+    /// A socket open at least this long resets the wait.
+    pub const STABLE: Duration = Duration::from_secs(60);
+
+    /// The wait after an attempt that ended: a failed upgrade (`open` = `None`) or a socket
+    /// that was open for `open`. `retry_after` is a `429`'s `retryAfter`. `jitter` is in
+    /// `0..1` (0.5 means none).
+    pub fn after(&mut self, open: Option<Duration>, retry_after: Option<u64>, jitter: f64) -> Duration {
+        if open.is_some_and(|o| o >= Self::STABLE) {
+            self.next = Self::FIRST;
+        }
+        let base = self.next.max(retry_after.unwrap_or(0).min(3600));
+        self.next = (self.next * 2).min(Self::MAX);
+        Duration::from_secs_f64(base as f64 * (0.8 + 0.4 * jitter.clamp(0.0, 1.0)))
+    }
+}
+
+fn jitter() -> f64 {
+    let mut b = [0u8; 2];
+    let _ = getrandom::fill(&mut b);
+    f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX)
+}
+
 /// Runs until the session locks (the task is aborted) or the relay says it has no channel.
 pub async fn run(d: Arc<Daemon>) {
     if let Err(e) = d.send_status(&[]).await {
         log::info!("status: {e:#}");
     }
-    let mut backoff = 2u64;
+    let mut wait = Reconnect::default();
     loop {
         let (keys_path, sock) = {
             let paired = d.paired.lock().await;
@@ -48,16 +92,18 @@ pub async fn run(d: Arc<Daemon>) {
                             d.lock("unpaired", true, false).await;
                             return;
                         }
-                        continue;
+                        // Still paired, yet refused: wait like any failure, never at once.
                     }
                 }
+                let retry_after = relay::refused(&e)
+                    .filter(|a| a.status == 429)
+                    .and_then(|a| a.body["retryAfter"].as_u64());
                 log::info!("machine socket {keys_path}: {e:#}");
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(300);
+                tokio::time::sleep(wait.after(None, retry_after, jitter())).await;
                 continue;
             }
         };
-        backoff = 2;
+        let opened = tokio::time::Instant::now();
         let mut ping = tokio::time::interval(Duration::from_secs(30));
         ping.tick().await;
         loop {
@@ -103,7 +149,7 @@ pub async fn run(d: Arc<Daemon>) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        tokio::time::sleep(wait.after(Some(opened.elapsed()), None, jitter())).await;
     }
 }
 
@@ -192,4 +238,46 @@ pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
         tokio::time::sleep_until(started + Duration::from_secs(60)).await;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reconnect;
+    use std::time::Duration;
+
+    const NONE: f64 = 0.5;
+
+    #[test]
+    fn a_socket_dropped_at_once_backs_off() {
+        // two daemons on one machine key evict each other: each socket lives a moment
+        let mut w = Reconnect::default();
+        let waits: Vec<u64> = (0..10)
+            .map(|_| w.after(Some(Duration::from_millis(200)), None, NONE).as_secs())
+            .collect();
+        assert_eq!(waits, [2, 4, 8, 16, 32, 64, 128, 256, 300, 300]);
+    }
+
+    #[test]
+    fn a_stable_socket_starts_over() {
+        let mut w = Reconnect::default();
+        for _ in 0..5 {
+            w.after(None, None, NONE);
+        }
+        assert_eq!(
+            w.after(Some(Reconnect::STABLE), None, NONE),
+            Duration::from_secs(2)
+        );
+        assert_eq!(w.after(None, None, NONE), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_429_is_waited_out_and_jitter_stays_within_20_percent() {
+        let mut w = Reconnect::default();
+        assert_eq!(w.after(None, Some(60), NONE), Duration::from_secs(60));
+        assert_eq!(w.after(None, Some(86_400), NONE), Duration::from_secs(3600));
+        let mut w = Reconnect::default();
+        assert_eq!(w.after(None, None, 0.0), Duration::from_secs_f64(1.6));
+        let mut w = Reconnect::default();
+        assert_eq!(w.after(None, None, 1.0), Duration::from_secs_f64(2.4));
+    }
 }

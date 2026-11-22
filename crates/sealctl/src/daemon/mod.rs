@@ -1088,6 +1088,11 @@ impl Daemon {
         if open && status_due && !self.inproc {
             if let Err(e) = self.send_status(&[]).await {
                 log::info!("status: {e:#}");
+                // A failed status (refused, rate limited, relay down) is tried again in a
+                // minute, not on every 15 s tick.
+                let mut st = self.st();
+                st.last_status = now();
+                st.status_dirty = true;
             }
         }
     }

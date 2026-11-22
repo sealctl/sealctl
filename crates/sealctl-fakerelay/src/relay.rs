@@ -96,6 +96,10 @@ pub struct App {
     opts: Arc<Mutex<Options>>,
     /// The next N signed calls from machines answer `429` (scope `network`, retry after 1 s).
     limited: Arc<std::sync::atomic::AtomicU32>,
+    /// Every signed call from a phone answers `429` scope `phone` (the daily limit).
+    phone_over_daily: Arc<std::sync::atomic::AtomicBool>,
+    /// Signed calls from phones, counted (to check clients do not hammer the relay).
+    phone_calls: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn now_ms() -> u64 {
@@ -131,6 +135,8 @@ impl FakeRelay {
             inner: Arc::new(Mutex::new(Inner::default())),
             opts: Arc::new(Mutex::new(opts)),
             limited: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            phone_over_daily: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            phone_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let a2 = app.clone();
@@ -184,6 +190,19 @@ impl FakeRelay {
     /// The next `n` signed calls from machines answer `429` with scope `network`.
     pub fn rate_limit(&self, n: u32) {
         self.app.limited.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `on`, every signed call from a phone answers `429` with scope `phone` (the
+    /// daily limit, retry after the next UTC midnight).
+    pub fn phone_over_daily_limit(&self, on: bool) {
+        self.app
+            .phone_over_daily
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Signed calls from phones so far.
+    pub fn phone_calls(&self) -> u64 {
+        self.app.phone_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Sets days used for a phone (for the ask).
@@ -348,6 +367,18 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         }
     }
     let is_phone = matches!(role, Role::Phone);
+    if is_phone {
+        app.phone_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if app.phone_over_daily.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut r = ok(
+                429,
+                json!({"error": "rate_limited", "retryAfter": 3600, "scope": "phone"}),
+            );
+            r.headers_mut()
+                .insert("retry-after", axum::http::HeaderValue::from_static("3600"));
+            return r;
+        }
+    }
 
     match (m.clone(), rest.as_slice()) {
         (Method::POST, ["machines"]) if is_phone => {
