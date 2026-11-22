@@ -1271,6 +1271,14 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     Ok("your passphrase works; sealctl's is removed.".into())
 }
 
+/// `<key file>.pub`: the name gets `.pub` added, so `work.laptop` has `work.laptop.pub`, never
+/// another key's `work.pub`.
+fn pub_of(key: &Path) -> PathBuf {
+    let mut p = key.as_os_str().to_owned();
+    p.push(".pub");
+    PathBuf::from(p)
+}
+
 fn step_ssh(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     let store = Store::configured()?;
     let v = read_secret(c, &store, &format!("ssh/{name}"))?;
@@ -1320,7 +1328,7 @@ fn step_ssh(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     };
     paths::write_private(&dest, text.as_bytes())?;
     paths::write_mode(
-        &dest.with_extension("pub"),
+        &pub_of(&dest),
         format!("{}\n", key.public_key().to_openssh()?).as_bytes(),
         0o644,
     )?;
@@ -1917,4 +1925,22 @@ pub fn newest_run() -> Option<PathBuf> {
         .collect();
     runs.sort();
     runs.pop()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pub_of;
+    use std::path::Path;
+
+    #[test]
+    fn a_dotted_key_name_keeps_its_own_public_file() {
+        assert_eq!(
+            pub_of(Path::new("/h/.ssh/work.laptop")),
+            Path::new("/h/.ssh/work.laptop.pub")
+        );
+        assert_eq!(
+            pub_of(Path::new("/h/.ssh/ed25519-2")),
+            Path::new("/h/.ssh/ed25519-2.pub")
+        );
+    }
 }
