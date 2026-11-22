@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use sealctl_core::RequestKind;
 use sealctl_fakerelay::{Answer, FakeRelay, Machine, Options, Phone};
@@ -376,6 +376,8 @@ pub struct PhoneThread {
     pub report_seen: Arc<AtomicBool>,
     /// Reports are answered only once this is set.
     pub report_release: Arc<AtomicBool>,
+    /// `unseal` requests that asked for the number match.
+    pub numbers: Arc<AtomicUsize>,
 }
 
 impl PhoneThread {
@@ -402,6 +404,8 @@ impl PhoneThread {
         let report_release = Arc::new(AtomicBool::new(release_reports));
         let (s2, k2) = (stop.clone(), kinds.clone());
         let (seen2, rel2) = (report_seen.clone(), report_release.clone());
+        let numbers = Arc::new(AtomicUsize::new(0));
+        let n2 = numbers.clone();
         let h = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -418,6 +422,7 @@ impl PhoneThread {
                     match req.kind() {
                         RequestKind::Unseal => {
                             let p = if req.has_match() {
+                                n2.fetch_add(1, Ordering::SeqCst);
                                 let shown = loop {
                                     if let Some(n) = number_on(&screen.lock().unwrap()) {
                                         break n;
@@ -455,6 +460,7 @@ impl PhoneThread {
             kinds,
             report_seen,
             report_release,
+            numbers,
         }
     }
 
