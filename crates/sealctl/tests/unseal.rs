@@ -229,3 +229,43 @@ fn unseal_is_refused_inside_an_agent_and_without_a_terminal() {
     assert_eq!(o.status.code(), Some(8));
     assert!(String::from_utf8_lossy(&o.stderr).contains("Not inside an AI agent"));
 }
+
+#[test]
+fn resume_after_a_kill_uses_the_same_approval() {
+    let (env, value) = setup();
+    let mut c = env.cmd();
+    c.args(["unseal", "--all"]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Type unseal to start:", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("unseal");
+    pty.expect("[1/", Duration::from_secs(60));
+    // power cut after the first step
+    pty.child.kill().unwrap();
+    let _ = pty.child.wait();
+    let run = unseal_run_dir(&env);
+    assert!(!run.join("done").exists());
+    let mut c = env.cmd();
+    c.args(["unseal", "--resume"]);
+    let pty = Pty::spawn(c);
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    assert!(screen.contains("Resuming the run in"), "{screen}");
+    assert!(
+        !screen.contains("pick "),
+        "no new number within 30 minutes of the approval: {screen}"
+    );
+    assert!(run.join("done").exists());
+    let env_file = std::fs::read_to_string(run.join("secrets.env")).unwrap();
+    assert_eq!(
+        env_file.matches(&value).count(),
+        1,
+        "the secret step was not repeated"
+    );
+    assert!(
+        phone.kinds().iter().filter(|k| *k == "Unseal").count() >= 2,
+        "{:?}",
+        phone.kinds()
+    );
+    assert!(!env.h().join(".config/sealctl").exists());
+}
