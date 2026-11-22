@@ -1122,6 +1122,8 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
                     derived.as_bytes(),
                 )?;
                 util::check(out, "cryptsetup luksRemoveKey")?;
+                // the words marker goes with sealctl's key slot (SPEC 18.2)
+                volume::luks::remove_tokens(path.as_ref().context("path")?);
             }
         }
     }

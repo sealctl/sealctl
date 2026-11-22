@@ -245,24 +245,139 @@ fn users_gid() -> String {
 }
 
 /// The words marker while locked: a LUKS2 token of type `sealctl` (best effort: needs sudo).
+/// `cryptsetup token import` alone adds a token, so the existing `sealctl` token is replaced in
+/// place (`--token-id N --token-replace`) and any others of that type are removed: after a
+/// rewrap the header holds the new words and check only, and repeated rewraps use no more of
+/// the header's token slots.
 pub fn import_token(v: &Volume, id: &sealctl_core::ids::IdFile) -> Result<()> {
     let Some(path) = v.path.as_ref() else {
         return Ok(());
     };
     let mut token = serde_json::to_value(id)?;
-    token["type"] = "sealctl".into();
+    token["type"] = TOKEN_TYPE.into();
     token["keyslots"] = serde_json::json!([]);
-    let out = run_with_stdin(
-        sudo()
-            .args(["cryptsetup", "token", "import", "--json-file=-"])
-            .arg(path),
-        token.to_string().as_bytes(),
-    );
-    match out {
-        Ok(o) if o.status.success() => {}
-        _ => log::info!("could not import the sealctl LUKS token into {}", path.display()),
+    let json = token.to_string();
+    let existing = match sealctl_tokens(path) {
+        Ok(ids) => ids,
+        Err(e) => {
+            // without knowing the tokens an import could add a second one: leave the header
+            log::info!("could not read the LUKS tokens of {}: {e:#}", path.display());
+            return Ok(());
+        }
+    };
+    let import = |extra: &[&str]| {
+        run_with_stdin(
+            sudo()
+                .args(["cryptsetup", "token", "import", "--json-file=-"])
+                .args(extra)
+                .arg(path),
+            json.as_bytes(),
+        )
+        .is_ok_and(|o| o.status.success())
+    };
+    let done = match existing.first() {
+        None => import(&[]),
+        Some(id) => {
+            let id = id.to_string();
+            // cryptsetup 2.4 and later replace in place; before that, remove and import
+            import(&["--token-id", &id, "--token-replace"])
+                || (remove_token(path, &id) && import(&["--token-id", &id]))
+        }
+    };
+    if !done {
+        log::info!("could not import the sealctl LUKS token into {}", path.display());
+    }
+    for id in existing.iter().skip(1) {
+        remove_token(path, &id.to_string());
     }
     Ok(())
+}
+
+/// Removes every `sealctl` token from the LUKS header (`unseal`; best effort).
+pub fn remove_tokens(path: &Path) {
+    match sealctl_tokens(path) {
+        Ok(ids) => {
+            for id in ids {
+                remove_token(path, &id.to_string());
+            }
+        }
+        Err(e) => log::info!("could not read the LUKS tokens of {}: {e:#}", path.display()),
+    }
+}
+
+const TOKEN_TYPE: &str = "sealctl";
+
+fn remove_token(path: &Path, id: &str) -> bool {
+    sudo()
+        .args(["cryptsetup", "token", "remove", "--token-id", id])
+        .arg(path)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// The ids of the LUKS2 tokens of type `sealctl`, lowest first.
+fn sealctl_tokens(path: &Path) -> Result<Vec<u32>> {
+    let out = sudo()
+        .args(["cryptsetup", "luksDump", "--dump-json-metadata"])
+        .arg(path)
+        .output()
+        .context("running cryptsetup")?;
+    if out.status.success() {
+        if let Some(ids) = tokens_in_json(&out.stdout) {
+            return Ok(ids);
+        }
+    }
+    // before cryptsetup 2.4: the text dump
+    let out = sudo()
+        .args(["cryptsetup", "luksDump"])
+        .arg(path)
+        .output()
+        .context("running cryptsetup")?;
+    if !out.status.success() {
+        bail!(
+            "cryptsetup luksDump: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(tokens_in_text(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `luksDump --dump-json-metadata`: `{"tokens": {"0": {"type": "sealctl", …}}, …}`.
+fn tokens_in_json(out: &[u8]) -> Option<Vec<u32>> {
+    let v: serde_json::Value = serde_json::from_slice(out).ok()?;
+    let mut ids: Vec<u32> = v
+        .get("tokens")?
+        .as_object()?
+        .iter()
+        .filter(|(_, t)| t["type"] == TOKEN_TYPE)
+        .filter_map(|(id, _)| id.parse().ok())
+        .collect();
+    ids.sort_unstable();
+    Some(ids)
+}
+
+/// `luksDump` text: a `Tokens:` section with lines `  <id>: <type>`.
+fn tokens_in_text(out: &str) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut in_tokens = false;
+    for line in out.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            in_tokens = line.trim_end() == "Tokens:";
+            continue;
+        }
+        if !in_tokens {
+            continue;
+        }
+        if let Some((id, kind)) = line.trim().split_once(':') {
+            if kind.trim() == TOKEN_TYPE {
+                if let Ok(id) = id.trim().parse() {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids
 }
 
 /// Does `passphrase` open the LUKS file? (`cryptsetup open --test-passphrase`.)
@@ -278,6 +393,75 @@ pub fn verify(path: &Path, passphrase: &[u8]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sealctl_tokens_are_found_in_either_dump() {
+        let json = br#"{"keyslots":{},"tokens":{"0":{"type":"systemd-tpm2","keyslots":["0"]},"1":{"type":"sealctl","keyslots":[]},"3":{"type":"sealctl","keyslots":[]}},"segments":{}}"#;
+        assert_eq!(super::tokens_in_json(json), Some(vec![1, 3]));
+        assert_eq!(super::tokens_in_json(br#"{"tokens":{}}"#), Some(vec![]));
+        assert_eq!(super::tokens_in_json(b"not json"), None);
+        let text = "LUKS header information\nVersion:       \t2\n\nKeyslots:\n  0: luks2\n\tKey:        512 bits\nTokens:\n  0: systemd-tpm2\n\tKeyslot:    0\n  2: sealctl\n  5: sealctl\nDigests:\n  0: pbkdf2\n";
+        assert_eq!(super::tokens_in_text(text), vec![2, 5]);
+        assert_eq!(
+            super::tokens_in_text("Tokens:\nDigests:\n  0: pbkdf2\n"),
+            Vec::<u32>::new()
+        );
+    }
+
+    /// Linux with cryptsetup and password-less sudo (CI): a rewrap writes the token again and
+    /// the header still holds one `sealctl` token, with the new words.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rewrap_replaces_the_token() {
+        use std::process::Command;
+        let have = |c: &str, a: &[&str]| Command::new(c).args(a).output().is_ok_and(|o| o.status.success());
+        if !have("cryptsetup", &["--version"]) || !have("sudo", &["-n", "true"]) {
+            eprintln!("skipped: needs cryptsetup and password-less sudo");
+            return;
+        }
+        std::env::set_var("SEALCTL_SUDO_NONINTERACTIVE", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.luks");
+        std::fs::File::create(&file).unwrap().set_len(32 << 20).unwrap();
+        let out = crate::util::run_with_stdin(
+            Command::new("cryptsetup")
+                .args(["luksFormat", "--type", "luks2", "--batch-mode", "--key-file=-"])
+                .args(["--pbkdf", "pbkdf2", "--pbkdf-force-iterations", "1000"])
+                .arg(&file),
+            b"pass",
+        )
+        .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut v = super::Volume {
+            name: "t".into(),
+            kind: super::super::Kind::Luks,
+            path: Some(file.clone()),
+            id: "00000000-0000-4000-8000-000000000000".into(),
+            words: "old-words".into(),
+            check: "old-check".into(),
+            mountpoint: dir.path().join("mnt"),
+            manual: true,
+        };
+        super::import_token(&v, &v.id_file()).unwrap();
+        for round in 0..3 {
+            v.words = format!("new-words-{round}");
+            v.check = format!("new-check-{round}");
+            super::import_token(&v, &v.id_file()).unwrap();
+            let ids = super::sealctl_tokens(&file).unwrap();
+            assert_eq!(ids.len(), 1, "round {round}: {ids:?}");
+            let dump = Command::new("sudo")
+                .args(["-n", "cryptsetup", "token", "export", "--token-id"])
+                .arg(ids[0].to_string())
+                .arg(&file)
+                .output()
+                .unwrap();
+            let t: serde_json::Value = serde_json::from_slice(&dump.stdout).unwrap();
+            assert_eq!(t["words"], v.words.as_str());
+            assert_eq!(t["check"], v.check.as_str());
+        }
+        super::remove_tokens(&file);
+        assert!(super::sealctl_tokens(&file).unwrap().is_empty());
+    }
+
     #[test]
     fn mount_paths_are_unescaped() {
         assert_eq!(super::unescape_mount("/home/u/My\\040Vault"), "/home/u/My Vault");
