@@ -120,29 +120,24 @@ fn scan_env_file(file: &Path, out: &mut Vec<Finding>) {
         return;
     };
     let text = Zeroizing::new(text);
-    let Ok(vars) = crate::dotenv::parse_dotenv(&text) else {
+    let Ok(entries) = crate::dotenv::entries(&text) else {
         return;
     };
     let dir = file.parent().unwrap_or(Path::new("."));
     let prefix = project_name(dir);
-    for (var, value) in vars.iter() {
-        if value.is_empty() {
+    // the last assignment of a name is the one in effect
+    let last: BTreeMap<&str, &crate::dotenv::Entry> = entries.iter().map(|e| (e.key.as_str(), e)).collect();
+    for (var, e) in last {
+        if e.value.is_empty() {
             continue;
         }
-        let line = text
-            .lines()
-            .position(|l| {
-                let t = l.trim_start().trim_start_matches("export ").trim_start();
-                t.starts_with(&format!("{var}=")) || t.starts_with(&format!("{var} ="))
-            })
-            .map_or(0, |i| i + 1);
         out.push(Finding {
             file: file.to_path_buf(),
-            line,
+            line: e.line,
             kind: "env file",
-            source: var.clone(),
+            source: var.to_string(),
             name: Some(format!("{prefix}/{}", dashed(var))),
-            value: value.clone(),
+            value: e.value.clone(),
         });
     }
 }
@@ -372,20 +367,32 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
                     }
                 }
                 std::fs::write(&pfile, toml::to_string_pretty(&p)?)?;
-                let vars: Vec<&str> = fs.iter().map(|f| f.source.as_str()).collect();
-                let kept: String = text
-                    .lines()
-                    .filter(|l| {
-                        let t = l.trim_start().trim_start_matches("export ").trim_start();
-                        !vars
-                            .iter()
-                            .any(|v| t.starts_with(&format!("{v}=")) || t.starts_with(&format!("{v} =")))
-                    })
-                    .map(|l| format!("{l}\n"))
+                // the assignments of the sealed names, found by the parser (any line ending,
+                // quoted values over several lines), removed byte for byte. A name goes only if
+                // the value in effect (its last assignment) is still the one stored; then its
+                // earlier assignments go too, so none of them takes effect instead
+                let entries = crate::dotenv::entries(&text).map_err(|e| {
+                    fail(
+                        exit::ERROR,
+                        format!("{}: {e}. It was left as it is.", file.display()),
+                    )
+                })?;
+                let last: BTreeMap<&str, &crate::dotenv::Entry> =
+                    entries.iter().map(|e| (e.key.as_str(), e)).collect();
+                let gone: Vec<&str> = fs
+                    .iter()
+                    .filter(|f| last.get(f.source.as_str()).is_some_and(|e| *e.value == *f.value))
+                    .map(|f| f.source.as_str())
                     .collect();
-                if kept
-                    .lines()
-                    .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
+                let remove: Vec<&crate::dotenv::Entry> = entries
+                    .iter()
+                    .filter(|e| gone.contains(&e.key.as_str()))
+                    .collect();
+                let kept = crate::dotenv::without(&text, &remove);
+                if crate::dotenv::entries(&kept).is_ok_and(|e| e.is_empty())
+                    && kept
+                        .split(['\n', '\r'])
+                        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
                 {
                     std::fs::remove_file(&file)
                         .map_err(|e| anyhow::anyhow!("removing {}: {e}", file.display()))?;

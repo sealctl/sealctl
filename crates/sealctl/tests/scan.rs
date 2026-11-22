@@ -124,3 +124,33 @@ fn the_same_value_twice_is_one_secret() {
     let tb = std::fs::read_to_string(env.h().join("b/.sealctl.toml")).unwrap();
     assert!(tb.contains("SERVICE_TOKEN = \"a/service-token\""), "{tb}");
 }
+
+/// A `.env` file with CR-only and mixed line endings and a quoted value over several lines: every
+/// assignment is found, only the sealed ones are removed, and the rest stays byte for byte.
+#[test]
+fn env_files_with_any_line_ending_lose_only_what_was_sealed() {
+    let mut env = Env::new();
+    env.pair();
+    let a = format!("Ab1{}", random_alnum(30));
+    let b = format!("Bc2{}", random_alnum(30));
+    let dir = env.h().join("cr");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = format!("# keep me\rFIRST_KEY={a}\r\nPEM_KEY=\"line one\r\n{b}\rline three\"\rEMPTY_KEY=\r\n");
+    std::fs::write(dir.join(".env"), &text).unwrap();
+    let (code, out, err) = env.run(&["scan", dir.to_str().unwrap(), "--dry-run"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("FIRST_KEY") && out.contains("PEM_KEY"), "{out}");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&["scan", dir.to_str().unwrap(), "--yes"])
+    });
+    assert_eq!(code, 0, "{err}");
+    let (_, list, _) = env.run(&["secret", "ls"]);
+    for n in ["cr/first-key", "cr/pem-key"] {
+        assert!(list.lines().any(|l| l == n), "{n} in {list}");
+    }
+    let (_, pem, _) = env.run(&["secret", "get", "cr/pem-key"]);
+    assert_eq!(pem, format!("line one\r\n{b}\rline three"));
+    // the empty variable and the comment are what is left, with their own line endings
+    let kept = std::fs::read_to_string(dir.join(".env")).unwrap();
+    assert_eq!(kept, "# keep me\rEMPTY_KEY=\r\n");
+}

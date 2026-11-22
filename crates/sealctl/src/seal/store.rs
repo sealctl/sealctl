@@ -639,6 +639,14 @@ pub fn dotenv_quote(v: &str) -> Zeroizing<String> {
     s
 }
 
+/// `KEY="value"\n` onto `text`, with no other copy of the value.
+fn push_assignment(text: &mut String, key: &str, value: &str) {
+    text.push_str(key);
+    text.push('=');
+    text.push_str(&dotenv_quote(value));
+    text.push('\n');
+}
+
 /// Set `var` in the dotenv `file` (0600), replacing an earlier line of the same variable.
 fn env_upsert(file: &Path, var: &str, value: &[u8]) -> Result<()> {
     let value = std::str::from_utf8(value).context("values in a .env file are text")?;
@@ -654,22 +662,24 @@ fn env_upsert(file: &Path, var: &str, value: &[u8]) -> Result<()> {
     }
     if existing.contains_key(var) {
         // rewrite the file from its parsed form (comments kept only at the top)
-        let header: String = old
-            .lines()
+        // (lines end at `\n`, `\r\n` or `\r`, as the parser reads them)
+        for l in old
+            .split_inclusive(['\n', '\r'])
             .take_while(|l| l.starts_with('#'))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        text.push_str(&header);
+        {
+            text.push_str(l.trim_end_matches(['\n', '\r']));
+            text.push('\n');
+        }
         for (k, v) in existing.iter() {
             let v = if k == var { value } else { v.as_str() };
-            text.push_str(&format!("{k}={}\n", dotenv_quote(v).as_str()));
+            push_assignment(&mut text, k, v);
         }
     } else {
         text.push_str(&old);
-        if !text.is_empty() && !text.ends_with('\n') {
+        if !text.is_empty() && !text.ends_with(['\n', '\r']) {
             text.push('\n');
         }
-        text.push_str(&format!("{var}={}\n", dotenv_quote(value).as_str()));
+        push_assignment(&mut text, var, value);
     }
     crate::paths::write_private(file, text.as_bytes())
 }
@@ -791,7 +801,7 @@ pub mod folder {
     use anyhow::{bail, Context, Result};
     use zeroize::Zeroizing;
 
-    use super::{dotenv_quote, env_var_name, Item, Location, StoreKind};
+    use super::{env_var_name, Item, Location, StoreKind};
 
     pub const PASSWORDS: &str = "passwords.txt";
     pub const SECRETS: &str = "secrets.env";
@@ -945,7 +955,7 @@ pub mod folder {
             .filter_map(|k| map.get_key_value(*k))
             .chain(map.iter().filter(|(k, _)| !first.contains(&k.as_str())));
         for (k, v) in ordered {
-            text.push_str(&format!("{k}={}\n", dotenv_quote(v).as_str()));
+            super::push_assignment(&mut text, k, v);
         }
         text
     }

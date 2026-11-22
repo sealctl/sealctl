@@ -14,10 +14,33 @@ use zeroize::Zeroizing;
 /// The text is copied once into a character buffer that is wiped when parsing ends, and each
 /// value is built in a buffer sized up front, so no unwiped copy of a value is left behind.
 pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
+    // a later assignment of the same name wins, as in dotenv libraries and `sh`
+    Ok(entries(text)?.into_iter().map(|e| (e.key, e.value)).collect())
+}
+
+/// One `KEY=value` assignment of a dotenv file.
+pub struct Entry {
+    pub key: String,
+    pub value: Zeroizing<String>,
+    /// The line it starts on, from 1.
+    pub line: usize,
+    /// Its bytes in the text: from the start of its line through its line ending (a quoted value
+    /// may span several lines), so removing them removes the assignment and nothing else.
+    pub span: std::ops::Range<usize>,
+}
+
+/// The assignments of a dotenv file in order, with where each one is (see [`parse_dotenv`]).
+pub fn entries(text: &str) -> Result<Vec<Entry>> {
     let chars: Zeroizing<Vec<char>> = Zeroizing::new(text.chars().collect());
     let chars: &[char] = &chars;
     let n = chars.len();
-    let mut out = BTreeMap::new();
+    // byte offset of each character (and of the end)
+    let offset: Vec<usize> = text
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let mut out = Vec::new();
     let mut i = 0;
     let mut line = 1;
     let is_eol = |c: char| c == '\n' || c == '\r';
@@ -45,6 +68,7 @@ pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
     };
     let bytes = |s: &[char]| s.iter().map(|c| c.len_utf8()).sum::<usize>();
     while i < n {
+        let line_start = i;
         skip_ws(&mut i);
         if i >= n {
             break;
@@ -157,9 +181,30 @@ pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
         if i < n && !eol(&mut i, &mut line) {
             bail!("line {line}: {key}: unexpected text after the closing quote");
         }
-        out.insert(key, val);
+        out.push(Entry {
+            key,
+            value: val,
+            line: start_line,
+            span: offset[line_start]..offset[i],
+        });
     }
     Ok(out)
+}
+
+/// `text` without the given assignments, byte for byte otherwise (line endings included).
+pub fn without(text: &str, remove: &[&Entry]) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(text.len()));
+    let mut at = 0;
+    let mut spans: Vec<&std::ops::Range<usize>> = remove.iter().map(|e| &e.span).collect();
+    spans.sort_by_key(|r| r.start);
+    for r in spans {
+        if r.start >= at {
+            out.push_str(&text[at..r.start]);
+            at = r.end;
+        }
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 #[cfg(test)]
@@ -243,5 +288,22 @@ mod tests {
         let m = parse_dotenv("A=\"x\\\\\"\rB=\"\\\"q\\\"\"\r").unwrap();
         assert_eq!(m["A"].as_str(), "x\\");
         assert_eq!(m["B"].as_str(), "\"q\"");
+    }
+
+    #[test]
+    fn spans_remove_exactly_one_assignment() {
+        let text = "# head\r\nA=1\rexport B=\"x\r\ny\" # c\r\nC=3\n  D=4";
+        let es = entries(text).unwrap();
+        let keys: Vec<_> = es.iter().map(|e| (e.key.as_str(), e.line)).collect();
+        assert_eq!(keys, [("A", 2), ("B", 3), ("C", 5), ("D", 6)]);
+        let b = es.iter().find(|e| e.key == "B").unwrap();
+        assert_eq!(&text[b.span.clone()], "export B=\"x\r\ny\" # c\r\n");
+        let d = es.iter().find(|e| e.key == "D").unwrap();
+        assert_eq!(&text[d.span.clone()], "  D=4");
+        let kept = without(text, &[b, d]);
+        assert_eq!(kept.as_str(), "# head\r\nA=1\rC=3\n");
+        let m = parse_dotenv(&kept).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["C"].as_str(), "3");
     }
 }
