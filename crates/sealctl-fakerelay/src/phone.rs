@@ -355,6 +355,37 @@ impl Phone {
         self.post_reply(&r.id, sealed, None).await.map(|_| ())
     }
 
+    /// New words: registers `m` under this phone's key with a move proof signed by `old`
+    /// (protocol.md, Phone key change); the relay drops the old pairing.
+    pub async fn move_from(&self, old: &Phone, m: &Machine) -> Result<()> {
+        let proof = sealctl_core::key_change_proof(&old.keys, &self.keys, m.key.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let body = json!({"machine": m.key, "name": m.name, "proof": proof});
+        let (s, v) = self
+            .call("POST", &format!("/v1/phones/{}/machines", self.id()), Some(body))
+            .await?;
+        if s != 200 && s != 201 {
+            bail!("move answered {s}: {v}");
+        }
+        self.machines.lock().unwrap().push(m.clone());
+        Ok(())
+    }
+
+    /// Answers `rewrap` with the old and new key of every item (`old`: the phone of the words
+    /// before).
+    pub async fn answer_rewrap(&self, r: &Incoming, req: &Request, old: &Phone) -> Result<()> {
+        let sealed = sealctl_core::seal_rewrap_reply(&old.root, &self.root, &self.keys, req)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.post_reply(&r.id, sealed, None).await.map(|_| ())
+    }
+
+    /// Answers `old_words` as if the person typed the words of `old`.
+    pub async fn answer_old_words(&self, r: &Incoming, req: &Request, old: &Phone) -> Result<()> {
+        let sealed = sealctl_core::seal_old_words_reply(&old.root, &self.root, &self.keys, req)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.post_reply(&r.id, sealed, None).await.map(|_| ())
+    }
+
     /// Sends a machine message (`lock`, `answers`, `notice`).
     pub async fn send_message(&self, m: &Machine, kind: MessageKind) -> Result<bool> {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;

@@ -18,6 +18,7 @@ pub mod guard;
 pub mod legacy;
 pub mod licence;
 pub mod machine;
+pub mod migrate;
 pub mod pair;
 pub mod paths;
 pub mod project;

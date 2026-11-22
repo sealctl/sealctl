@@ -162,6 +162,10 @@ pub async fn look_up(relay: &Relay, paired: &mut Paired) -> Result<bool> {
     paired.phone = PhonePublic::from_b64u(phone, &x_b64).map_err(|e| anyhow::anyhow!("{e}"))?;
     paired.file.save()?;
     log::info!("moved to the new phone key");
+    if crate::daemon::IN_DAEMON.load(std::sync::atomic::Ordering::SeqCst) {
+        // the daemon has no terminal: its objects move to the new words by themselves
+        crate::migrate::rewrap_in_background();
+    }
     Ok(true)
 }
 
@@ -354,7 +358,8 @@ pub struct Delayed {
 }
 
 impl Delayed {
-    fn from_json(v: &Value) -> Delayed {
+    /// From a relay answer (one item of `GET .../delayed`, or `GET .../delayed/{id}`).
+    pub fn from_json(v: &Value) -> Delayed {
         let by = v["cancelled"]["by"]
             .as_str()
             .or_else(|| v["by"].as_str())

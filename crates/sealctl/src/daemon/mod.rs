@@ -32,6 +32,9 @@ use session::Saved;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// Set in the daemon process (the rewrap after a phone key change starts from there).
+pub static IN_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The CLI version every socket request carries.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1233,6 +1236,7 @@ async fn serve_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) {
 /// `sealctl daemon [--spawned]`: serves the session until stopped.
 pub fn run(spawned: bool) -> Result<()> {
     harden();
+    IN_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

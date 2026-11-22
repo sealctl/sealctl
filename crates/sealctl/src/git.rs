@@ -142,6 +142,25 @@ pub fn credentials(host: &str, undo: bool) -> Result<()> {
     Ok(())
 }
 
+/// `host=` of the git credential helper protocol input (empty when missing or unusable).
+pub fn credential_host(input: &str) -> String {
+    let h = input
+        .lines()
+        .find_map(|l| l.strip_prefix("host="))
+        .map(str::trim)
+        .unwrap_or("");
+    // a host name, with an optional port: never a path into the store
+    if h.is_empty()
+        || h.len() > 253
+        || !h
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+    {
+        return String::new();
+    }
+    h.to_string()
+}
+
 /// The git credential helper protocol: `get` prints `username=` and `password=` for
 /// `host=` from the secret `git/<host>` (a token, or `user` and token on two lines).
 pub fn credential(action: &str) -> Result<()> {
@@ -153,12 +172,7 @@ pub fn credential(action: &str) -> Result<()> {
     }
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-    let host = input
-        .lines()
-        .find_map(|l| l.strip_prefix("host="))
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
+    let host = credential_host(&input);
     if host.is_empty() {
         return Ok(());
     }

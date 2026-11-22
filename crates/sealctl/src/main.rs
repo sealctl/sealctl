@@ -138,6 +138,34 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Move objects to new words (rewrap, old words) or re-encrypt them under new keys.
+    Migrate {
+        /// The re-encryption job: per object, state and notes.
+        #[arg(long)]
+        status: bool,
+        /// Find objects by their markers (default: home and /Volumes).
+        #[arg(long, num_args = 0..)]
+        scan: Option<Vec<PathBuf>>,
+        /// rewrap: same data key, new words; re-encrypt: new keys and a copy of the data.
+        #[arg(long, default_value = "re-encrypt", value_parser = ["rewrap", "re-encrypt"])]
+        depth: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, conflicts_with_all = ["resume", "cancel"])]
+        pause: bool,
+        #[arg(long, conflicts_with = "cancel")]
+        resume: bool,
+        #[arg(long)]
+        cancel: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, hide = true)]
+        run_job: bool,
+        #[arg(long, hide = true)]
+        foreground: bool,
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
     /// Objects this machine knows.
     Inventory {
         #[arg(long)]
@@ -757,6 +785,41 @@ fn run(cli: Cli) -> Result<i32> {
             yes,
             json,
         } => sealctl::scan::run(paths, home, dry_run, yes, json).map(|_| 0),
+        Cmd::Migrate {
+            status,
+            scan,
+            depth,
+            yes,
+            pause,
+            resume,
+            cancel,
+            json,
+            run_job,
+            foreground,
+            auto,
+        } => {
+            let control = if pause {
+                Some("pause".to_string())
+            } else if resume {
+                Some("resume".into())
+            } else if cancel {
+                Some("cancel".into())
+            } else {
+                None
+            };
+            sealctl::migrate::run(sealctl::migrate::Opts {
+                status,
+                scan,
+                depth,
+                yes,
+                control,
+                json,
+                run_job,
+                foreground,
+                auto,
+            })
+            .map(|_| 0)
+        }
         Cmd::Inventory { json } => status::inventory(json).map(|_| 0),
         Cmd::Seal(SealArgs {
             from: Some(f),
