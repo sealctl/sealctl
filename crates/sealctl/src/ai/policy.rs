@@ -324,11 +324,19 @@ const MAX_DEPTH: usize = 8;
 /// pattern's `)`).
 const READINGS: [(bool, bool); 4] = [(true, true), (true, false), (false, true), (false, false)];
 
+/// The longest command line checked; macOS limits all of execve's arguments to 1 MiB.
+const MAX_COMMAND_BYTES: usize = 1 << 20;
+
 /// Why a whole command line may not run, if one of its commands runs a denied sealctl subcommand.
 /// The work is bounded: every parse of every reading, at every nesting level, is paid for from
 /// one budget of characters that grows linearly with the command's length; when it runs out the
 /// command is denied as too complex to check.
 fn sealctl_check(command: &str) -> Option<&'static str> {
+    // Longer than any command line a shell accepts (execve limits): denied, so the check stays
+    // well inside the hook's timeout for any input.
+    if command.len() > MAX_COMMAND_BYTES {
+        return Some(TOO_COMPLEX);
+    }
     let mut budget = command.len().saturating_mul(32).saturating_add(1 << 20);
     sealctl_in(command, 0, &mut budget)
 }
@@ -851,6 +859,15 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
         // `case` after keywords still opens a case
         assert!(bash("if case x in a) sealctl secret get k ;; esac").is_some());
+    }
+
+    #[test]
+    fn oversized_command_lines_are_denied() {
+        let line = format!("{}; true", "x".repeat(MAX_COMMAND_BYTES));
+        assert_eq!(
+            bash(&line).as_deref(),
+            Some(format!("sealctl: {TOO_COMPLEX}").as_str())
+        );
     }
 
     #[test]
