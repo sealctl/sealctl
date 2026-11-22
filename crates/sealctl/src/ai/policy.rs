@@ -1,6 +1,7 @@
 //! What AI agents may do with secrets — the same rules for every tool. Each tool's hook adapter
 //! (see `mod.rs`) turns these verdicts into that tool's hook output.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -111,7 +112,7 @@ pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
     for safe in SAFE_ENV_FILES {
         probe = probe.replace(safe, "EXAMPLE_FILE");
     }
-    if let Some(why) = sealctl_in(command, 0) {
+    if let Some(why) = sealctl_check(command) {
         return Some(format!("sealctl: {why}"));
     }
     for (re, why) in deny_patterns() {
@@ -302,29 +303,61 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
     cmds
 }
 
-/// Why a command line may not run, if one of its commands runs a denied sealctl subcommand.
-fn sealctl_in(text: &str, depth: usize) -> Option<&'static str> {
-    if depth > 8 {
-        return None;
+/// The reason given when a command line is too deeply nested or too costly to check: the hook
+/// must answer within its timeout, and a command it cannot check is denied, not let through.
+const TOO_COMPLEX: &str = "this command is too complex to check (too deeply nested `eval`, `sh -c` or wrappers, or too much text to parse). Split it into simpler commands.";
+
+/// How deeply `eval`, `sh -c`, wrappers and `sealctl run` may nest before a command line counts
+/// as too complex to check.
+const MAX_DEPTH: usize = 8;
+
+/// The readings of a command line that are checked (see `simple_commands`): double quotes resumed
+/// after a substitution or not, `case` patterns followed or not (bash 3.2 closes `$(` at a
+/// pattern's `)`).
+const READINGS: [(bool, bool); 4] = [(true, true), (true, false), (false, true), (false, false)];
+
+/// Why a whole command line may not run, if one of its commands runs a denied sealctl subcommand.
+/// The work is bounded: every parse of every reading, at every nesting level, is paid for from
+/// one budget of characters that grows linearly with the command's length; when it runs out the
+/// command is denied as too complex to check.
+fn sealctl_check(command: &str) -> Option<&'static str> {
+    let mut budget = command.len().saturating_mul(32).saturating_add(1 << 20);
+    sealctl_in(command, 0, &mut budget)
+}
+
+/// Why a command line may not run (`budget`: characters left to parse, shared by the recursion).
+fn sealctl_in(text: &str, depth: usize, budget: &mut usize) -> Option<&'static str> {
+    if depth > MAX_DEPTH {
+        return Some(TOO_COMPLEX);
     }
-    // deny if any plausible reading finds a denied command: double quotes resumed after a
-    // substitution or not, `case` patterns followed or not (bash 3.2 closes `$(` at a pattern's
-    // `)`)
-    [(true, true), (true, false), (false, true), (false, false)]
-        .into_iter()
-        .find_map(|(resume, track_case)| {
-            simple_commands(text, resume, track_case)
-                .iter()
-                .find_map(|words| sealctl_argv(words, depth))
-        })
+    let cost = text.len().saturating_mul(READINGS.len()).max(1);
+    if *budget < cost {
+        return Some(TOO_COMPLEX);
+    }
+    *budget -= cost;
+    // deny if any plausible reading finds a denied command; the readings mostly agree, so each
+    // distinct simple command is looked into once (else the work grows as 4^depth)
+    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    let mut distinct: Vec<Vec<String>> = Vec::new();
+    for (resume, track_case) in READINGS {
+        for words in simple_commands(text, resume, track_case) {
+            if !seen.contains(&words) {
+                seen.insert(words.clone());
+                distinct.push(words);
+            }
+        }
+    }
+    distinct
+        .iter()
+        .find_map(|words| sealctl_argv(words, depth, budget))
 }
 
 /// The same for one command's words: the program is found past variable assignments, shell
 /// keywords and wrappers (`env`, `command`, `sudo`, `xargs`, …), at any path; `sh -c` and `eval`
 /// are looked into, and so is the command `sealctl run` starts.
-fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
-    if depth > 8 {
-        return None;
+fn sealctl_argv(words: &[String], depth: usize, budget: &mut usize) -> Option<&'static str> {
+    if depth > MAX_DEPTH {
+        return Some(TOO_COMPLEX);
     }
     let is_assignment = |w: &str| {
         w.split_once('=').is_some_and(|(k, _)| {
@@ -374,10 +407,10 @@ fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
             let c = rest
                 .iter()
                 .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))?;
-            return sealctl_in(rest.get(c + 1)?, depth + 1);
+            return sealctl_in(rest.get(c + 1)?, depth + 1, budget);
         }
-        "eval" => return sealctl_in(&rest.join(" "), depth + 1),
-        "sealctl" => return sealctl_args(rest, depth),
+        "eval" => return sealctl_in(&rest.join(" "), depth + 1, budget),
+        "sealctl" => return sealctl_args(rest, depth, budget),
         _ => return None,
     };
     let mut j = 0;
@@ -399,7 +432,7 @@ fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
     if base == "timeout" && j < rest.len() {
         j += 1;
     }
-    sealctl_argv(rest.get(j..)?, depth + 1)
+    sealctl_argv(rest.get(j..)?, depth + 1, budget)
 }
 
 /// `git credential fill` and `git credential-<helper> get` print the stored password or token.
@@ -439,7 +472,7 @@ fn is_keyword(w: &str) -> bool {
 
 /// sealctl's arguments: its global options are skipped, the first word left is the subcommand,
 /// and the next one its own subcommand (`secret get`, `git credential`).
-fn sealctl_args(args: &[String], depth: usize) -> Option<&'static str> {
+fn sealctl_args(args: &[String], depth: usize, budget: &mut usize) -> Option<&'static str> {
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() && positional.len() < 2 {
@@ -471,7 +504,7 @@ fn sealctl_args(args: &[String], depth: usize) -> Option<&'static str> {
                     _ => break,
                 }
             }
-            return sealctl_argv(args.get(j..)?, depth + 1);
+            return sealctl_argv(args.get(j..)?, depth + 1, budget);
         }
     }
     denied_verb(positional.first()?, positional.get(1).copied())
@@ -791,6 +824,54 @@ mod tests {
         ] {
             assert!(bash(c).is_some(), "should deny: {c}");
         }
+    }
+
+    #[test]
+    fn nested_commands_are_checked_in_bounded_time() {
+        // many distinct `eval` and `sh -c` chains, each nested as deep as is checked, then a
+        // denied command: every reading of every level used to be looked into separately
+        // (4^depth work per chain)
+        let chains: Vec<String> = (0..300)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("eval eval eval eval eval eval eval eval x{i}")
+                } else {
+                    format!("bash -c 'eval eval eval eval eval eval eval y{i}'")
+                }
+            })
+            .collect();
+        let line = format!("{} ; sealctl secret get k", chains.join(" ; "));
+        let started = std::time::Instant::now();
+        let why = bash(&line);
+        let took = started.elapsed();
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("secret get")),
+            "should deny: {why:?}"
+        );
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+        // the chains alone are fine
+        assert!(bash(&chains.join(" ; ")).is_none());
+
+        // deeper than is checked: denied, not let through
+        for c in [
+            "eval eval eval eval eval eval eval eval eval sealctl secret get k",
+            "eval eval eval eval eval eval eval eval eval x",
+            "sh -c \"sh -c 'eval eval eval eval eval eval eval eval x'\"",
+        ] {
+            assert_eq!(
+                bash(c).as_deref(),
+                Some(format!("sealctl: {TOO_COMPLEX}").as_str()),
+                "{c}"
+            );
+        }
+        // when the budget runs out, the command is denied
+        let mut budget = 100;
+        assert_eq!(
+            sealctl_in(&"echo hello ".repeat(10), 0, &mut budget),
+            Some(TOO_COMPLEX)
+        );
+        let mut budget = 1000;
+        assert_eq!(sealctl_in(&"echo hello ".repeat(10), 0, &mut budget), None);
     }
 
     #[test]
