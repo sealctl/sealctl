@@ -36,7 +36,7 @@ signature = "2"
 hex = "0.4"
 base64 = "0.22"
 regex = "1"
-signal-hook = "0.3"
+signal-hook = "0.4"
 qrcode = { version = "0.15", default-features = false }
 jiff = "0.2"
 command-fds = "0.3"
