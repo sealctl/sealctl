@@ -1,0 +1,36 @@
+name: Fuzz
+
+# cargo-fuzz targets for every parser (SPEC 21): 2 minutes each on pull requests that touch
+# a parser, 1 hour each nightly. A crash fails the job and uploads its input.
+
+on:
+  pull_request:
+    paths: ["crates/sealctl-core/src/**", "crates/sealctl/src/**", "fuzz/**"]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pairing_link, sealed_file, id_file, request, bodies, channel, dotenv, project_toml, git_credential, relay_json, socket_line, handback]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Run
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 3600 || 120 }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

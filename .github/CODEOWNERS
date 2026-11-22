@@ -1,0 +1,24 @@
+# Paths that need the maintainer's review (SPEC.md section 21): the protocol and crypto core,
+# the vectors, the code that handles keys, values and agents, and the supply chain.
+crates/sealctl-core/**                @oleksiyp
+docs/protocol.md                      @oleksiyp
+docs/vectors/**                       @oleksiyp
+crates/sealctl/src/relay.rs           @oleksiyp
+crates/sealctl/src/approve.rs         @oleksiyp
+crates/sealctl/src/daemon/**          @oleksiyp
+crates/sealctl/src/store.rs           @oleksiyp
+crates/sealctl/src/project.rs         @oleksiyp
+crates/sealctl/src/guard.rs           @oleksiyp
+crates/sealctl/src/recover.rs         @oleksiyp
+crates/sealctl/src/pair.rs            @oleksiyp
+crates/sealctl/src/machine.rs         @oleksiyp
+crates/sealctl/src/ai/**              @oleksiyp
+crates/sealctl/src/migrate.rs         @oleksiyp
+crates/sealctl/src/scan.rs            @oleksiyp
+crates/sealctl/src/seal/**            @oleksiyp
+Cargo.toml                            @oleksiyp
+Cargo.lock                            @oleksiyp
+deny.toml                             @oleksiyp
+supply-chain/**                       @oleksiyp
+fuzz/**                               @oleksiyp
+.github/**                            @oleksiyp
