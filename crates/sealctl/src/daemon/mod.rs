@@ -254,15 +254,25 @@ impl Daemon {
     }
 
     /// The turn to open the session (SPEC 6.3): a caller that finds an open pending waits for it
-    /// and is told it is waiting for the phone, like the caller that asked.
+    /// and is told it is waiting for the phone, like the caller that asked. On an Open session the
+    /// other holder usually needs the turn only for a moment, so the caller is told only when the
+    /// phone is being asked or the turn has not come within half a second.
     async fn join_open(&self, ev: &Events) -> tokio::sync::MutexGuard<'_, ()> {
-        match self.opening.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                ev(json!({"event": "waiting"}));
-                self.opening.lock().await
+        if let Ok(g) = self.opening.try_lock() {
+            return g;
+        }
+        let phone = {
+            let st = self.st();
+            !st.open || st.waiting_since.is_some()
+        };
+        if !phone {
+            let soon = tokio::time::timeout(Duration::from_millis(500), self.opening.lock());
+            if let Ok(g) = soon.await {
+                return g;
             }
         }
+        ev(json!({"event": "waiting"}));
+        self.opening.lock().await
     }
 
     /// Asks the phone; one request at a time.

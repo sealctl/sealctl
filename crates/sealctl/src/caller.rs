@@ -8,8 +8,9 @@
 //! that runs the helper itself (from its shell, `sh -c`, `git credential fill`, …) is refused.
 //!
 //! This is a check on the process tree, not a security boundary against code running as the same
-//! user: such code can name a copy of a shell `git`. The agent hooks and deny rules (section 11)
-//! are the other layer; every value given out is still a use of the secret, approved and logged.
+//! user: such code can name a copy of a shell `git-remote-https`. The agent hooks and deny rules
+//! (section 11) are the other layer; every value given out is still a use of the secret, approved
+//! and logged.
 
 use std::path::{Path, PathBuf};
 
@@ -194,53 +195,32 @@ fn is_git(p: &Proc) -> bool {
     n == "git" || n.starts_with("git-")
 }
 
-/// git's options that take the next argument as their value.
-const GIT_OPTS_WITH_VALUE: &[&str] = &[
-    "-c",
-    "-C",
-    "--config-env",
-    "--git-dir",
-    "--work-tree",
-    "--namespace",
-    "--super-prefix",
-    "--exec-path",
-    "--list-cmds",
-    "--attr-source",
-    "--shallow-file",
+/// The programs of git's that ask a credential helper for their own use: the HTTP and FTP
+/// transports and the other programs built on git's HTTP code, and Git LFS (which asks through
+/// `git credential fill`). Matched by the executable the kernel ran.
+const GIT_ASKERS: &[&str] = &[
+    "git-remote-http",
+    "git-remote-https",
+    "git-remote-ftp",
+    "git-remote-ftps",
+    "git-http-fetch",
+    "git-http-push",
+    "git-imap-send",
+    "git-lfs",
 ];
 
-/// A git process asked for a credential on someone else's behalf: `git credential fill` (also
-/// through an alias such as `-c alias.x=…credential…`), whose answer goes to whoever ran it.
-/// The check fails closed: any argument that is exactly `credential`, an `alias.` setting that
-/// mentions credentials, or an alias taken from the environment (`--config-env alias.…`) makes
-/// one, whatever option parsing says. Other arguments that only mention credentials (a
-/// repository URL, a `credential.*` setting) do not.
-fn is_git_front_end(p: &Proc) -> bool {
-    let args = || p.argv.iter().skip(1).map(String::as_str);
-    let mut prev = "";
-    for a in args() {
-        let alias = a.contains("alias.");
-        if a == "credential"
-            || (alias && a.contains("credential"))
-            || (alias && (prev == "--config-env" || a.starts_with("--config-env=")))
-        {
-            return true;
-        }
-        prev = a;
-    }
-    let mut it = args();
-    while let Some(a) = it.next() {
-        if GIT_OPTS_WITH_VALUE.contains(&a) {
-            it.next();
-            continue;
-        }
-        if a.starts_with('-') {
-            continue;
-        }
-        // the subcommand
-        return a == "credential";
-    }
-    false
+/// Whether a git process asks for a credential for its own use (`Some(true)`) or only passes on
+/// what it is given (`Some(false)`); `None` when it is not git.
+///
+/// Only the programs in [`GIT_ASKERS`] ask for their own use. The `git` program itself never
+/// runs a credential helper for `push`, `fetch` or `clone` (its transports do, as child
+/// processes), so a helper whose nearest git is `git` was started for whoever ran that git:
+/// `git credential fill`, an alias (from `-c`, `--config-env`, `GIT_CONFIG_*` or a config file,
+/// in any case), a pager, a hook or any other command git runs from its configuration. Such a
+/// git is a relay whatever its arguments say, and counts only if an asker started it in turn.
+/// The same holds for `git-credential` and any other `git-*` program not in the list.
+fn git_asks(p: &Proc) -> Option<bool> {
+    is_git(p).then(|| GIT_ASKERS.contains(&p.name()))
 }
 
 fn is_aws(p: &Proc) -> bool {
@@ -252,10 +232,11 @@ fn is_aws(p: &Proc) -> bool {
     aws && !p.argv.iter().any(|a| a == "export-credentials")
 }
 
-/// Whether `chain` (parent first) shows the helper started by `tool` itself: git (or one of its
-/// `git-*` programs) or the AWS CLI, with at most one shell in between (git runs `!` helpers
-/// through `sh -c`). A git process that only relays the answer (`git credential fill`) counts
-/// only if git started it in turn, as git-lfs and git-send-email do.
+/// Whether `chain` (parent first) shows the helper started by `tool` itself: one of git's
+/// programs that asks for its own use ([`git_asks`]) or the AWS CLI, with at most one shell in
+/// between (git runs `!` helpers through `sh -c`). A git process that only relays the answer
+/// (`git credential fill`, the `git` program) counts only if an asker started it in turn, as
+/// git-lfs does.
 pub fn started_by(tool: Tool, chain: &[Proc]) -> bool {
     let mut i = 0;
     // up to 4 relays (git credential fill run by git-lfs run by git …)
@@ -266,9 +247,11 @@ pub fn started_by(tool: Tool, chain: &[Proc]) -> bool {
         let Some(p) = chain.get(i) else { return false };
         match tool {
             Tool::Aws => return is_aws(p),
-            Tool::Git if !is_git(p) => return false,
-            Tool::Git if !is_git_front_end(p) => return true,
-            Tool::Git => i += 1,
+            Tool::Git => match git_asks(p) {
+                None => return false,
+                Some(true) => return true,
+                Some(false) => i += 1,
+            },
         }
     }
     false
@@ -349,6 +332,20 @@ mod tests {
         }
     }
 
+    /// `[sh -c helper, <git>, agent shell, agent]`
+    fn via(git: Proc) -> Vec<Proc> {
+        vec![
+            p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+            git,
+            agent_shell(),
+            agent(),
+        ]
+    }
+
+    fn git(argv: &[&str]) -> Proc {
+        p("/usr/bin/git", argv)
+    }
+
     fn agent() -> Proc {
         p(
             "/opt/homebrew/bin/node",
@@ -415,6 +412,51 @@ mod tests {
             agent(),
         ];
         assert!(started_by(Tool::Git, &lfs));
+        // as seen with Homebrew git 2.52: `git ls-remote` runs `git remote-http`, which runs the
+        // transport (a symlink resolved to its target)
+        let homebrew = [
+            p("/bin/sh", &["/bin/sh", "/opt/sealctl-helper", "get"]),
+            p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/libexec/git-core/git-remote-http",
+                &[
+                    "/opt/homebrew/opt/git/libexec/git-core/git-remote-http",
+                    "http://h/r.git",
+                    "http://h/r.git",
+                ],
+            ),
+            p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/bin/git",
+                &[
+                    "/opt/homebrew/opt/git/libexec/git-core/git",
+                    "remote-http",
+                    "http://h/r.git",
+                ],
+            ),
+            p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/bin/git",
+                &["git", "ls-remote", "http://h/r.git"],
+            ),
+            agent_shell(),
+            agent(),
+        ];
+        assert!(started_by(Tool::Git, &homebrew));
+        // command-line settings and a branch that only mention credentials
+        let push = [
+            p(
+                "/usr/libexec/git-core/git-remote-https",
+                &["git-remote-https", "origin", "https://github.com/a/b"],
+            ),
+            git(&[
+                "git",
+                "-c",
+                "credential.helper=x",
+                "push",
+                "origin",
+                "credential-fix",
+            ]),
+            agent(),
+        ];
+        assert!(started_by(Tool::Git, &push));
     }
 
     #[test]
@@ -489,6 +531,45 @@ mod tests {
                 agent_shell(),
                 agent(),
             ],
+            // aliases given on the command line, in any case and with quotes git removes
+            via(git(&["git", "-c", "ALIAS.x=credential fill", "x"])),
+            via(git(&["git", "-c", "alias.x=cre\"d\"ential fill", "x"])),
+            via(git(&["git", "--config-env=ALIAS.x=VAR", "x"])),
+            via(git(&["git", "--config-env", "alias.x=VAR", "x"])),
+            via(git(&["git", "-c", "include.path=/tmp/c", "x"])),
+            // an alias from GIT_CONFIG_COUNT/KEY/VALUE, GIT_CONFIG_PARAMETERS or a config file
+            // leaves no trace in the arguments
+            via(git(&["git", "x"])),
+            // a command git runs from its configuration: a pager, a hook
+            via(git(&[
+                "git",
+                "-c",
+                "core.pager=sealctl git credential get",
+                "log",
+            ])),
+            vec![
+                p(
+                    "/bin/sh",
+                    &["/bin/sh", "/tmp/hooks/pre-push", "origin", "https://h/r"],
+                ),
+                git(&["git", "push"]),
+                agent(),
+            ],
+            // `credential` in another case; the dashed form of the git program
+            via(git(&["git", "Credential", "fill"])),
+            via(p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/bin/git",
+                &["git-credential", "fill"],
+            )),
+            // a relay above a relay, with no asker
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                git(&["git", "credential", "fill"]),
+                git(&["git", "x"]),
+                agent(),
+            ],
+            // a git-* program that is not one of git's askers
+            via(p("/usr/local/bin/git-foo", &["git-foo"])),
             // two shells deep
             vec![
                 p("/bin/sh", &["sh", "-c", "x"]),
