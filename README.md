@@ -1,8 +1,11 @@
 # sealctl
 
-**Keys for your developer machine, approved on your phone.**
-`sealctl` keeps API keys out of `.env` files and away from AI agents, signs SSH logins and git
-commits, opens encrypted volumes and runs encrypted backups with restic. Every key is derived
+**Keys for developers and their AI agents.**
+API keys, SSH and git signing keys, encrypted volumes and backups, opened only when your phone
+approves. One tap per use; your AI agents never see the key.
+
+`sealctl` keeps API keys out of `.env` files, signs SSH logins and git commits, opens encrypted
+volumes and runs encrypted backups with restic. Every key is derived
 from **24 words** held by the sealctl phone app; the phone hands keys to a paired machine when
 you approve, and **the 24 words alone open every object**, with no phone, relay or company.
 
