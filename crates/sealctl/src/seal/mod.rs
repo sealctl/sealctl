@@ -301,6 +301,19 @@ pub fn seal_volume_given(
 
 /// Validates a restic repository id taken from a URL.
 pub fn repo_id_of(url: &str) -> Result<String> {
+    let id = repo_id_in(url)?;
+    if Backup::list()?.iter().any(|b| b.repo_id == id) {
+        return Err(fail(
+            exit::USAGE,
+            format!("Another backup uses the repository id {id}."),
+        ));
+    }
+    Ok(id)
+}
+
+/// The id of a restic repository, its key's derivation id: the last segment of its URL after
+/// `/` or `:`. `seal backup` and `recover` both take it from here.
+pub fn repo_id_in(url: &str) -> Result<String> {
     let id = url
         .trim_end_matches('/')
         .rsplit(['/', ':'])
@@ -315,12 +328,6 @@ pub fn repo_id_of(url: &str) -> Result<String> {
         return Err(fail(
             exit::USAGE,
             "The repository's last path segment must be 1 to 64 of A-Z a-z 0-9 . _ -",
-        ));
-    }
-    if Backup::list()?.iter().any(|b| b.repo_id == id) {
-        return Err(fail(
-            exit::USAGE,
-            format!("Another backup uses the repository id {id}."),
         ));
     }
     Ok(id)
@@ -761,5 +768,25 @@ fn seal_one(stores: &mut store::Stores, o: &handback::Object, words: bool) -> Re
             Ok("stored, read back.".into())
         }
         other => Err(fail(exit::USAGE, format!("Unknown kind {other}."))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_id_in;
+
+    #[test]
+    fn repository_ids_from_every_url_form() {
+        for (url, id) in [
+            ("/srv/restic/safe-backup/", "safe-backup"),
+            ("rclone:gdrive:backups", "backups"),
+            ("sftp:user@nas:docs", "docs"),
+            ("sftp:user@nas:/srv/docs", "docs"),
+            ("s3:s3.amazonaws.com/bucket/repo", "repo"),
+            ("b2:bucket:repo.1", "repo.1"),
+        ] {
+            assert_eq!(repo_id_in(url).unwrap(), id, "{url}");
+        }
+        assert!(repo_id_in("rclone:remote:").is_err());
     }
 }
