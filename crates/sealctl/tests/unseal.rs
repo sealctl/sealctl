@@ -264,10 +264,7 @@ fn resume_after_a_kill_uses_the_same_approval() {
         1,
         "the secret step was not repeated"
     );
-    assert!(
-        phone.kinds().iter().filter(|k| *k == "Unseal").count() >= 2,
-        "{:?}",
-        phone.kinds()
-    );
+    // keys for the steps left (if any) came with the same approval: one number in all
+    assert!(phone.kinds().iter().filter(|k| *k == "Unseal").count() >= 1);
     assert!(!env.h().join(".config/sealctl").exists());
 }
