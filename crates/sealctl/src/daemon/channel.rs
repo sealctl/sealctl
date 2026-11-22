@@ -57,6 +57,11 @@ fn jitter() -> f64 {
     f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX)
 }
 
+/// The relay answers every `ping` (sent each 30 s) with `pong`. A socket that has carried
+/// nothing for this long is taken as dead (a half-open connection after sleep or a network
+/// change) and replaced, so held messages such as `lock` are fetched again.
+const SILENT: Duration = Duration::from_secs(75);
+
 /// Runs until the session locks (the task is aborted) or the relay says it has no channel.
 pub async fn run(d: Arc<Daemon>) {
     if let Err(e) = d.send_status(&[]).await {
@@ -104,17 +109,23 @@ pub async fn run(d: Arc<Daemon>) {
             }
         };
         let opened = tokio::time::Instant::now();
+        let mut heard = opened;
         let mut ping = tokio::time::interval(Duration::from_secs(30));
         ping.tick().await;
         loop {
             tokio::select! {
                 _ = ping.tick() => {
+                    if heard.elapsed() >= SILENT {
+                        log::info!("machine socket {keys_path}: no answer to ping; reconnecting");
+                        break;
+                    }
                     if ws.send(Message::text("ping")).await.is_err() {
                         break;
                     }
                 }
                 m = ws.next() => {
                     let Some(Ok(m)) = m else { break };
+                    heard = tokio::time::Instant::now();
                     let Message::Text(t) = m else { continue };
                     if t.as_str() == "pong" {
                         continue;
@@ -201,8 +212,8 @@ pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
             Ok(WaitEnd::Reply(s)) => {
                 if let Ok(reply) = request.open_reply(&m, &p, &s) {
                     if reply.ok {
-                        if reply.ack.is_some() {
-                            d.st().log.clear();
+                        if let Some(ack) = reply.ack {
+                            d.ack(ack);
                         }
                         for msg in reply.msgs {
                             let new = {
