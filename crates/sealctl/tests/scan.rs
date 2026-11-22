@@ -154,3 +154,68 @@ fn env_files_with_any_line_ending_lose_only_what_was_sealed() {
     let kept = std::fs::read_to_string(dir.join(".env")).unwrap();
     assert_eq!(kept, "# keep me\rEMPTY_KEY=\r\n");
 }
+
+/// A name the store or the same scan already has with another value gets `-2`, `-3`; a zsh
+/// history that is not UTF-8 is masked byte for byte; a symlinked `~/.zshrc` is rewritten where
+/// it points, and stays a link.
+#[test]
+fn scan_keeps_other_values_history_bytes_and_links() {
+    let mut env = Env::new();
+    env.pair();
+    let h = env.h().to_path_buf();
+    let x = format!("Xa1{}", random_alnum(30));
+    let y = format!("Yb2{}", random_alnum(30));
+    let z = format!("Zc3{}", random_alnum(30));
+    let one = h.join("one/shop");
+    let two = h.join("two/shop");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(one.join(".env"), format!("API_KEY={x}\n")).unwrap();
+    std::fs::write(two.join(".env"), format!("API_KEY={y}\n")).unwrap();
+    std::fs::write(two.join(".env.local"), format!("API_KEY={z}\n")).unwrap();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&["scan", one.to_str().unwrap(), "--yes"])
+    });
+    assert_eq!(code, 0, "{err}");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&["scan", two.to_str().unwrap(), "--yes"])
+    });
+    assert_eq!(code, 0, "{err}");
+    for (n, v) in [
+        ("shop/api-key", &x),
+        ("shop/api-key-2", &y),
+        ("shop/api-key-3", &z),
+    ] {
+        let (code, got, err) = env.run(&["secret", "get", n]);
+        assert_eq!(code, 0, "{n}: {err}");
+        assert_eq!(&got, v, "{n} keeps its own value");
+    }
+
+    // zsh keeps non-ASCII text metafied: not UTF-8
+    let token = ["gh", "p_", &random_alnum(36)].concat();
+    let mut hist = b": 1:0;echo \x83\xb1\xe9\n".to_vec();
+    hist.extend_from_slice(format!(": 2:0;curl -H 'Authorization: Bearer {token}' x\n").as_bytes());
+    std::fs::write(h.join(".zsh_history"), &hist).unwrap();
+    let rc_val = format!("Wq9{}", random_alnum(30));
+    std::fs::create_dir_all(h.join("dotfiles")).unwrap();
+    std::fs::write(
+        h.join("dotfiles/zshrc"),
+        format!("alias ll='ls -l'\nexport OPENAI_API_KEY=\"{rc_val}\"\n"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(h.join("dotfiles/zshrc"), h.join(".zshrc")).unwrap();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["scan", "--home", "--yes"]));
+    assert_eq!(code, 0, "{err}");
+    let mut want = b": 1:0;echo \x83\xb1\xe9\n".to_vec();
+    want.extend_from_slice(b": 2:0;curl -H 'Authorization: Bearer ****' x\n");
+    assert_eq!(std::fs::read(h.join(".zsh_history")).unwrap(), want);
+    assert!(std::fs::symlink_metadata(h.join(".zshrc"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let rc = std::fs::read_to_string(h.join("dotfiles/zshrc")).unwrap();
+    assert!(
+        !rc.contains(&rc_val) && rc.contains("# OPENAI_API_KEY moved to sealctl"),
+        "{rc}"
+    );
+}
