@@ -136,12 +136,24 @@ pub fn seal_volume_given(
     let path = (kind != Kind::Apfs)
         .then(|| std::fs::canonicalize(p))
         .transpose()?;
+    // a marker with no volume of this machine on the bundle: left by a seal that stopped
+    // before it finished; its id is used again if the passphrase still opens the bundle
+    let mut leftover = None;
     if kind == Kind::Sparsebundle {
         if let Some(f) = volume::read_marker(kind, target)? {
-            return Err(fail(
-                exit::USAGE,
-                format!("{target} is sealed already (words {}).", f.words),
-            ));
+            let ours = Volume::list()?.iter().any(|v| {
+                v.path
+                    .as_deref()
+                    .zip(path.as_deref())
+                    .is_some_and(|(a, b)| volume::same_path(a, b))
+            });
+            if ours {
+                return Err(fail(
+                    exit::USAGE,
+                    format!("{target} is sealed already (words {}).", f.words),
+                ));
+            }
+            leftover = Some(f);
         }
     }
     let old = match given {
@@ -156,13 +168,26 @@ pub fn seal_volume_given(
         }
     };
     if !opens(old.as_bytes())? {
+        if let Some(f) = &leftover {
+            return Err(fail(
+                exit::WRONG_KEY,
+                format!(
+                    "That passphrase does not open {target}, which has sealctl's marker (words {}). \
+                     If those words sealed it, sealctl volume import registers it and sealctl recover opens it.",
+                    f.words
+                ),
+            ));
+        }
         return Err(fail(
             exit::WRONG_KEY,
             format!("That passphrase does not open {target}."),
         ));
     }
     let id = match kind {
-        Kind::Sparsebundle => util::new_uuid()?,
+        Kind::Sparsebundle => match &leftover {
+            Some(f) => f.id.clone(),
+            None => util::new_uuid()?,
+        },
         Kind::Apfs => uuid_of_apfs(target)?,
         Kind::Luks => {
             let out = util::system_cmd("cryptsetup")
@@ -188,12 +213,40 @@ pub fn seal_volume_given(
     };
     let (key, fp) = takeover_key(&item, words)?;
     let new = key.hex();
+    let vol = Volume {
+        name: name.into(),
+        kind,
+        path: path.clone(),
+        id: id.clone(),
+        words: fp.clone(),
+        check: key.check(),
+        mountpoint: match mountpoint {
+            Some(m) => m,
+            None => volume::default_mountpoint(kind, name)?,
+        },
+        manual,
+    };
+    // a sparse bundle's id is random: it is on disk before the passphrase changes, since the
+    // key (from the words or the phone) cannot be found again without it
+    let unmark = || {
+        if let Some(p) = volume::sparsebundle::id_path(&vol) {
+            let _ = std::fs::remove_file(p);
+        }
+    };
+    if kind == Kind::Sparsebundle {
+        volume::write_marker(&vol)?;
+    }
     match kind {
         Kind::Sparsebundle => volume::sparsebundle::change_passphrase(
             path.as_ref().expect("path"),
             old.as_bytes(),
             new.as_bytes(),
-        )?,
+        )
+        .inspect_err(|_| {
+            if opens(old.as_bytes()).unwrap_or(false) {
+                unmark();
+            }
+        })?,
         Kind::Apfs => volume::apfs::change_passphrase(&id, old.as_bytes(), new.as_bytes())?,
         Kind::Luks => {
             let out = util::run_with_fds(
@@ -220,7 +273,7 @@ pub fn seal_volume_given(
     // check before the old way in is gone: the new key opens it
     if !opens(new.as_bytes())? {
         if kind != Kind::Luks {
-            let _ = match kind {
+            let back = match kind {
                 Kind::Sparsebundle => volume::sparsebundle::change_passphrase(
                     path.as_ref().expect("path"),
                     new.as_bytes(),
@@ -228,25 +281,15 @@ pub fn seal_volume_given(
                 ),
                 _ => volume::apfs::change_passphrase(&id, new.as_bytes(), old.as_bytes()),
             };
+            if back.is_ok() && kind == Kind::Sparsebundle {
+                unmark();
+            }
         }
         return Err(fail(
             exit::ERROR,
             "The new key did not open the volume; your passphrase still does.",
         ));
     }
-    let vol = Volume {
-        name: name.into(),
-        kind,
-        path,
-        id,
-        words: fp.clone(),
-        check: key.check(),
-        mountpoint: match mountpoint {
-            Some(m) => m,
-            None => volume::default_mountpoint(kind, name)?,
-        },
-        manual,
-    };
     volume::write_marker(&vol)?;
     vol.save()?;
     eprintln!(

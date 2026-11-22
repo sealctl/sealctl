@@ -371,3 +371,70 @@ fn unseal_backup_resumed_after_the_key_change_keeps_the_new_password() {
     let o = restic(&repo, &first, &["snapshots", "--json"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
+
+/// A sparse bundle's id is on disk before its passphrase changes. A seal that stopped before
+/// the change leaves that marker on a bundle the user's passphrase still opens: sealing it
+/// again uses the same id instead of refusing it as sealed.
+#[cfg(target_os = "macos")]
+#[test]
+fn sealing_a_bundle_with_a_leftover_marker_uses_its_id() {
+    let mut env = Env::new();
+    env.pair();
+    let own = canary();
+    let bundle = env.h().join("left.sparsebundle");
+    let mut c = Command::new("/usr/bin/hdiutil")
+        .args([
+            "create",
+            "-quiet",
+            "-size",
+            "32m",
+            "-type",
+            "SPARSEBUNDLE",
+            "-fs",
+            "APFS",
+            "-encryption",
+            "AES-256",
+            "-stdinpass",
+            "-volname",
+            "left",
+        ])
+        .arg(&bundle)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(own.as_bytes()).unwrap();
+    assert!(c.wait().unwrap().success());
+    let id = "6f1c2a4e-0b7d-4c3a-9e5f-1a2b3c4d5e6f";
+    std::fs::write(
+        bundle.join("sealctl.id"),
+        serde_json::json!({
+            "sealctl": 1, "kind": "volume", "id": id, "words": env.phone.fingerprint(),
+            "check": "x", "created": "2026-11-22T00:00:00Z", "volume": "sparsebundle"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut c = env.cmd();
+    c.args([
+        "seal",
+        "volume",
+        "left",
+        bundle.to_str().unwrap(),
+        "--mountpoint",
+        env.h().join("mnt/left").to_str().unwrap(),
+    ]);
+    let pty = Pty::spawn(c);
+    pty.expect("Passphrase of", Duration::from_secs(30));
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line(&own);
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    let marker: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(bundle.join("sealctl.id")).unwrap()).unwrap();
+    assert_eq!(marker["id"], id, "the leftover id is used again");
+    assert!(!hdiutil_opens(&bundle, &own));
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "left"]));
+    assert_eq!(code, 0, "{err}");
+    env.run(&["volume", "close", "left"]);
+}
