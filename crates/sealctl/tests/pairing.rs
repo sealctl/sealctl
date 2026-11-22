@@ -101,3 +101,26 @@ fn not_paired_commands_exit_3() {
     let (code, _, _) = env.run(&["unlock", "x"]);
     assert_eq!(code, 2);
 }
+
+#[test]
+fn pairing_at_a_terminal_shows_the_qr_code() {
+    let env = Env::fake(Default::default());
+    let mut c = env.cmd();
+    c.args(["pair", "--name", "tty@box.test"]);
+    let pty = common::Pty::spawn(c);
+    let screen = pty.expect("Waiting for your phone (10 min)", std::time::Duration::from_secs(30));
+    assert!(screen.contains("Scan with the sealctl app on your phone. Or open this link on the phone:"), "{screen}");
+    assert!(screen.contains('█') || screen.contains('▀'), "QR code drawn with half blocks");
+    let link = screen
+        .lines()
+        .find(|l| l.trim_start().starts_with("https://sealctl.com/p#"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(link.contains("&r=http%3A%2F%2F127.0.0.1%3A"), "a test relay is named in the link: {link}");
+    env.block(env.phone.pair(&link)).unwrap();
+    let (code, out, screen) = pty.wait(std::time::Duration::from_secs(30));
+    assert_eq!(code, 0, "{screen}");
+    assert!(out.starts_with("Paired: tty@box.test #"), "{out}");
+    assert!(screen.contains("Free to use. If it earns its place, $5.99 once keeps the relay running: sealctl buy"), "{screen}");
+}

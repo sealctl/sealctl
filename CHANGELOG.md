@@ -6,6 +6,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.7.0] - unreleased
+
+The phone release: keys come from 24 words held by the sealctl phone app, which approves their
+use. No Ledger code: sealctl 0.5 users hand their objects back with release 0.6
+(`brew install sealctl/tap/sealctl@0.6`, `sealctl unseal --all`), then `sealctl seal` them.
+
+### Added
+
+- `sealctl pair` (QR code on a terminal, the link without one), `unpair`, a relay client with
+  signed calls and WebSocket waits; `SEALCTL_RELAY` / `--relay`, recorded at pairing.
+- The session daemon: Locked / Open / Waiting, idle allowance and hard stop from the phone's
+  reply, agent allowances and remembered answers, own-approval secrets, on-lock backups, the
+  machine channel (status to the phone; lock, answers and notices from it), the SSH agent on
+  store keys. `SEALCTL_NO_DAEMON=1` for CI runners.
+- The secret store on `.sealed` files (`secret set/get/ls/rm/mv/store`, `--own-approval`),
+  `sealctl run` with `[command."<words>"]` sections.
+- `sealctl seal volume|backup|ssh|secret|env` (level 2 on the phone, or `--words`);
+  `sealctl unseal <object>` and `unseal --all` into `~/sealctl-unsealed-<date>` with the plan,
+  number match, plan signature, delayed approvals and the hand-back report; `sealctl cancel`.
+- `sealctl recover <store | .sealed | sparse bundle | restic repository>` with the 24 words.
+- `sealctl status --json` with `licence`; `sealctl buy` (`--seats`, `--code`); the soft ask
+  after 30 days with use, at most weekly, only to a person at a terminal.
+- `sealctl git credentials <host>` and the git credential helper; `sealctl aws credentials`.
+- `crates/sealctl-fakerelay` (test only) and `scripts/pair-test.sh` for real-phone tests.
+
+### Removed
+
+- The Ledger: `sealctl-ledger`, OpenPGP (`setup`, `pin`, `card`, `devices`, `kit`, `encrypt`,
+  `decrypt`), the 2HashDH derivation, `agent`, `ssh install/passphrase`, `unlock` and
+  `lock <volume>` (use `volume open/close`), `volume rekey`, `backup rekey`, emoji in output.
+- Backup passwords and credentials cached inside volumes.
+
+### Not yet
+
+- `scan`, `migrate` (rewrap after new words, re-encryption), `seal --from <hand-back list>`,
+  `unseal --to keychain|op|bw|show`, the `report` fallback for relays without the machine
+  channel, `doctor` checks for hooks.
+
 ## [0.5.0] - 2026-11-18
 
 ### Changed

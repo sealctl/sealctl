@@ -1,85 +1,91 @@
 # Design
 
+How sealctl 0.7 is put together. The rules for every byte on the wire, every key and every
+file format are in [protocol.md](protocol.md); the command-line behaviour is in
+[../SPEC.md](../SPEC.md). This page is the map.
+
 ## Components
 
-```
-sealctl (CLI, clap)
- ├─ card        setup / status / doctor          ─┐
- ├─ crypto      encrypt / decrypt (rPGP)           │  openpgp-card  ──▶  CardBackend
- ├─ volume      APFS (diskutil) · LUKS2 (cryptsetup)│                       │
- ├─ backup      restic                             │            sealctl-ledger
- └─ secrets     pass-compatible store             ─┘        ├─ USB HID  (hidapi)
-                                                            └─ Bluetooth LE (btleplug)
+```text
+crates/
+  sealctl-core      protocol and crypto, shared with the phone apps (UniFFI)
+  sealctl           CLI and daemon (binary `sealctl`)
+  sealctl-fakerelay test only: in-process relay and scripted phone
 ```
 
-* **sealctl-ledger** implements Ledger APDU framing over USB HID and Bluetooth LE and exposes it
-  as a `card_backend::CardBackend`. It knows nothing about OpenPGP beyond the PIN-pad CLA.
-* **openpgp-card** speaks the OpenPGP card protocol (SELECT, GET DATA, PSO:DECIPHER, …).
-* **openpgp-card-rpgp + rPGP** turn card keys into OpenPGP certificates and decrypt / sign
-  standard OpenPGP messages.
+```text
+sealctl (CLI)                       sealctl daemon (one per user)
+ ├─ pair       QR code / link        ├─ session: Locked / Open / Waiting, timers, credit
+ ├─ secret     store on .sealed      ├─ keys held while Open (store, volumes, backups)
+ ├─ run        env + masking         ├─ agent allowances, own-approval keys per command
+ ├─ volume     APFS · bundle · LUKS  ├─ machine channel: status out; lock/answers/notice in
+ ├─ backup     restic                ├─ SSH agent socket on store keys
+ ├─ seal       take over             └─ socket ~/.local/state/sealctl/daemon.sock (0600, peer uid)
+ ├─ unseal     hand back
+ ├─ recover    24 words only
+ └─ status, cancel, buy, doctor
+        │
+        ▼ approve: seal request (HPKE to the phone, signed), wait socket, open reply
+      relay (Cloudflare Worker; sees sealed strings, ids, timing)
+        │
+        ▼
+      phone app (sealctl-core): open request, number match, plan signature, sealed reply
+```
 
 ## Keys
 
-The Ledger OpenPGP app derives keys from the device seed (BIP32 path
-`m/0x80475047'/(slot+1)'`, then per key name and algorithm). `sealctl setup` will:
+The phone's root comes from the 24 words (BIP39 seed, then HKDF); every object key is
+`derive(root, "<purpose>:<object id>", 16)` with the id readable from the object itself (store
+folder name, volume UUID, repository folder). A machine keeps only its pairing key and box key
+(`machine.json`, 0600). Object keys reach a machine only inside a reply sealed to a one-time
+key of that request, and live in daemon memory while the session is Open (or for one command).
+Each object carries a public `.id` file or marker with the words fingerprint and a key check,
+so a wrong key is noticed before it is used and `recover` can check the words.
 
-1. select Curve25519 (Ed25519 for signing/auth, X25519 for decryption) in all three keys;
-2. generate keys in seeded mode (deterministic);
-3. write fingerprints and a **fixed creation time** to the card so the certificate — and thus
-   every fingerprint — is reproducible from the device alone;
-4. export the certificate to every configured backup location.
+## Approvals
 
-`sealctl doctor` re-derives the certificate from the device and compares fingerprints.
+| Situation | Request | Level |
+| --- | --- | --- |
+| First use while Locked (`run`, `secret get`, `volume open`, SSH signing) | `open`, with agent `uses` when an agent asks | 1 |
+| An agent's first use of a secret in a repository while Open | `agent` | 1 |
+| A new object while Open | `keys` | 1 |
+| An own-approval secret | `own`, every time | 1 |
+| `seal` of an existing object | `keys`, `lvl` 2, number match | 2 |
+| `unseal <object>` | `unseal` with the plan, number match | 2 |
+| `unseal --all` | `unseal` with the plan, number match, delay away from trusted places | 3 |
 
-## Derived keys and the agent
+The CLI prints `Waiting for your phone` once, with the number when one is shown. The phone
+decides the level; the CLI can only raise it. A level 3 approval comes back with a plan
+signature over the plan hash, the request id and the not-before time; the CLI checks it and
+acts only on objects named by the plan. Delayed approvals are held by the relay and can be
+cancelled from the phone or any paired machine (`sealctl cancel`).
 
-Volume passphrases, restic passwords and the secret-store key are derived on the Ledger from
-its seed-derived X25519 key and a public id — see [derived-keys.md](derived-keys.md). Derived
-values go to OS tools through stdin only and are zeroized after use.
+## Session
 
-`sealctl agent` (started on demand, one thread per client, 0600 Unix socket) caches the card's
-X25519 results so a session needs one PIN entry. It exits after 1 h idle or 24 h total;
-`sealctl lock` stops it.
+The daemon opens the session with one `open` request covering the store key, the keys of
+volumes that mount with the session, and backup keys. The idle allowance is
+`min(cap, base + rate × minutes worked)` with `cap/base/rate` from the phone's reply (they
+depend on where the phone is); the hard stop is 02:00 or 14 hours after the first open. Credit
+survives locks and restarts (`session.json`, no keys). Locking wipes the keys, runs on-lock
+backups, closes volumes and tells the phone. While Open, the daemon keeps the machine socket
+to the relay: it sends sealed status (state, time left, usage log) and applies sealed
+messages from the phone (lock, remembered answers, notices of level 3 actions).
 
-## Transports
+## Files
 
-| | USB HID | Bluetooth LE |
-|---|---|---|
-| Works with the official OpenPGP app | ✅ | ❌ (built without Bluetooth) |
-| Works with the Bluetooth build | ✅ | ✅ |
-| Opening the app remotely | possible | drops the link — open the app on the device |
-| PIN entry | on device | on device |
+| Path | Content |
+| --- | --- |
+| `~/.config/sealctl/config.toml`, `machine.json` | Relay and store folder; the pairing |
+| `~/.config/sealctl/volumes/*.toml`, `backups/*.toml` | Object definitions with id, words, check |
+| `~/.local/share/sealctl/store/<store-id>/` | `.sealed` files and `<store-id>.id` |
+| `~/.local/state/sealctl/` | Sockets, `session.json`, `licence.json`, `answers.json`, logs |
+| `~/sealctl-unsealed-<date>/` | One `seal`/`unseal` run: plan, journal, the folder store |
 
-## Backups
+## Testing
 
-* `backup init` derives the restic password from the repository URL; it and the repository
-  credentials are cached (0600) in `<mount>/.sealctl/`. Re-running `init` with the same URL
-  reconnects to an existing repository.
-* `backup run --all --if-unlocked` (launchd `StartInterval` / systemd timer) backs up every
-  unlocked volume with `RESTIC_PASSWORD_FILE` pointing inside the volume — no device needed.
-* `lock` runs the same backup first; a failed backup never prevents locking.
-* `snapshots` / `restore` / `check` derive the password on the Ledger when the volume is locked
-  (credentials from the environment or a prompt) and give it to restic through a stdin pipe.
-* Retention (`forget --prune`, 7 daily / 4 weekly / 12 monthly by default) runs at most weekly.
-
-## Secrets
-
-`~/.local/share/sealctl/secrets/<name>.gpg`: OpenPGP messages (SKESK + SEIPD, AES-256)
-encrypted with the seed-derived store key. `sealctl run` decrypts all mapped secrets with one
-key derivation and `exec`s the command with them in its environment only.
-
-## SSH
-
-`sealctl ssh agent` implements the ssh-agent protocol (ssh-agent-lib) and offers the encrypted
-key files `~/.ssh/sealctl_<name>` (standard OpenSSH format). A key's passphrase is derived on
-the Ledger from its public fingerprint (docs/derived-keys.md); the agent decrypts the key on
-first use and keeps it in memory for the sealctl agent session, so signing needs no device
-round trip. Git uses it via `gpg.format=ssh` and a `gpg.ssh.program` shim that sets
-`SSH_AUTH_SOCK`. (Until 0.4 the agent also signed with the Ledger's OpenPGP authentication key
-via INTERNAL AUTHENTICATE; that made every login depend on the device and was removed.)
-
-## Recovery
-
-Only the seed (24 words) is needed: `sealctl setup --force` recreates the identical keys and
-certificate; volumes, backups and secrets are re-derived. `sealctl kit export` writes a recovery kit with step-by-step
-instructions (`README.txt`) for both sealctl and plain GnuPG + restic.
+`sealctl-fakerelay` implements the Relay API in memory with real signature checks, and a
+scripted phone built on `sealctl-core` answers requests the way a test says (approve, decline,
+pick the right or a wrong number, delay, send a lock message). The integration tests run the
+real binary in temporary HOMEs against it, or against a live relay with
+`SEALCTL_TEST_RELAY`. macOS runs sparse bundles with `hdiutil`; restic uses folder
+repositories.

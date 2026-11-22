@@ -184,6 +184,16 @@ pub fn seal_volume(
             util::check(out, "cryptsetup luksAddKey")?;
         }
     }
+    // LUKS has slots: the user's goes only once the new key is known to open it
+    if kind == Kind::Luks && opens(new.as_bytes())? {
+        let out = util::run_with_stdin(
+            util::system_cmd("cryptsetup")
+                .args(["luksRemoveKey", "--key-file=-"])
+                .arg(path.as_ref().expect("path")),
+            old.as_bytes(),
+        )?;
+        util::check(out, "cryptsetup luksRemoveKey")?;
+    }
     // check before the old way in is gone: the new key opens it
     if !opens(new.as_bytes())? {
         if kind != Kind::Luks {
