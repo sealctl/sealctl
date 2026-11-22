@@ -4,11 +4,14 @@ Thanks for helping! A few ground rules keep this tool trustworthy.
 
 ## The hard rule: no new cryptography
 
-`sealctl` uses established components (Ledger OpenPGP app, `openpgp-card`, rPGP, APFS, LUKS2,
-restic). It has exactly **one** custom construction — the seed-derived keys in
-`crates/sealctl/src/derive.rs`, specified in `docs/derived-keys.md` and pinned by test vectors
-that must never change. Pull requests that add further constructions or alter the derivation
-will be declined, however well-meant. Transport, orchestration, UX and docs are all fair game.
+`sealctl` is built only from established components: HKDF, HPKE (RFC 9180), Ed25519, X25519,
+ChaCha20-Poly1305 and BIP39 from established Rust crates, and APFS, LUKS2 and restic for data at
+rest. How they are combined (derivation, sealed files, pairing, requests and replies) is
+specified in [docs/protocol.md](docs/protocol.md) and pinned by the test vectors in
+`docs/vectors/`, which must never change for an existing protocol version. Pull requests that
+add new constructions or alter the derivation will be declined, however well-meant. Changes to
+the protocol, key handling or the store format start as a pull request to `docs/protocol.md`.
+Orchestration, UX, platform support and docs are all fair game.
 
 Other rules for security-sensitive code:
 
@@ -26,15 +29,17 @@ cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 ```
 
-Hardware tests need a Ledger with the OpenPGP app open and are run manually
-(`sealctl -v status`, `-vv` prints raw APDUs).
+`cargo test` runs the unit tests and the real `sealctl` binary against an in-process fake relay
+with a scripted phone (`crates/sealctl-fakerelay`). To test with a real phone, pair it with a
+throwaway HOME: `SEALCTL_RELAY=https://<relay> scripts/pair-test.sh`.
 
-On Linux install `libudev-dev libdbus-1-dev pkg-config` first.
+Backup tests need `restic`; on Linux, volume tests need `cryptsetup`.
 
 ## Pull requests
 
-- Keep PRs focused; describe what you tested (device model, transport, OS).
-- Add tests for pure logic (framing, parsing, config).
+- Keep PRs focused; describe what you tested (OS, and the phone's OS and app version if the
+  phone was involved).
+- Add tests for pure logic (parsing, formats, plans).
 - Update `CHANGELOG.md` under *Unreleased*.
 - By contributing you agree that your work is licensed under the MIT license.
 

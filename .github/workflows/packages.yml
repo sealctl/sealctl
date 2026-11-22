@@ -16,6 +16,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Supply chain (SPEC.md section 21): actions pinned to commit SHAs, the build container pinned
+# by digest, rustup-init checked against its digest, the compiler from rust-toolchain.toml.
+# Tag builds start without the Actions cache, so a poisoned cache entry cannot reach a release.
+
 jobs:
   # ---------------------------------------------------------------- build ----
   linux:
@@ -29,17 +33,33 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Rocky Linux 9 (glibc 2.34, supported to 2032): one binary for RHEL/Rocky/Alma 9+,
     # Fedora, Ubuntu 22.04+, Debian 12+, openSUSE and Arch
-    container: rockylinux:9
+    # rockylinux:9 by digest (2026-11-17 build); update the digest by hand now and then
+    container: rockylinux:9@sha256:03303863808e9cd79f0c58c833db3e5f9cde9f2abe16804a267b05dc54af86e4
     steps:
-      - name: Toolchain and libraries
+      - name: Libraries and rustup
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           dnf install -y --setopt=install_weak_deps=False gcc pkgconf-pkg-config systemd-devel \
             dbus-devel git tar gzip findutils
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          # rustup-init 1.29.3, checked against pinned digests (no curl | sh)
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu) sum=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;;
+            aarch64-unknown-linux-gnu) sum=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
+          esac
+          curl -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.29.3/$TARGET/rustup-init"
+          echo "$sum  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain none
           # The Rocky image declares no PATH, so GITHUB_PATH would replace it: set it in full.
           echo "PATH=$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-rocky9
       - name: Packaging tools
@@ -56,7 +76,7 @@ jobs:
           cargo generate-rpm -p crates/sealctl -o dist/
       - name: List
         run: ls -l dist && ldd target/release/sealctl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ matrix.arch }}
           path: dist/*
@@ -65,11 +85,15 @@ jobs:
     name: build macos
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml) and both targets
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build both architectures
         run: |
           cargo build --release --locked -p sealctl --target aarch64-apple-darwin
@@ -81,7 +105,7 @@ jobs:
           scripts/package.sh aarch64-apple-darwin
           scripts/package.sh x86_64-apple-darwin
           lipo -info target/*/release/sealctl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos
           path: dist/*
@@ -102,7 +126,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: linux-${{ matrix.arch }}
       - run: |
@@ -128,7 +152,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: linux-${{ matrix.arch }}
       - run: |
@@ -144,8 +168,10 @@ jobs:
     runs-on: ubuntu-24.04
     container: archlinux:latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: linux-*
           path: dist
@@ -167,8 +193,10 @@ jobs:
     needs: macos
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: macos
           path: dist
@@ -194,8 +222,10 @@ jobs:
         os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
       - run: |
           nix build --print-build-logs .#sealctl
           ./result/bin/sealctl --version
@@ -208,9 +238,14 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # build provenance attestations (Sigstore, via the workflow's OIDC token)
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -223,7 +258,18 @@ jobs:
         run: |
           BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
           scripts/render-pkgbuild.sh "$VERSION" "$BASE" dist > dist/PKGBUILD
-          cd dist && sha256sum *.tar.gz *.deb *.rpm PKGBUILD > SHA256SUMS
+          cd dist && sha256sum -- *.tar.gz *.deb *.rpm PKGBUILD > SHA256SUMS
+          # the per-tarball .sha256 files (used by the formula and PKGBUILD) agree with SHA256SUMS
+          for f in *.tar.gz; do grep -qx "$(cut -d' ' -f1 "$f.sha256")  $f" SHA256SUMS; done
+      # Users check a download with: gh attestation verify <file> --repo sealctl/sealctl
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+            dist/PKGBUILD
+            dist/SHA256SUMS
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -237,18 +283,35 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: release
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - uses: actions/checkout@v4
+      # What Homebrew users will download is what was built, hashed and attested here.
+      - name: Verify the published tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" -p '*.tar.gz' -D published
+          for f in published/*.tar.gz; do
+            n=$(basename "$f")
+            test "$(sha256sum "$f" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "dist/$n.sha256")"
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
+          done
+      # The deploy key is the only write access to the tap (its credentials stay in tap/.git).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: oleksiyp/homebrew-tap
+          repository: sealctl/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: tap
-      - run: |
+      - name: Formula
+        run: |
           VERSION="${GITHUB_REF_NAME#v}"
           BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
           mkdir -p tap/Formula
@@ -257,4 +320,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/sealctl.rb
-          git commit -m "sealctl $VERSION" && git push
+          git commit -m "sealctl $VERSION"
+          if git push origin HEAD:main; then exit 0; fi
+          # main on the tap accepts pull requests only (ruleset "main") unless the deploy key is
+          # one of its bypass actors: push a branch and leave the pull request to a maintainer.
+          BRANCH="formula/sealctl-$VERSION"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          URL="https://github.com/sealctl/homebrew-tap/compare/main...$BRANCH?expand=1"
+          echo "::warning::tap main is protected; open and merge the formula pull request: $URL"
+          echo "Formula for sealctl $VERSION is on branch \`$BRANCH\`: [open the pull request]($URL)" >> "$GITHUB_STEP_SUMMARY"

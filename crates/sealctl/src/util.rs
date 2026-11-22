@@ -6,8 +6,68 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
+/// A new UUID v4 (lower case).
+pub fn new_uuid() -> Result<String> {
+    sealctl_core::ids::new_uuid().map_err(|e| anyhow::anyhow!("system RNG failed: {e}"))
+}
+
+/// Runs `cmd` with each `(fd, bytes)` written to a pipe that the child sees as that file
+/// descriptor (`/dev/fd/3`, `/dev/fd/4`). Values never go through argv or the environment.
+///
+/// The copies of the values live in `Zeroizing` buffers from the start, so an early return
+/// (pipe, mapping or spawn failure) wipes them too. Once the child runs, `cmd` is replaced by an
+/// empty command: that drops the parent's read ends held by the fd mappings, so a writer blocked
+/// on a full pipe gets `BrokenPipe` when the child exits without reading, instead of hanging.
+/// `cmd` must not be used again by the caller.
+pub fn run_with_fds(
+    cmd: &mut Command,
+    fds: &[(i32, &[u8])],
+    stdin_data: Option<&[u8]>,
+) -> Result<std::process::Output> {
+    use command_fds::{CommandFdExt, FdMapping};
+    use std::os::fd::OwnedFd;
+    let mut mappings = Vec::new();
+    let mut writers = Vec::new();
+    for (fd, data) in fds {
+        let (r, w) = std::io::pipe().context("pipe")?;
+        mappings.push(FdMapping {
+            parent_fd: OwnedFd::from(r),
+            child_fd: *fd,
+        });
+        writers.push((w, Zeroizing::new(data.to_vec())));
+    }
+    cmd.fd_mappings(mappings)
+        .map_err(|e| anyhow::anyhow!("fd mapping: {e:?}"))?;
+    cmd.stdin(if stdin_data.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let name = format!("{:?}", cmd.get_program());
+    let mut child = cmd.spawn().with_context(|| format!("starting {name}"))?;
+    // the parent's read ends were moved into the mappings: drop them with the command
+    drop(std::mem::replace(cmd, Command::new("/nonexistent")));
+    // write and close each pipe
+    let mut threads = Vec::new();
+    for (mut w, data) in writers {
+        threads.push(std::thread::spawn(move || {
+            let _ = w.write_all(&data);
+        }));
+    }
+    if let Some(d) = stdin_data {
+        let mut stdin = child.stdin.take().context("stdin")?;
+        stdin.write_all(d)?;
+    }
+    let out = child.wait_with_output()?;
+    for t in threads {
+        let _ = t.join();
+    }
+    Ok(out)
+}
+
 /// A random secret of `n` bytes, hex-encoded (`2n` characters, no newline).
-/// Used for volume passphrases and restic passwords.
 pub fn random_secret(n: usize) -> Result<Zeroizing<String>> {
     let mut buf = Zeroizing::new(vec![0u8; n]);
     getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("system RNG failed: {e}"))?;
@@ -130,14 +190,42 @@ pub fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
-/// Read a value from the terminal without echo (for API keys typed by the user).
+/// Reads one line from the terminal on stdin without echo (prompt on stderr).
 pub fn read_hidden(prompt: &str) -> Result<Zeroizing<String>> {
-    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
+    use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
+    use std::io::BufRead;
+    use std::os::fd::AsFd;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let stdin = std::io::stdin();
+    // Not a terminal (piped input): nothing to hide. Any other failure to turn echo off stops
+    // here, before anything is read, so a hidden prompt never reads with echo on.
+    let orig = match tcgetattr(stdin.as_fd()) {
+        Ok(o) => Some(o),
+        Err(nix::errno::Errno::ENOTTY) => None,
+        Err(e) => anyhow::bail!("cannot turn off echo on this terminal: {e}"),
+    };
+    if let Some(o) = &orig {
+        let mut t = o.clone();
+        t.local_flags.remove(LocalFlags::ECHO);
+        t.local_flags.insert(LocalFlags::ECHONL);
+        tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &t)
+            .map_err(|e| anyhow::anyhow!("cannot turn off echo on this terminal: {e}"))?;
+    }
+    let mut line = Zeroizing::new(String::new());
+    let r = stdin.lock().read_line(&mut line);
+    if let Some(o) = &orig {
+        let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, o);
+    }
+    r?;
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
 }
 
-/// Tell the user what to do on the Ledger: on stderr, and as a desktop notification (useful when
-/// sealctl runs in the background — SSH agent, git signing, scheduled backups). The same
-/// message is repeated at most once a minute.
+/// A desktop notification (SPEC 5.2: when nobody watches a terminal): `osascript` on macOS,
+/// `notify-send` on Linux, silently skipped if missing. The same message at most once a minute.
 pub fn notify(msg: &str) {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -150,7 +238,6 @@ pub fn notify(msg: &str) {
         }
         shown.push((msg.to_string(), Instant::now()));
     }
-    eprintln!("👉 {msg}");
     if std::env::var_os("SEALCTL_NO_NOTIFY").is_some() {
         return;
     }
@@ -259,5 +346,35 @@ impl Since {
     pub fn elapsed(&self) -> std::time::Duration {
         let wall = self.wall.elapsed().unwrap_or_default();
         self.mono.elapsed().max(wall)
+    }
+}
+
+#[cfg(test)]
+mod fd_tests {
+    use super::*;
+
+    /// A child that exits without reading a value larger than a pipe holds: the call returns.
+    #[test]
+    fn a_child_that_does_not_read_does_not_hang() {
+        let big = vec![b'x'; 4 << 20];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", "exit 3"]);
+            let out = run_with_fds(&mut c, &[(3, &big)], None).map(|o| o.status.code());
+            let _ = tx.send(out.ok().flatten());
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("run_with_fds hung on an unread pipe");
+        assert_eq!(code, Some(3));
+    }
+
+    #[test]
+    fn values_reach_the_child() {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "cat /dev/fd/3; cat /dev/fd/4"]);
+        let out = run_with_fds(&mut c, &[(3, b"one"), (4, b"two")], None).unwrap();
+        assert_eq!(out.stdout, b"onetwo");
     }
 }

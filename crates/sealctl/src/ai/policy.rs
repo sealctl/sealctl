@@ -24,7 +24,7 @@ pub fn prompt(text: &str) -> Option<String> {
         .map(|f| format!("{} {}", f.kind, f.preview))
         .collect();
     Some(format!(
-        "🔐 sealctl: this prompt was NOT sent — it seems to contain a secret ({}).\n\
+        "sealctl: this prompt was NOT sent — it seems to contain a secret ({}).\n\
          Store it instead: copy the key and ask \"store it as <project>/<name>\" — the assistant \
          runs `sealctl secret set <project>/<name> --from-clipboard` and never sees the value.\n\
          Not a secret? Send the prompt again starting with #nosecret.\n\
@@ -39,16 +39,8 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
     P.get_or_init(|| {
         [
             (
-                r"\bsealctl\b[^|;&]*\bsecret\s+get\b",
-                "`sealctl secret get` would put the secret into the conversation. Use `sealctl run -- <command>` so only the program sees it.",
-            ),
-            (
-                r"\bsealctl\b[^|;&]*\bssh\s+passphrase\b",
-                "the SSH key passphrase must not enter the conversation; the user runs this in their own terminal.",
-            ),
-            (
-                r"\bsealctl\b[^|;&]*\brecover\b",
-                "`sealctl recover` asks for the 24-word recovery phrase — only the user runs it, in their own terminal.",
+                r"(?:^|[\s|;&(])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|awk|sed|cut|cp|base64)\s[^|;&]*(?:\.sealed\b|machine\.json|\.local/state/sealctl|\.local/share/sealctl)",
+                "sealctl's own files are not for the conversation. Use `sealctl secret ls` for names and `sealctl run` for values.",
             ),
             (
                 r"(?:^|[|;&(`]|\$\()\s*(?:sudo\s+)?(?:printenv|env|set|export\s+-p|declare\s+-x)\s*(?:$|[|;&)>`])",
@@ -80,7 +72,7 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
             ),
             (
                 r"<\s*\.env\b",
-                "`.env` files hold secrets. Use `sealctl secret import-env` and `sealctl run`.",
+                "`.env` files hold secrets. Use `sealctl seal env` and `sealctl run`.",
             ),
             (
                 r"\b(?:pbpaste|wl-paste|xclip\b[^|;&]*-o|xsel\b[^|;&]*-o)",
@@ -119,6 +111,9 @@ pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
     for safe in SAFE_ENV_FILES {
         probe = probe.replace(safe, "EXAMPLE_FILE");
     }
+    if let Some(why) = sealctl_in(command, 0) {
+        return Some(format!("sealctl: {why}"));
+    }
     for (re, why) in deny_patterns() {
         if re.is_match(&probe) {
             return Some(format!("sealctl: {why}"));
@@ -149,6 +144,286 @@ pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
         ));
     }
     None
+}
+
+/// The sealctl subcommands an agent must not run, by the words that name them.
+fn denied_verb(verb: &str, sub: Option<&str>) -> Option<&'static str> {
+    const USER_ONLY: &str =
+        "only the user runs this, in their own terminal. Tell the user the command to run.";
+    match (verb, sub) {
+        ("secret", Some("get")) => Some(
+            "`sealctl secret get` would put the secret into the conversation. Use `sealctl run -- <command>` so only the program sees it.",
+        ),
+        ("aws", Some("credentials")) | ("git", Some("credential")) => Some(
+            "the credential helpers print values for git and the AWS CLI, not for the conversation. Run `git push` or `aws` itself.",
+        ),
+        ("recover", _) => Some(
+            "`sealctl recover` asks for the 24-word recovery phrase — only the user runs it, in their own terminal.",
+        ),
+        ("seal" | "unseal" | "buy" | "unpair", _)
+        | ("secret", Some("import-env"))
+        | ("volume" | "ssh", Some("import")) => Some(USER_ONLY),
+        _ => None,
+    }
+}
+
+/// The simple commands of a shell command line, each as its words with quotes removed. Pipes,
+/// lists, subshells and command substitutions (`$(…)`, backquotes, also inside double quotes)
+/// separate commands. Not a full shell parser: it is meant to find which program each command
+/// runs and with which arguments, erring towards splitting more.
+fn simple_commands(text: &str) -> Vec<Vec<String>> {
+    let mut cmds = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let cs: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let end_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
+        if *in_word {
+            words.push(std::mem::take(word));
+            *in_word = false;
+        }
+    };
+    let end_cmd = |words: &mut Vec<String>, cmds: &mut Vec<Vec<String>>| {
+        if !words.is_empty() {
+            cmds.push(std::mem::take(words));
+        }
+    };
+    while i < cs.len() {
+        let c = cs[i];
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Some(_) => match c {
+                '"' => quote = None,
+                '\\' if i + 1 < cs.len() => {
+                    i += 1;
+                    word.push(cs[i]);
+                }
+                // a command substitution inside double quotes runs a command too
+                '`' => {
+                    quote = None;
+                    end_word(&mut word, &mut in_word, &mut words);
+                    end_cmd(&mut words, &mut cmds);
+                }
+                '$' if cs.get(i + 1) == Some(&'(') => {
+                    quote = None;
+                    i += 1;
+                    end_word(&mut word, &mut in_word, &mut words);
+                    end_cmd(&mut words, &mut cmds);
+                }
+                c => word.push(c),
+            },
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                '\\' if i + 1 < cs.len() => {
+                    i += 1;
+                    if cs[i] != '\n' {
+                        word.push(cs[i]);
+                        in_word = true;
+                    }
+                }
+                ' ' | '\t' => end_word(&mut word, &mut in_word, &mut words),
+                // `2>&1`, `>&2`, `&>file`: redirections, not separators
+                '&' if i > 0 && matches!(cs[i - 1], '>' | '<') => word.push(c),
+                '&' if cs.get(i + 1) == Some(&'>') => word.push(c),
+                '|' | ';' | '&' | '\n' | '(' | ')' | '`' | '{' | '}' => {
+                    end_word(&mut word, &mut in_word, &mut words);
+                    end_cmd(&mut words, &mut cmds);
+                }
+                '$' if cs.get(i + 1) == Some(&'(') => {
+                    i += 1;
+                    end_word(&mut word, &mut in_word, &mut words);
+                    end_cmd(&mut words, &mut cmds);
+                }
+                c => {
+                    word.push(c);
+                    in_word = true;
+                }
+            },
+        }
+        i += 1;
+    }
+    end_word(&mut word, &mut in_word, &mut words);
+    end_cmd(&mut words, &mut cmds);
+    cmds
+}
+
+/// Why a command line may not run, if one of its commands runs a denied sealctl subcommand.
+fn sealctl_in(text: &str, depth: usize) -> Option<&'static str> {
+    if depth > 8 {
+        return None;
+    }
+    simple_commands(text)
+        .iter()
+        .find_map(|words| sealctl_argv(words, depth))
+}
+
+/// The same for one command's words: the program is found past variable assignments, shell
+/// keywords and wrappers (`env`, `command`, `sudo`, `xargs`, …), at any path; `sh -c` and `eval`
+/// are looked into, and so is the command `sealctl run` starts.
+fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
+    if depth > 8 {
+        return None;
+    }
+    let is_assignment = |w: &str| {
+        w.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty()
+                && !k.starts_with(|c: char| c.is_ascii_digit())
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let mut i = 0;
+    while i < words.len() && (is_assignment(&words[i]) || is_keyword(&words[i])) {
+        i += 1;
+    }
+    let names_switch = |w: &str| {
+        let name = w.split_once('=').map_or(w, |(k, _)| k);
+        crate::guard::agent_variables().any(|v| v == name)
+    };
+    // the agent variables are how sealctl knows an agent runs a command; changing them is the
+    // user's call, not the agent's (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`, `env -u …`)
+    const SWITCH: &str = "the agent variables (SEALCTL_AGENT, CLAUDECODE, …) tell sealctl an agent runs this; only the user changes them.";
+    if words[..i].iter().any(|w| names_switch(w)) {
+        return Some(SWITCH);
+    }
+    let prog = words.get(i)?;
+    let base = prog.rsplit('/').next().unwrap_or(prog);
+    let rest = &words[i + 1..];
+    if matches!(
+        base,
+        "export" | "unset" | "env" | "declare" | "typeset" | "local" | "readonly" | "unsetenv" | "setenv"
+    ) && rest.iter().any(|w| names_switch(w))
+    {
+        return Some(SWITCH);
+    }
+    if base == "git" {
+        return git_credential(rest);
+    }
+    // options of a wrapper that take a value
+    let wrapper_value_opts: &[&str] = match base {
+        "env" => &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+        "sudo" | "doas" => &["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U"],
+        "nice" => &["-n", "--adjustment"],
+        "timeout" => &["-s", "--signal", "-k", "--kill-after"],
+        "xargs" => &["-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a"],
+        "stdbuf" => &["-i", "-o", "-e"],
+        "command" | "exec" | "nohup" | "time" | "caffeinate" | "builtin" => &[],
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
+            // `sh -c 'text'` (also `-lc`, `-ec`, …)
+            let c = rest
+                .iter()
+                .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))?;
+            return sealctl_in(rest.get(c + 1)?, depth + 1);
+        }
+        "eval" => return sealctl_in(&rest.join(" "), depth + 1),
+        "sealctl" => return sealctl_args(rest, depth),
+        _ => return None,
+    };
+    let mut j = 0;
+    while j < rest.len() {
+        let w = rest[j].as_str();
+        if w == "--" {
+            j += 1;
+            break;
+        }
+        if base == "env" && is_assignment(w) {
+            j += 1;
+        } else if w.starts_with('-') && w.len() > 1 {
+            j += if wrapper_value_opts.contains(&w) { 2 } else { 1 };
+        } else {
+            break;
+        }
+    }
+    // `timeout` has a duration before the command
+    if base == "timeout" && j < rest.len() {
+        j += 1;
+    }
+    sealctl_argv(rest.get(j..)?, depth + 1)
+}
+
+/// `git credential fill` and `git credential-<helper> get` print the stored password or token.
+fn git_credential(args: &[String]) -> Option<&'static str> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() && positional.len() < 2 {
+        let w = args[i].as_str();
+        i += 1;
+        if positional.is_empty()
+            && matches!(
+                w,
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "--exec-path"
+            )
+        {
+            i += 1;
+        } else if !w.starts_with('-') {
+            positional.push(w);
+        }
+    }
+    let prints = match positional.as_slice() {
+        ["credential", "fill", ..] => true,
+        [helper, "get", ..] => helper.starts_with("credential-"),
+        _ => false,
+    };
+    prints.then_some(
+        "`git credential fill` prints the stored password or token. Run `git push` or `git fetch`, which use it without printing it.",
+    )
+}
+
+fn is_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "!" | "{" | "}" | "time" | "exec"
+    )
+}
+
+/// sealctl's arguments: its global options are skipped, the first word left is the subcommand,
+/// and the next one its own subcommand (`secret get`, `git credential`).
+fn sealctl_args(args: &[String], depth: usize) -> Option<&'static str> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() && positional.len() < 2 {
+        let w = args[i].as_str();
+        if w == "--relay" {
+            i += 2;
+            continue;
+        }
+        if w == "--" {
+            break;
+        }
+        if w.starts_with('-') && w.len() > 1 {
+            i += 1;
+            continue;
+        }
+        positional.push(w);
+        i += 1;
+        if positional == ["run"] {
+            // the command `run` starts: after `--`, or the first word that is not an option
+            let mut j = i;
+            while j < args.len() {
+                match args[j].as_str() {
+                    "--" => {
+                        j += 1;
+                        break;
+                    }
+                    "-e" | "--env" | "--relay" => j += 2,
+                    w if w.starts_with('-') => j += 1,
+                    _ => break,
+                }
+            }
+            return sealctl_argv(args.get(j..)?, depth + 1);
+        }
+    }
+    denied_verb(positional.first()?, positional.get(1).copied())
 }
 
 /// A shell command, without knowing the working directory.
@@ -195,6 +470,16 @@ pub fn read(path: &str) -> Option<String> {
             "sealctl: this file holds credentials and must not be read into the conversation.".into(),
         );
     }
+    if name.ends_with(".sealed")
+        || (name == "machine.json" && path.contains("sealctl"))
+        || path.contains("/.local/state/sealctl/")
+        || path.contains("/.local/share/sealctl/")
+    {
+        return Some(
+            "sealctl: sealctl's own files are not for the conversation. Use `sealctl secret ls` for names."
+                .into(),
+        );
+    }
     let private_key = (name.starts_with("id_") && !name.ends_with(".pub"))
         || name.ends_with(".pem")
         || name.ends_with(".key")
@@ -202,7 +487,7 @@ pub fn read(path: &str) -> Option<String> {
     if secret_env {
         Some(
             "sealctl: `.env` files hold secrets and must not be read into the conversation. \
-             Move it into sealctl: `sealctl secret import-env <file> --prefix <project> --delete`; \
+             Move it into sealctl: `sealctl secret import-env <file> --prefix <project> --delete` (the user runs it); \
              programs then get the values via `sealctl run`."
                 .into(),
         )
@@ -215,7 +500,10 @@ pub fn read(path: &str) -> Option<String> {
 
 /// One line of context for a new session: that sealctl exists, and which secrets (names only).
 pub fn session_context() -> String {
-    let names = crate::secrets::list().unwrap_or_default();
+    let names: Vec<String> = crate::store::Store::configured()
+        .and_then(|s| s.list())
+        .map(|l| l.into_iter().map(|x| x.name).collect())
+        .unwrap_or_default();
     let shown: Vec<&str> = names.iter().take(40).map(String::as_str).collect();
     let more = if names.len() > shown.len() {
         format!(" (+{} more)", names.len() - shown.len())
@@ -223,10 +511,7 @@ pub fn session_context() -> String {
         String::new()
     };
     format!(
-        "Secrets on this machine are managed by sealctl (Ledger-encrypted). Never read or print \
-         secret values or .env files; programs get secrets with `sealctl run -- <command>`, new \
-         keys are stored with `sealctl secret set <name> --from-clipboard` (see the \
-         sealctl-secrets skill). Stored secret names: {}{more}.",
+        "sealctl: secrets are available by name through sealctl run (names: {}{more}). Values are never shown.",
         if shown.is_empty() {
             "none yet".to_string()
         } else {
@@ -250,9 +535,13 @@ mod tests {
     fn leaking_commands_are_denied() {
         for c in [
             "sealctl secret get myapp/openai",
-            "cd x && sealctl -t ble secret get k",
-            "sealctl ssh passphrase",
+            "cd x && sealctl -v secret get k",
             "sealctl recover",
+            "sealctl unseal --all",
+            "sealctl seal volume safe disk3s5",
+            "sealctl buy",
+            "sealctl git credential get",
+            "cat ~/.local/share/sealctl/store/x/a.sealed",
             "printenv",
             "env | grep KEY",
             "echo $OPENAI_API_KEY",
@@ -298,6 +587,104 @@ mod tests {
             "env FOO=bar cargo run",
             "grep -r environment src/",
             "cat README.md",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c}: {:?}", bash(c));
+        }
+    }
+
+    #[test]
+    fn sealctl_subcommands_are_matched_not_words() {
+        // secret names, values and other arguments that contain a denied word
+        for c in [
+            "sealctl run -e KEY=shop/buy -- curl https://example.test",
+            "sealctl run -e T=ops/unseal-token -- make deploy",
+            "sealctl run -e K=x/recover -e L=app/seal -- ./deploy.sh",
+            "sealctl run --env G=git/credential -- git push",
+            "sealctl run -e A=aws/credentials -- aws s3 ls",
+            "sealctl run -e K=shop/get -- npm test",
+            "sealctl secret set shop/buy-key --from-clipboard",
+            "sealctl secret set team/unpair --from-clipboard",
+            "sealctl secret mv seal/get unseal/recover",
+            "sealctl secret ls | grep buy",
+            "sealctl status --relay https://buy.example.test",
+            "sealctl -v run -- echo seal unseal buy recover",
+            "echo sealctl secret get",
+            "grep -rn 'sealctl secret get' docs/",
+            "git commit -m 'deny sealctl buy and sealctl unseal'",
+            "sealctl volume open recover",
+            "sealctl ssh ls",
+            "sealctl git setup",
+            "command -v sealctl",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c}: {:?}", bash(c));
+        }
+        // the denied subcommands, however they are reached
+        for c in [
+            "sealctl secret get k",
+            "/usr/local/bin/sealctl secret get k",
+            "./target/debug/sealctl secret get k",
+            "cd /tmp && ~/bin/sealctl secret get k",
+            "\"sealctl\" recover",
+            "'sealctl' 'secret' 'get' k",
+            "sealc\\tl buy",
+            "sealctl -vv --relay https://r.test secret get k",
+            "sealctl --relay=https://r.test unpair --yes",
+            "sealctl secret --relay https://r.test get k",
+            "env sealctl secret get k",
+            "env -i PATH=/usr/bin FOO=1 sealctl unseal --all",
+            "env -u HOME -- sealctl seal env .env --prefix p",
+            "FOO=1 sealctl aws credentials --profile p",
+            "command sealctl buy",
+            "exec sealctl recover",
+            "sudo -u me sealctl unseal secrets",
+            "nohup sealctl recover &",
+            "time sealctl git credential get",
+            "timeout 5 sealctl secret get k",
+            "xargs sealctl secret get < names.txt",
+            "echo k | xargs -n 1 sealctl secret get",
+            "bash -c 'sealctl secret get k'",
+            "sh -lc \"sealctl unpair --yes\"",
+            "eval sealctl secret get k",
+            "echo \"$(sealctl secret get k)\"",
+            "x=`sealctl secret get k`; echo $x",
+            "if sealctl secret get k >/dev/null; then echo y; fi",
+            "true && (sealctl seal ssh ~/.ssh/id_ed25519)",
+            "sealctl secret get k 2>&1 | cat",
+            "sealctl run -- sealctl secret get k",
+            "sealctl run -e K=a/b -- env sealctl aws credentials",
+            "sealctl secret import-env .env --prefix p --delete",
+            "sealctl volume import safe disk3s5",
+            "sealctl ssh import ~/.ssh/id_ed25519",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c}");
+        }
+    }
+
+    #[test]
+    fn git_credential_fill_and_the_agent_switch() {
+        for c in [
+            "printf 'host=github.com\\n' | git credential fill",
+            "echo host=github.com | git -c credential.helper= credential fill",
+            "git -C /repo credential fill < req",
+            "git credential-osxkeychain get",
+            "git credential-store get",
+            "SEALCTL_AGENT=0 sealctl secret ls",
+            "CLAUDECODE= sealctl run -- env",
+            "env -u CLAUDECODE sealctl git credential get",
+            "unset CLAUDECODE; git push",
+            "export SEALCTL_AGENT=0",
+            "env SEALCTL_AGENT=0 aws s3 ls",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c}");
+        }
+        for c in [
+            "git push origin main",
+            "git credential approve < x",
+            "git log --grep credential",
+            "git config --get credential.helper",
+            "grep -rn SEALCTL_AGENT src/",
+            "echo $CLAUDECODE",
+            "export PATH=$PATH:/x",
         ] {
             assert!(bash(c).is_none(), "should allow: {c}: {:?}", bash(c));
         }

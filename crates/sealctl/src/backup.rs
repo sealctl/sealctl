@@ -1,645 +1,585 @@
-//! Encrypted, versioned backups of volumes with restic.
-//!
-//! How it works without a daemon:
-//! * the restic password is **derived from the Ledger seed and the repository URL**
-//!   (`crate::derive`, purpose "restic") — nothing to back up; with the 24 words and the
-//!   repository URL you can always open the repository again;
-//! * a cached copy of the password and the storage credentials live **inside the encrypted
-//!   volume** (`<mount>/.sealctl/`), readable exactly while the volume is unlocked;
-//! * a scheduled job runs `sealctl backup run --all --if-unlocked` (no Ledger needed), and
-//!   `sealctl lock` runs a final backup before unmounting.
+//! Backups with restic on derived keys (SPEC 14). The repository password is
+//! `hex(derive(root, "backup:<repository-id>", 16))`, handed to restic on a pipe; storage
+//! credentials are secrets `backup/<name>/<VAR>` in the store. Nothing secret is written to
+//! disk: the daemon holds the key and the credentials while the session is Open.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use sealctl_core::wire::{ObjectFacts, RequestItem};
+use sealctl_core::ObjectKey;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::derive::{self, Oracle, Purpose};
-use crate::volume::{BackupPolicy, Volume};
-use crate::{paths, util};
+use crate::exit::{self, fail};
+use crate::paths;
 
-/// Everything restic needs. Secret: stored only inside the encrypted volume.
-#[derive(Serialize, Deserialize)]
-pub struct RepoSecrets {
-    pub repository: String,
-    pub password: String,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
+/// Retention and when backups run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Policy {
+    /// Back up before the session locks.
+    #[serde(default = "yes")]
+    pub on_lock: bool,
+    /// Include in scheduled backups.
+    #[serde(default = "yes")]
+    pub scheduled: bool,
+    /// `--keep-daily`.
+    #[serde(default = "d7")]
+    pub keep_daily: u32,
+    /// `--keep-weekly`.
+    #[serde(default = "d4")]
+    pub keep_weekly: u32,
+    /// `--keep-monthly`.
+    #[serde(default = "d12")]
+    pub keep_monthly: u32,
 }
 
-impl Drop for RepoSecrets {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.password.zeroize();
-        for v in self.env.values_mut() {
-            v.zeroize();
+fn yes() -> bool {
+    true
+}
+fn d7() -> u32 {
+    7
+}
+fn d4() -> u32 {
+    4
+}
+fn d12() -> u32 {
+    12
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Policy {
+            on_lock: true,
+            scheduled: true,
+            keep_daily: 7,
+            keep_weekly: 4,
+            keep_monthly: 12,
         }
     }
 }
 
+/// `~/.config/sealctl/backups/<name>.toml`. No secrets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Backup {
+    /// Name.
+    pub name: String,
+    /// What is backed up: a folder, or a volume's mount point.
+    pub source: PathBuf,
+    /// The volume it backs up, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    /// The restic repository URL.
+    pub repo: String,
+    /// The repository id (its last path segment).
+    pub repo_id: String,
+    /// Words fingerprint.
+    pub words: String,
+    /// `check(backup key)`.
+    pub check: String,
+    /// Names of the storage credential variables (secrets `backup/<name>/<VAR>`).
+    #[serde(default)]
+    pub credentials: Vec<String>,
+    /// Policy.
+    #[serde(default)]
+    pub policy: Policy,
+}
+
+/// Last backup times.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BackupState {
+    /// Last successful backup, Unix seconds.
     pub last_success: Option<u64>,
-    pub last_attempt: Option<u64>,
+    /// Last error.
     pub last_error: Option<String>,
+    /// Last `forget --prune`, Unix seconds.
     pub last_prune: Option<u64>,
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn state_file(vol: &str) -> Result<PathBuf> {
-    Ok(paths::state_dir()?.join("backup").join(format!("{vol}.toml")))
-}
-
-pub fn load_state(vol: &str) -> BackupState {
-    state_file(vol)
-        .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-fn save_state(vol: &str, s: &BackupState) -> Result<()> {
-    let p = state_file(vol)?;
-    fs::create_dir_all(p.parent().context("dir")?)?;
-    fs::write(p, toml::to_string(s)?)?;
-    Ok(())
-}
-
+/// The restic binary (`SEALCTL_RESTIC` or `restic`).
 pub fn restic_bin() -> String {
     std::env::var("SEALCTL_RESTIC").unwrap_or_else(|_| "restic".into())
 }
 
-fn inner_secrets_file(vol: &Volume) -> PathBuf {
-    vol.inner_dir().join("backup.toml")
-}
-
-fn inner_password_file(vol: &Volume) -> PathBuf {
-    vol.inner_dir().join("restic-password")
-}
-
-fn write_inner(vol: &Volume, s: &RepoSecrets) -> Result<()> {
-    if let Err(e) = paths::ensure_private_dir(&vol.inner_dir()) {
-        let denied = e
-            .chain()
-            .filter_map(|c| c.downcast_ref::<std::io::Error>())
-            .any(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
-        if denied {
-            // New APFS volumes have a root-owned top directory.
-            anyhow::bail!(
-                "{e:#}\n   The top folder of the volume is not yours. Fix it once (it stays on the volume):\n   \
-                 sudo chown \"$USER\" {}",
-                vol.mountpoint.display()
-            );
-        }
-        return Err(e);
-    }
-    paths::write_private(&inner_secrets_file(vol), toml::to_string(s)?.as_bytes())?;
-    paths::write_private(&inner_password_file(vol), s.password.as_bytes())?;
-    Ok(())
-}
-
-fn read_inner(vol: &Volume) -> Result<RepoSecrets> {
-    let text = Zeroizing::new(fs::read_to_string(inner_secrets_file(vol)).with_context(|| {
-        format!(
-            "backup settings missing in '{}' — run `sealctl backup init`",
-            vol.name
-        )
-    })?);
-    Ok(toml::from_str(&text)?)
-}
-
-enum Probe {
-    Exists,
-    Missing,
-    WrongPassword,
-}
-
-/// How restic gets its password: a file inside the unlocked volume, or our stdin pipe.
-enum Password {
-    File(PathBuf),
-    Pipe(Zeroizing<String>),
-}
-
-struct Repo {
-    secrets: RepoSecrets,
-    password: Password,
-}
-
-impl Repo {
-    fn from_unlocked(vol: &Volume) -> Result<Repo> {
-        Ok(Repo {
-            secrets: read_inner(vol)?,
-            password: Password::File(inner_password_file(vol)),
-        })
-    }
-
-    /// Works while locked or lost too: the password is derived on the Ledger from the
-    /// repository's key id; storage credentials come from the environment or a prompt.
-    fn open(oracle: &mut dyn Oracle, vol: &Volume) -> Result<Repo> {
-        if vol.is_unlocked().unwrap_or(false) && inner_secrets_file(vol).exists() {
-            return Self::from_unlocked(vol);
-        }
-        let policy = vol
-            .backup
-            .as_ref()
-            .filter(|b| !b.repository.is_empty())
-            .context("no backup configured for this volume")?;
-        Self::derived(oracle, &policy.repository, policy.password_id())
-    }
-
-    fn derived(oracle: &mut dyn Oracle, repository: &str, key_id: &str) -> Result<Repo> {
-        let password = derive::passphrase(oracle, Purpose::Restic, key_id)?;
-        let env = collect_env(repository, &[])?;
-        Ok(Repo {
-            secrets: RepoSecrets {
-                repository: repository.to_string(),
-                password: password.to_string(),
-                env,
-            },
-            password: Password::Pipe(password),
-        })
-    }
-
-    /// Does a repository exist at the URL, and does our password open it? (No output.)
-    fn probe(&self) -> Result<Probe> {
-        let mut c = self.command();
-        c.args(["cat", "config"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let out = match &self.password {
-            Password::File(_) => c.stdin(Stdio::null()).output(),
-            Password::Pipe(pw) => {
-                let mut child = c.stdin(Stdio::piped()).spawn().context("starting restic")?;
-                {
-                    use std::io::Write;
-                    let mut i = child.stdin.take().context("stdin")?;
-                    i.write_all(pw.as_bytes())?;
-                }
-                child.wait_with_output()
-            }
-        }
-        .context("starting restic")?;
-        if out.status.success() {
-            return Ok(Probe::Exists);
-        }
-        let err = String::from_utf8_lossy(&out.stderr);
-        if err.contains("does not exist") || err.contains("unable to open config file") {
-            Ok(Probe::Missing)
-        } else if err.contains("wrong password") || err.contains("no key found") {
-            Ok(Probe::WrongPassword)
-        } else {
-            bail!("restic could not open the repository:\n{}", err.trim())
-        }
-    }
-
-    /// The id of the restic key our password opens.
-    fn current_key(&self) -> Result<String> {
-        #[derive(serde::Deserialize)]
-        struct Key {
-            current: bool,
-            id: String,
-        }
-        let out = self
-            .command()
-            .args(["key", "list", "--json"])
-            .stdin(Stdio::null())
-            .output()
-            .context("starting restic")?;
-        if !out.status.success() {
-            bail!(
-                "restic key list failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        let keys: Vec<Key> = serde_json::from_slice(&out.stdout).context("parsing restic key list")?;
-        keys.into_iter()
-            .find(|k| k.current)
-            .map(|k| k.id)
-            .context("restic did not mark a current key")
-    }
-
-    fn command(&self) -> Command {
-        let mut c = Command::new(restic_bin());
-        c.env("RESTIC_REPOSITORY", &self.secrets.repository);
-        for (k, v) in &self.secrets.env {
-            c.env(k, v);
-        }
-        match &self.password {
-            Password::File(p) => {
-                c.env("RESTIC_PASSWORD_FILE", p);
-            }
-            Password::Pipe(_) => {
-                c.env("RESTIC_PASSWORD_FILE", "/dev/stdin");
-            }
-        }
-        c
-    }
-
-    /// Run restic with inherited stdout/stderr.
-    fn run(&self, args: &[&str], quiet: bool) -> Result<()> {
-        let mut c = self.command();
-        c.args(args);
-        if quiet {
-            c.stdout(Stdio::null());
-        }
-        let status = match &self.password {
-            Password::File(_) => c.stdin(Stdio::null()).status(),
-            Password::Pipe(pw) => {
-                c.stdin(Stdio::piped());
-                let mut child = c.spawn().context("starting restic (is it installed?)")?;
-                {
-                    use std::io::Write;
-                    let mut i = child.stdin.take().context("stdin")?;
-                    i.write_all(pw.as_bytes())?;
-                }
-                child.wait()
-            }
-        }
-        .context("starting restic (is it installed? brew install restic / apt install restic)")?;
-        if !status.success() {
-            bail!("restic {} failed ({status})", args.first().unwrap_or(&""));
-        }
-        Ok(())
-    }
-}
-
-/// Credentials restic needs for common backends, asked for when not given.
-fn needed_env(repo: &str) -> Vec<&'static str> {
+/// Credentials restic needs for common backends.
+pub fn needed_env(repo: &str) -> Vec<&'static str> {
     if repo.starts_with("s3:") {
         vec!["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
     } else if repo.starts_with("b2:") {
         vec!["B2_ACCOUNT_ID", "B2_ACCOUNT_KEY"]
     } else if repo.starts_with("azure:") {
         vec!["AZURE_ACCOUNT_NAME", "AZURE_ACCOUNT_KEY"]
+    } else if repo.starts_with("gs:") {
+        vec!["GOOGLE_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]
     } else {
         vec![]
     }
 }
 
-/// Storage credentials: `--env` pairs, then the process environment, then a hidden prompt.
-fn collect_env(repository: &str, env_pairs: &[String]) -> Result<BTreeMap<String, String>> {
-    let mut env = BTreeMap::new();
-    for p in env_pairs {
-        let (k, v) = p
-            .split_once('=')
-            .with_context(|| format!("expected KEY=VALUE, got {p:?}"))?;
-        env.insert(k.to_string(), v.to_string());
+fn now_secs() -> u64 {
+    crate::machine::now_ms() / 1000
+}
+
+impl Backup {
+    fn file(name: &str) -> Result<PathBuf> {
+        Ok(paths::backups_dir()?.join(format!("{name}.toml")))
     }
-    for key in needed_env(repository) {
+
+    /// Loads a definition (exit 9).
+    pub fn load(name: &str) -> Result<Backup> {
+        crate::volume::validate_name(name)?;
+        let text = std::fs::read_to_string(Self::file(name)?)
+            .map_err(|_| fail(exit::NOT_FOUND, format!("No backup {name}.")))?;
+        Ok(toml::from_str(&text)?)
+    }
+
+    /// Saves it.
+    pub fn save(&self) -> Result<()> {
+        paths::ensure_private_dir(&paths::backups_dir()?)?;
+        paths::write_private(&Self::file(&self.name)?, toml::to_string_pretty(self)?.as_bytes())
+    }
+
+    /// Every definition.
+    pub fn list() -> Result<Vec<Backup>> {
+        let Ok(rd) = std::fs::read_dir(paths::backups_dir()?) else {
+            return Ok(vec![]);
+        };
+        let mut v: Vec<Backup> = rd
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|t| toml::from_str(&t).ok())
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(v)
+    }
+
+    /// Removes the definition.
+    pub fn forget(&self) -> Result<()> {
+        let _ = std::fs::remove_file(Self::file(&self.name)?);
+        Ok(())
+    }
+
+    /// The `keys` item for its key.
+    pub fn request_item(&self) -> RequestItem {
+        RequestItem {
+            purpose: "backup".into(),
+            id: self.repo_id.clone(),
+            words: Some(self.words.clone()),
+            check: Some(self.check.clone()),
+            object: Some(ObjectFacts {
+                kind: "backup".into(),
+                path: self.repo.clone(),
+                size: 0,
+            }),
+        }
+    }
+
+    /// Secret names of its credentials.
+    pub fn credential_names(&self) -> Vec<String> {
+        self.credentials
+            .iter()
+            .map(|v| format!("backup/{}/{v}", self.name))
+            .collect()
+    }
+
+    /// Last backup times.
+    pub fn state(&self) -> BackupState {
+        paths::backup_state_dir()
+            .ok()
+            .and_then(|d| std::fs::read_to_string(d.join(format!("{}.toml", self.name))).ok())
+            .and_then(|t| toml::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_state(&self, st: &BackupState) -> Result<()> {
+        let d = paths::backup_state_dir()?;
+        paths::ensure_private_dir(&d)?;
+        paths::write_private(
+            &d.join(format!("{}.toml", self.name)),
+            toml::to_string(st)?.as_bytes(),
+        )
+    }
+}
+
+/// A repository opened with its password and credentials.
+pub struct Repo {
+    /// Repository URL.
+    pub url: String,
+    password: Zeroizing<String>,
+    env: BTreeMap<String, Zeroizing<String>>,
+}
+
+impl Repo {
+    /// From a backup key.
+    pub fn new(url: &str, key: &ObjectKey, env: BTreeMap<String, Zeroizing<String>>) -> Repo {
+        Repo {
+            url: url.into(),
+            password: key.hex(),
+            env,
+        }
+    }
+
+    /// From a plain password (for `unseal`, `seal` and `recover`).
+    pub fn with_password(
+        url: &str,
+        password: Zeroizing<String>,
+        env: BTreeMap<String, Zeroizing<String>>,
+    ) -> Repo {
+        Repo {
+            url: url.into(),
+            password,
+            env,
+        }
+    }
+
+    /// restic with the repository, credentials, and the password on stdin.
+    pub fn command(&self) -> Command {
+        let mut c = Command::new(restic_bin());
+        c.env("RESTIC_REPOSITORY", &self.url);
+        c.env("RESTIC_PASSWORD_FILE", "/dev/stdin");
+        c.env_remove("RESTIC_PASSWORD");
+        c.env_remove("RESTIC_PASSWORD_COMMAND");
+        for (k, v) in &self.env {
+            c.env(k, v.as_str());
+        }
+        if self.url.contains(".r2.cloudflarestorage.com") && !self.env.contains_key("AWS_DEFAULT_REGION") {
+            c.env("AWS_DEFAULT_REGION", "auto");
+        }
+        c
+    }
+
+    /// Runs restic with output captured.
+    pub fn output(&self, args: &[&str]) -> Result<std::process::Output> {
+        let mut c = self.command();
+        c.args(args);
+        crate::util::run_with_stdin(&mut c, self.password.as_bytes())
+            .context("starting restic (is it installed? brew install restic / apt install restic)")
+    }
+
+    /// Runs restic with output shown (stdout optional).
+    pub fn run(&self, args: &[&str], quiet: bool) -> Result<()> {
+        let mut c = self.command();
+        c.args(args).stdin(Stdio::piped());
+        if quiet {
+            c.stdout(Stdio::null());
+        }
+        let mut child = c
+            .spawn()
+            .context("starting restic (is it installed? brew install restic / apt install restic)")?;
+        {
+            use std::io::Write;
+            let mut i = child.stdin.take().context("stdin")?;
+            i.write_all(self.password.as_bytes())?;
+        }
+        let status = child.wait()?;
+        if !status.success() {
+            bail!("restic {} failed ({status})", args.first().unwrap_or(&""));
+        }
+        Ok(())
+    }
+
+    /// Does the password open the repository?
+    pub fn opens(&self) -> Result<bool> {
+        let out = self.output(&["cat", "config"])?;
+        if out.status.success() {
+            return Ok(true);
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("wrong password") || err.contains("no key found") {
+            return Ok(false);
+        }
+        bail!(
+            "restic could not open the repository: {}",
+            err.trim().lines().last().unwrap_or("")
+        )
+    }
+
+    /// The keys of the repository: `(id, user, host, current)`.
+    pub fn keys(&self) -> Result<Vec<(String, String, String, bool)>> {
+        #[derive(Deserialize)]
+        struct K {
+            id: String,
+            #[serde(default, rename = "userName")]
+            user: String,
+            #[serde(default, rename = "hostName")]
+            host: String,
+            #[serde(default)]
+            current: bool,
+        }
+        let out = self.output(&["key", "list", "--json"])?;
+        if !out.status.success() {
+            bail!(
+                "restic key list failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let keys: Vec<K> = serde_json::from_slice(&out.stdout).context("parsing restic key list")?;
+        Ok(keys
+            .into_iter()
+            .map(|k| (k.id, k.user, k.host, k.current))
+            .collect())
+    }
+
+    /// `restic key add --user U --host H` with the new password on fd 3. Returns the new key id.
+    pub fn key_add(&self, new: &[u8], user: &str, host: &str) -> Result<String> {
+        let before: Vec<String> = self.keys()?.into_iter().map(|k| k.0).collect();
+        let mut c = self.command();
+        c.args([
+            "key",
+            "add",
+            "--new-password-file",
+            "/dev/fd/3",
+            "--user",
+            user,
+            "--host",
+            host,
+        ]);
+        let out = crate::util::run_with_fds(&mut c, &[(3, new)], Some(self.password.as_bytes()))?;
+        if !out.status.success() {
+            bail!(
+                "restic key add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let after = self.keys()?;
+        after
+            .into_iter()
+            .map(|k| k.0)
+            .find(|id| !before.contains(id))
+            .context("restic did not list the new key")
+    }
+
+    /// `restic key remove <id>`, opening with the key `hint`.
+    pub fn key_remove(&self, id: &str, hint: &str) -> Result<()> {
+        let out = self.output(&["--key-hint", hint, "key", "remove", id])?;
+        if !out.status.success() {
+            bail!(
+                "restic key remove failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Collects credentials: `-e VAR=value`, then the environment, then a hidden prompt.
+pub fn collect_env(repo: &str, pairs: &[String]) -> Result<BTreeMap<String, Zeroizing<String>>> {
+    let mut env = BTreeMap::new();
+    for p in pairs {
+        let (k, v) = p.split_once('=').ok_or_else(|| {
+            fail(
+                exit::USAGE,
+                format!("Expected VAR=value, got {}.", p.split('=').next().unwrap_or("")),
+            )
+        })?;
+        env.insert(k.to_string(), Zeroizing::new(v.to_string()));
+    }
+    for key in needed_env(repo) {
         if env.contains_key(key) {
             continue;
         }
         let v = match std::env::var(key) {
             Ok(v) if !v.is_empty() => Zeroizing::new(v),
-            _ => util::read_hidden(&format!("{key}: "))?,
+            _ => {
+                if !crate::term::is_person() {
+                    return Err(fail(
+                        exit::REFUSED,
+                        format!("{key} is needed. Give it with -e {key}=…"),
+                    ));
+                }
+                crate::util::read_hidden(&format!("{key}: "))?
+            }
         };
-        env.insert(key.to_string(), v.to_string());
-    }
-    if repository.contains(".r2.cloudflarestorage.com") {
-        env.entry("AWS_DEFAULT_REGION".into())
-            .or_insert_with(|| "auto".into());
+        env.insert(key.to_string(), v);
     }
     Ok(env)
 }
 
-/// Configure backups for an unlocked volume. The repository password is derived from the
-/// Ledger seed and the repository URL; re-running `init` with the same URL reconnects to an
-/// existing repository.
-pub fn init(
-    oracle: &mut dyn Oracle,
-    vol_name: &str,
-    repository: &str,
-    key_id: Option<&str>,
-    env_pairs: &[String],
-) -> Result<()> {
-    let mut vol = Volume::load(vol_name)?;
-    if !vol.is_unlocked()? {
-        bail!("unlock '{vol_name}' first (`sealctl unlock {vol_name}`)");
-    }
-    if !util::which(&restic_bin()) && std::env::var_os("SEALCTL_RESTIC").is_none() {
-        bail!("restic not found — install it (brew install restic / apt install restic)");
-    }
-    let key_id = key_id.unwrap_or(vol_name);
-    let env = collect_env(repository, env_pairs)?;
-    let password = derive::passphrase(oracle, Purpose::Restic, key_id)?;
-    let secrets = RepoSecrets {
-        repository: repository.to_string(),
-        password: password.to_string(),
-        env,
-    };
-    // Check the repository with the new password first; the stored credentials (which the
-    // scheduled backups use) are only replaced once that worked.
-    let repo = Repo {
-        secrets,
-        password: Password::Pipe(password),
-    };
-    match repo.probe()? {
-        Probe::Exists => {
-            println!("existing repository found — reconnected (same seed, same key id ⇒ same password)")
-        }
-        Probe::Missing => repo.run(&["init"], false)?,
-        Probe::WrongPassword => bail!(
-            "a repository exists at {repository}, but not for key id '{key_id}'.\n   \
-             Repositories created by sealctl 0.2.0 use the URL as key id: add --key-id '{repository}'"
-        ),
-    }
-    write_inner(&vol, &repo.secrets)?;
-    vol.backup = Some(BackupPolicy::new(repository, key_id));
-    vol.save()?;
-    println!("✅ backups configured for '{vol_name}' → {repository}");
-    println!("   password derived from your seed and key id '{key_id}'");
-    println!("   first backup:      sealctl backup run {vol_name}");
-    println!("   hourly schedule:   sealctl backup schedule install");
-    Ok(())
+/// What `backup init` needs.
+pub struct InitOpts<'a> {
+    /// Name.
+    pub name: &'a str,
+    /// Volume name or folder.
+    pub from: &'a str,
+    /// Base URL; the repository is `<base>/<repo-id>`.
+    pub repo_base: &'a str,
+    /// Credentials.
+    pub env: BTreeMap<String, Zeroizing<String>>,
 }
 
-/// Filesystem bookkeeping, never user data (macOS metadata, ext4 lost+found).
-const SYSTEM_EXCLUDES: &[&str] = &[
-    ".Spotlight-V100",
-    ".fseventsd",
-    ".Trashes",
-    ".TemporaryItems",
-    ".DocumentRevisions-V100",
-    "lost+found",
-];
-
-pub fn run_one(vol: &Volume, quiet: bool) -> Result<()> {
-    if !vol.is_unlocked()? {
-        bail!("'{}' is locked", vol.name);
+/// Makes a repository with a new id and key, and records the definition.
+pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Result<(Backup, ObjectKey)> {
+    crate::volume::validate_name(opts.name)?;
+    if Backup::load(opts.name).is_ok() {
+        return Err(fail(exit::USAGE, format!("Backup {} exists already.", opts.name)));
     }
-    let policy = vol
-        .backup
-        .clone()
-        .context("no backup configured — run `sealctl backup init`")?;
-    let repo = Repo::from_unlocked(vol)?;
-    let mut state = load_state(&vol.name);
-    state.last_attempt = Some(now());
-    let mp = vol.mountpoint.to_string_lossy().into_owned();
-    let tag = format!("vol:{}", vol.name);
-    let mut args: Vec<String> = vec![
-        "backup".into(),
-        mp.clone(),
-        "--tag".into(),
-        "sealctl".into(),
-        "--tag".into(),
-        tag.clone(),
-    ];
-    for ex in std::iter::once(".sealctl").chain(SYSTEM_EXCLUDES.iter().copied()) {
-        args.push("--exclude".into());
-        args.push(format!("{mp}/{ex}"));
-    }
-    if quiet {
-        args.push("--quiet".into());
-    }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let res = repo.run(&refs, quiet);
-    match &res {
-        Ok(()) => {
-            state.last_success = Some(now());
-            state.last_error = None;
+    let (source, volume) = match crate::volume::Volume::load(opts.from) {
+        Ok(v) => (v.mountpoint.clone(), Some(v.name)),
+        Err(_) => {
+            let p = std::fs::canonicalize(opts.from)
+                .map_err(|_| fail(exit::NOT_FOUND, format!("No volume or folder {}.", opts.from)))?;
+            (p, None)
         }
-        Err(e) => state.last_error = Some(format!("{e:#}")),
-    }
-    save_state(&vol.name, &state)?;
-    res?;
-
-    // Weekly retention + prune.
-    if state
-        .last_prune
-        .is_none_or(|t| now().saturating_sub(t) > 7 * 86_400)
-    {
-        let (d, w, m) = (
-            policy.keep_daily.to_string(),
-            policy.keep_weekly.to_string(),
-            policy.keep_monthly.to_string(),
+    };
+    let repo_id = crate::util::new_uuid()?;
+    let url = format!("{}/{repo_id}", opts.repo_base.trim_end_matches('/'));
+    let item = RequestItem {
+        purpose: "backup".into(),
+        id: repo_id.clone(),
+        words: None,
+        check: None,
+        object: Some(ObjectFacts {
+            kind: "backup".into(),
+            path: url.clone(),
+            size: 0,
+        }),
+    };
+    let (key, words) = new_key(&item)?;
+    let repo = Repo::new(&url, &key, opts.env.clone());
+    let out = repo.output(&["init"])?;
+    if !out.status.success() {
+        bail!(
+            "restic init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("")
         );
-        let r = repo.run(
-            &[
+    }
+    // A key that names the words, then the one `init` made removed.
+    let init_key = repo
+        .keys()?
+        .into_iter()
+        .map(|k| k.0)
+        .next()
+        .context("restic key list")?;
+    let new_id = repo.key_add(key.hex().as_bytes(), "sealctl", &format!("sealctl-{words}"))?;
+    repo.key_remove(&init_key, &new_id)?;
+    let b = Backup {
+        name: opts.name.into(),
+        source,
+        volume,
+        repo: url,
+        repo_id,
+        words,
+        check: key.check(),
+        credentials: opts.env.keys().cloned().collect(),
+        policy: Policy::default(),
+    };
+    b.save()?;
+    Ok((b, key))
+}
+
+/// Runs one backup now, then `forget` with the policy (`--prune` at most weekly).
+pub fn run_one(
+    b: &Backup,
+    key: &ObjectKey,
+    env: BTreeMap<String, Zeroizing<String>>,
+    quiet: bool,
+) -> Result<()> {
+    if key.check() != b.check {
+        return Err(fail(
+            exit::WRONG_KEY,
+            format!("The key does not open backup {} (check mismatch).", b.name),
+        ));
+    }
+    if !b.source.is_dir() {
+        return Err(fail(
+            exit::NOT_FOUND,
+            format!("{} is not there (volume closed?).", b.source.display()),
+        ));
+    }
+    let repo = Repo::new(&b.repo, key, env);
+    let mut st = b.state();
+    let src = b.source.to_string_lossy().into_owned();
+    // volume roots hold OS folders nobody can read or needs back
+    let mut args = vec![
+        "backup",
+        src.as_str(),
+        "--exclude",
+        ".sealctl",
+        "--exclude",
+        ".fseventsd",
+        "--exclude",
+        ".Spotlight-V100",
+        "--exclude",
+        ".Trashes",
+        "--exclude",
+        ".TemporaryItems",
+        "--exclude",
+        "lost+found",
+    ];
+    if quiet {
+        args.push("--quiet");
+    }
+    let r = repo.run(&args, quiet);
+    match &r {
+        Ok(()) => {
+            st.last_success = Some(now_secs());
+            st.last_error = None;
+            let prune = st
+                .last_prune
+                .is_none_or(|t| now_secs().saturating_sub(t) > 7 * 86_400);
+            let (d, w, m) = (
+                b.policy.keep_daily.to_string(),
+                b.policy.keep_weekly.to_string(),
+                b.policy.keep_monthly.to_string(),
+            );
+            let mut fargs = vec![
                 "forget",
-                "--tag",
-                &tag,
                 "--keep-daily",
                 &d,
                 "--keep-weekly",
                 &w,
                 "--keep-monthly",
                 &m,
-                "--prune",
-                "--quiet",
-            ],
-            true,
-        );
-        match r {
-            Ok(()) => {
-                state.last_prune = Some(now());
-                save_state(&vol.name, &state)?;
+            ];
+            if prune {
+                fargs.push("--prune");
             }
-            Err(e) if !quiet => eprintln!("⚠️  pruning old snapshots failed (backups are fine): {e:#}"),
-            Err(_) => {}
-        }
-    }
-    Ok(())
-}
-
-/// `sealctl backup run`: explicit volumes, or all scheduled ones.
-pub fn run(names: &[String], all: bool, if_unlocked: bool, quiet: bool) -> Result<()> {
-    let vols: Vec<Volume> = if all || names.is_empty() {
-        Volume::list()?
-            .into_iter()
-            .filter(|v| v.backup.as_ref().is_some_and(|b| b.scheduled))
-            .collect()
-    } else {
-        names.iter().map(|n| Volume::load(n)).collect::<Result<_>>()?
-    };
-    let mut failed = 0;
-    for v in vols {
-        if !v.is_unlocked().unwrap_or(false) {
-            if if_unlocked {
-                continue;
+            if repo.run(&fargs, true).is_ok() && prune {
+                st.last_prune = Some(now_secs());
             }
-            eprintln!("skipping '{}': locked", v.name);
-            failed += 1;
-            continue;
         }
-        if !quiet {
-            println!("backing up '{}'…", v.name);
-        }
-        if let Err(e) = run_one(&v, quiet) {
-            eprintln!("❌ '{}': {e:#}", v.name);
-            failed += 1;
-        } else if !quiet {
-            println!("✅ '{}' backed up", v.name);
-        }
+        Err(e) => st.last_error = Some(format!("{e:#}")),
     }
-    if failed > 0 {
-        bail!("{failed} volume(s) not backed up");
-    }
-    Ok(())
+    b.save_state(&st)?;
+    r
 }
 
-pub fn snapshots(oracle: &mut dyn Oracle, vol: &str) -> Result<()> {
-    let v = Volume::load(vol)?;
-    Repo::open(oracle, &v)?.run(&["snapshots", "--tag", &format!("vol:{vol}")], false)
-}
-
-pub fn restore(
-    oracle: &mut dyn Oracle,
-    vol: &str,
-    snapshot: &str,
-    target: &std::path::Path,
-    include: &[String],
-) -> Result<()> {
-    let v = Volume::load(vol)?;
-    let target = target.to_string_lossy().into_owned();
-    // one --tag with a comma = snapshots carrying BOTH tags (repeated --tag means either)
-    let tagf = format!("sealctl,vol:{vol}");
-    let mut args = vec!["restore", snapshot, "--target", &target, "--tag", &tagf];
-    let incl: Vec<String> = include
-        .iter()
-        .map(|p| {
-            if p.starts_with('/') {
-                p.clone()
-            } else {
-                format!("{}/{p}", v.mountpoint.display())
-            }
-        })
-        .collect();
-    for p in &incl {
-        args.extend(["--include", p]);
+/// `1 h 5 min ago`.
+pub fn age(secs: u64) -> String {
+    match secs {
+        s if s < 90 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 172_800 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
     }
-    Repo::open(oracle, &v)?.run(&args, false)?;
-    println!("✅ restored into {target}{}", v.mountpoint.display());
-    Ok(())
 }
 
-pub fn check(oracle: &mut dyn Oracle, vol: &str, read_data_percent: Option<u8>) -> Result<()> {
-    let v = Volume::load(vol)?;
-    let subset = read_data_percent.map(|p| format!("--read-data-subset={p}%"));
-    let mut args = vec!["check"];
-    if let Some(s) = &subset {
-        args.push(s);
-    }
-    Repo::open(oracle, &v)?.run(&args, false)
-}
-
-pub fn set_policy(vol: &str, f: impl FnOnce(&mut BackupPolicy)) -> Result<()> {
-    let mut v = Volume::load(vol)?;
-    let p = v.backup.as_mut().context("no backup configured")?;
-    f(p);
-    v.save()
-}
-
-// ---- scheduling ----
-
-pub const SCHEDULE_LABEL: &str = "io.github.oleksiyp.sealctl.backup";
-
-/// Switch an existing repository to the password derived from `key_id` (default: the volume
-/// name), using restic's own key management: the new key is added, then the old one removed.
-/// The data and the repository's master key stay the same.
-pub fn rekey(oracle: &mut dyn Oracle, vol_name: &str, key_id: Option<&str>) -> Result<()> {
-    let mut vol = Volume::load(vol_name)?;
-    if !vol.is_unlocked()? {
-        bail!("unlock '{vol_name}' first (`sealctl unlock {vol_name}`)");
-    }
-    let mut policy = vol
-        .backup
-        .clone()
-        .context("no backup configured for this volume")?;
-    let new_id = key_id.unwrap_or(vol_name);
-    if policy.key_id.as_deref() == Some(new_id) {
-        println!("'{vol_name}' backups already use key id '{new_id}'");
-        return Ok(());
-    }
-    let repo = Repo::from_unlocked(&vol)?;
-    let old_key = repo.current_key()?;
-    let new_password = derive::passphrase(oracle, Purpose::Restic, new_id)?;
-    let staged = vol.inner_dir().join("restic-password.new");
-    paths::write_private(&staged, new_password.as_bytes())?;
-    let added = repo.run(
-        &["key", "add", "--new-password-file", &staged.to_string_lossy()],
-        true,
-    );
-    let _ = fs::remove_file(&staged);
-    added?;
-    let mut secrets = repo.secrets;
-    secrets.password = new_password.to_string();
-    write_inner(&vol, &secrets)?;
-    Repo::from_unlocked(&vol)?.run(&["key", "remove", &old_key], true)?;
-    policy.key_id = Some(new_id.to_string());
-    vol.backup = Some(policy);
-    vol.save()?;
-    println!("✅ '{vol_name}' backups now use a password derived from key id '{new_id}'");
-    Ok(())
-}
-
+/// Installs the schedule: `sealctl backup run --all --if-open --quiet` every N minutes.
 pub fn schedule_install(every_minutes: u64) -> Result<()> {
     let exe = crate::util::stable_exe()?;
-    let args = vec![
-        exe.to_string_lossy().into_owned(),
-        "backup".into(),
-        "run".into(),
-        "--all".into(),
-        "--if-unlocked".into(),
-        "--quiet".into(),
-    ];
     crate::service::install(&crate::service::Service {
-        label: SCHEDULE_LABEL,
-        args,
+        label: crate::service::BACKUP_LABEL,
+        args: vec![
+            exe.to_string_lossy().into_owned(),
+            "backup".into(),
+            "run".into(),
+            "--all".into(),
+            "--if-open".into(),
+            "--quiet".into(),
+        ],
         every_secs: Some(every_minutes * 60),
-        description: "sealctl: back up unlocked volumes",
-    })?;
-    println!("✅ unlocked volumes will be backed up every {every_minutes} min (and before `sealctl lock`)");
-    Ok(())
+        description: "sealctl scheduled backups",
+    })
 }
 
+/// Removes the schedule.
 pub fn schedule_uninstall() -> Result<()> {
-    crate::service::uninstall(SCHEDULE_LABEL)
-}
-
-pub fn age(secs: u64) -> String {
-    let d = now().saturating_sub(secs);
-    match d {
-        0..=59 => "just now".into(),
-        60..=3599 => format!("{} min ago", d / 60),
-        3600..=86_399 => format!("{} h ago", d / 3600),
-        _ => format!("{} days ago", d / 86_400),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_requirements() {
-        assert_eq!(
-            needed_env("s3:https://x.r2.cloudflarestorage.com/b"),
-            vec!["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
-        );
-        assert!(needed_env("/mnt/usb/repo").is_empty());
-        assert_eq!(needed_env("b2:bucket:path").len(), 2);
-    }
-
-    #[test]
-    fn secrets_roundtrip() {
-        let s = RepoSecrets {
-            repository: "r".into(),
-            password: "p".into(),
-            env: [("A".into(), "1".into())].into(),
-        };
-        let t: RepoSecrets = toml::from_str(&toml::to_string(&s).unwrap()).unwrap();
-        assert_eq!(t.repository, "r");
-        assert_eq!(t.env["A"], "1");
-    }
+    crate::service::uninstall(crate::service::BACKUP_LABEL)
 }

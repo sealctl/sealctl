@@ -15,11 +15,11 @@ cat <<EOF
 pkgname=sealctl-bin
 pkgver=$VERSION
 pkgrel=1
-pkgdesc="Hardware-wallet backed encryption: volumes, backups, secrets, SSH (Ledger OpenPGP)"
+pkgdesc="Phone-approved keys: secrets kept from AI agents, SSH, git signing, volumes, backups"
 arch=('x86_64' 'aarch64')
-url="https://github.com/oleksiyp/sealctl"
+url="https://github.com/sealctl/sealctl"
 license=('MIT')
-depends=('systemd-libs' 'dbus' 'gcc-libs' 'glibc')
+depends=('gcc-libs' 'glibc')
 optdepends=('restic: encrypted backups'
             'cryptsetup: encrypted LUKS volumes'
             'openssh: SSH agent and git signing')

@@ -1,0 +1,7 @@
+# Pinned compiler for builds, CI and release artefacts (SPEC.md section 21: reproducible
+# releases). Dependabot (package-ecosystem rust-toolchain) proposes new stable releases after
+# its cooldown. The MSRV job and the fuzz job override this with RUSTUP_TOOLCHAIN.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

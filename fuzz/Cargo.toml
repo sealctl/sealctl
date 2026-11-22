@@ -1,0 +1,106 @@
+[package]
+name = "sealctl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sealctl-core = { path = "../crates/sealctl-core" }
+sealctl = { path = "../crates/sealctl" }
+serde_json = "1"
+toml = "0.9"
+
+# Not part of the main workspace: built with cargo fuzz on nightly.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "pairing_link"
+path = "fuzz_targets/pairing_link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_file"
+path = "fuzz_targets/sealed_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "id_file"
+path = "fuzz_targets/id_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bodies"
+path = "fuzz_targets/bodies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel"
+path = "fuzz_targets/channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dotenv"
+path = "fuzz_targets/dotenv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "project_toml"
+path = "fuzz_targets/project_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_credential"
+path = "fuzz_targets/git_credential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_json"
+path = "fuzz_targets/relay_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socket_line"
+path = "fuzz_targets/socket_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handback"
+path = "fuzz_targets/handback.rs"
+test = false
+doc = false
+bench = false

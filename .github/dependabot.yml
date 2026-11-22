@@ -1,16 +1,48 @@
 version: 2
+
+# Version updates wait out a cooldown so a release that is yanked or found malicious in its
+# first days is never proposed; security updates are not delayed (cooldown does not apply to
+# them). Every Cargo update still has to pass cargo-deny and cargo-vet (supply-chain/) in CI.
+
 updates:
   - package-ecosystem: cargo
-    directory: /
+    # the workspace and the separate fuzz workspace (its own Cargo.lock)
+    directories: ["/", "/fuzz"]
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
-    ignore:
-      # pinned on purpose: the MSRV job must use the declared rust-version
-      - dependency-name: dtolnay/rust-toolchain
+    # actions are pinned to commit SHAs with a version comment; Dependabot updates both
+    cooldown:
+      default-days: 14
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # rust-toolchain.toml (the pinned release compiler)
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # flake.lock (nixpkgs for `nix build` / `nix profile install`)
+  - package-ecosystem: nix
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
