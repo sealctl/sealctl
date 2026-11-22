@@ -686,15 +686,24 @@ fn test_keychain() -> Option<security_framework::os::macos::keychain::SecKeychai
     None
 }
 
-/// Tests only (`test-hooks`, `SEALCTL_TEST_KEYCHAIN_NO_UI`): the default keychain, with any
-/// dialog turned into an error, to find which call would wait for one.
+/// Keychain calls never wait for a dialog: without a window session (SSH, CI, a locked login
+/// keychain nobody can unlock) such a dialog never comes, and the command would hang. A call
+/// that needs one fails with errSecInteractionNotAllowed, which [`no_dialog`] explains.
 #[cfg(target_os = "macos")]
-fn test_no_ui() -> Option<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
-    #[cfg(feature = "test-hooks")]
-    if std::env::var_os("SEALCTL_TEST_KEYCHAIN_NO_UI").is_some() {
-        return security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok();
+fn no_ui() -> Result<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
+    Ok(security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()?)
+}
+
+/// The text for a keychain call that needed a dialog.
+#[cfg(target_os = "macos")]
+fn no_dialog(e: security_framework::base::Error) -> anyhow::Error {
+    if e.code() == -25308 {
+        return crate::exit::fail(
+            crate::exit::ERROR,
+            "The macOS Keychain wants a dialog (it may be locked). Unlock it in this terminal: security unlock-keychain\nThen run sealctl unseal --resume, or choose another store: --to folder|op|bw",
+        );
     }
-    None
+    e.into()
 }
 
 /// Reads a keychain item into memory.
@@ -715,10 +724,10 @@ fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
             _ => bail!("no keychain item {account}"),
         };
     }
-    let _no_ui = test_no_ui();
-    log::debug!("keychain: keyring get (default keychain)");
-    let e = keyring::Entry::new(service, account)?;
-    Ok(Zeroizing::new(e.get_secret()?))
+    let _no_ui = no_ui()?;
+    log::debug!("keychain: get (default keychain)");
+    let v = security_framework::passwords::get_generic_password(service, account).map_err(no_dialog)?;
+    Ok(Zeroizing::new(v))
 }
 
 /// Reads a keychain item into memory.
@@ -749,15 +758,15 @@ fn keychain_set(service: &str, account: &str, label: &str, value: &[u8]) -> Resu
             .set_location(Location::FileKeychain(kc));
         return Ok(add.add()?);
     }
-    let _no_ui = test_no_ui();
+    let _no_ui = no_ui()?;
     let mut o = PasswordOptions::new_generic_password(service, account);
     o.set_label(label);
-    log::debug!("keychain: SecItemAdd (default keychain)");
+    log::debug!("keychain: add (default keychain)");
     match set_generic_password_options(value, o) {
         Ok(()) => Ok(()),
         // errSecItemNotFound: the item exists (same service and account) with another label
-        Err(e) if e.code() == -25300 => Ok(set_generic_password(service, account, value)?),
-        Err(e) => Err(e.into()),
+        Err(e) if e.code() == -25300 => set_generic_password(service, account, value).map_err(no_dialog),
+        Err(e) => Err(no_dialog(e)),
     }
 }
 

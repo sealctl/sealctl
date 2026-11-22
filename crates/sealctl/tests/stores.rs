@@ -303,7 +303,7 @@ fn plan_rows_name_the_chosen_store() {
 #[test]
 fn secrets_to_the_keychain_with_readable_labels() {
     use std::process::Command;
-    // a keychain file made by CI, or (diagnosis) the default keychain with dialogs as errors
+    // a keychain file made by CI, or (SEALCTL_TEST_KEYCHAIN_DEFAULT) the default keychain
     let keychain = std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH");
     let default = std::env::var_os("SEALCTL_TEST_KEYCHAIN_DEFAULT").is_some();
     if keychain.is_none() && !default {
@@ -317,9 +317,6 @@ fn secrets_to_the_keychain_with_readable_labels() {
         .args(["unseal", "secrets", "--keep-store", "--secrets-to", "keychain"]);
     if let Some(k) = &keychain {
         c.env("SEALCTL_TEST_KEYCHAIN_PATH", k);
-    }
-    if default {
-        c.env("SEALCTL_TEST_KEYCHAIN_NO_UI", "1");
     }
     let mut pty = Pty::spawn(c);
     pty.expect("Start?", Duration::from_secs(30));
