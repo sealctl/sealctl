@@ -412,7 +412,11 @@ impl Stores {
                     None => default_env_file()?,
                 };
                 on_edit(&file)?;
-                let var = env_var_name(item.name);
+                // a secret's variable is chosen for the whole run (two names may map to one)
+                let var = match (item.kind, &item.var) {
+                    ("secret", Some(v)) => v.clone(),
+                    _ => env_var_name(item.name),
+                };
                 env_upsert(&file, &var, value)?;
                 let mut l = Location::new(kind);
                 l.file = Some(file);
@@ -425,7 +429,7 @@ impl Stores {
     /// Read a value back into memory.
     pub fn read(&mut self, loc: &Location) -> Result<Zeroizing<Vec<u8>>> {
         match loc.store {
-            StoreKind::Folder => folder::read(loc),
+            StoreKind::Folder => folder::read(&self.moved(loc)),
             StoreKind::Keychain => {
                 let service = loc.service.as_deref().unwrap_or(SERVICE);
                 let account = loc.account.as_deref().context("keychain account")?;
@@ -487,6 +491,28 @@ impl Stores {
                 Ok(Zeroizing::new(v.as_bytes().to_vec()))
             }
         }
+    }
+
+    /// A `folder` location whose file is gone, found again in [`Self::folder`]: a hand-back
+    /// list read after its folder was moved or copied to another machine.
+    fn moved(&self, loc: &Location) -> Location {
+        let mut l = loc.clone();
+        if let (Some(dir), Some(f)) = (&self.folder, &loc.file) {
+            if !f.exists() {
+                if let Some(name) = f.file_name() {
+                    let binary = f
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|p| p == folder::BINARY);
+                    l.file = Some(if binary {
+                        dir.join(folder::BINARY).join(name)
+                    } else {
+                        dir.join(name)
+                    });
+                }
+            }
+        }
+        l
     }
 
     fn op_put(&mut self, item: &Item, value: &[u8]) -> Result<Location> {
@@ -602,16 +628,20 @@ impl Stores {
             c[c.len().saturating_sub(4)..].iter().collect()
         };
         let mut ok = false;
+        // lines on the screen below the passphrase's
+        let mut below = 0;
         for _ in 0..3 {
             let typed = crate::util::read_hidden("Write it down. Type its last 4 characters to go on: ")?;
+            below += 1;
             if typed.trim() == last4 {
                 ok = true;
                 break;
             }
             writeln!(tty, "That is not it; look again.")?;
+            below += 1;
         }
-        // move the cursor up and clear the shown line from the screen
-        let _ = write!(tty, "\x1b[s\x1b[2A\x1b[2K\x1b[u");
+        // move the cursor up to the passphrase's line and clear it from the screen
+        let _ = write!(tty, "\x1b[s\x1b[{}A\x1b[2K\x1b[u", below + 1);
         if !ok {
             bail!("the passphrase for {what} was not confirmed");
         }
@@ -1149,6 +1179,42 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_folder_is_read_where_it_is_now() {
+        let t = tempfile::tempdir().unwrap();
+        let old = t.path().join("sealctl-unsealed-2026-11-21");
+        std::fs::create_dir(&old).unwrap();
+        let cfg = Config {
+            to: StoreKind::Folder,
+            secrets_to: StoreKind::Folder,
+            env_file: None,
+            op_vault: None,
+            bw_folder: None,
+            type_passwords: false,
+        };
+        let mut s = Stores::new(cfg.clone());
+        s.folder = Some(old.clone());
+        let item = |kind: &'static str, name: &'static str| Item {
+            kind,
+            name,
+            notes: String::new(),
+            credential: false,
+            var: Some("RAW".into()),
+        };
+        let pw = s
+            .put_checked(StoreKind::Folder, &item("volume", "safe"), b"pw", &|_| Ok(()))
+            .unwrap();
+        let raw = s
+            .put_checked(StoreKind::Folder, &item("secret", "raw"), &[0, 1], &|_| Ok(()))
+            .unwrap();
+        let new = t.path().join("elsewhere");
+        std::fs::rename(&old, &new).unwrap();
+        let mut s = Stores::new(cfg);
+        s.folder = Some(new);
+        assert_eq!(&*s.read(&pw).unwrap(), b"pw");
+        assert_eq!(&*s.read(&raw).unwrap(), &[0, 1]);
+    }
+
+    #[test]
     fn env_store_roundtrip() {
         let t = tempfile::tempdir().unwrap();
         let file = t.path().join("s.env");
@@ -1178,6 +1244,23 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map["A_ONE"].as_str(), "again");
         assert_eq!(map["A_TWO"].as_str(), tricky);
+        // two names with one variable: each secret keeps the variable chosen for the run
+        let names = ["x/b-c".to_string(), "x-b/c".to_string()];
+        let vars = env_vars(&names);
+        for (n, v) in names.iter().zip(["first", "second"]) {
+            let item = Item {
+                kind: "secret",
+                name: n,
+                notes: String::new(),
+                credential: true,
+                var: vars.get(n).cloned(),
+            };
+            s.put_checked(StoreKind::Env, &item, v.as_bytes(), &|_| Ok(()))
+                .unwrap();
+        }
+        let map = crate::dotenv::parse_dotenv(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(map["X_B_C"].as_str(), "first");
+        assert_eq!(map["X_B_C_2"].as_str(), "second");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,

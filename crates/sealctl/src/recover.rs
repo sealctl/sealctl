@@ -262,12 +262,7 @@ pub fn recover(
             Ok(())
         }
         Target::Restic(url) => {
-            let id = url
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let id = crate::seal::repo_id_in(&url)?;
             let words = restic_words(&url);
             let root = read_root()?;
             if let Some(w) = &words {

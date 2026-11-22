@@ -532,7 +532,7 @@ Finds keys and moves them into the store, leaving references behind.
 | `~/.aws/credentials` | Profiles with `aws_secret_access_key` | `aws/<profile>` (JSON with the key id, the secret key and an optional session token) | Profile removed from `credentials`; `credential_process = <sealctl path> aws credentials --profile <profile>` set in `~/.aws/config` |
 
 - The list shows file, line, kind and the first 4 characters only. `--dry-run` stops there; otherwise a terminal asks `Seal 6 keys? [y/N]`; `--yes` skips the question.
-- The same value found twice becomes one secret. Files keep their mode and are rewritten atomically. No backup copies are made, since they would hold the keys.
+- The same value found twice becomes one secret. A name the store or this scan already has with another value gets `-2`, `-3`, … instead of replacing it; one that holds the same value is used as it is. A folder's `.sealctl.toml` maps a variable to one secret, so `.env` files of one folder that give a variable different values (`.env` and `.env.local`) stop the scan before anything is stored, naming the variable and the files. Files keep their mode and are rewritten atomically, byte for byte outside the sealed values (a zsh history need not be UTF-8); a symlinked file is rewritten where the link points, and the link stays. No backup copies are made, since they would hold the keys.
 - Sealing needs the store key (`open` when Locked).
 - `--json`: `{"findings": [{"file", "line", "kind", "source", "name"}], "sealed": <count>}`; never values.
 
@@ -785,7 +785,7 @@ Aliases: `volume import` is `seal volume`, `ssh import` is `seal ssh`, `secret i
 | Object | Reads | Steps | Check before the old way in is removed |
 | --- | --- | --- | --- |
 | APFS volume | Its passphrase (prompt without echo, or `--from-*`) | Read the UUID (`diskutil info`); get the volume key with a `keys` request; `diskutil apfs changePassphrase <uuid> -user disk -oldStdinpassphrase -newStdinpassphrase`; hint `sealctl <fp>`; once mounted, `<mount>/.sealctl/volume.id` | `diskutil apfs unlockVolume <uuid> -verify -stdinpassphrase` passes with `hex(volume key)` and fails with the old passphrase |
-| Sparse bundle | Its passphrase | New UUID, written to `<bundle>/sealctl.id`; `hdiutil chpass -oldstdinpass -newstdinpass` | `hdiutil attach -nomount -stdinpass`, then `detach`, with the new key; the old fails |
+| Sparse bundle | Its passphrase | New UUID, written to `<bundle>/sealctl.id` before `hdiutil chpass -oldstdinpass -newstdinpass` (the id cannot be found again otherwise) and removed if the change fails or is undone. A marker on a bundle no volume of this machine uses is left by a seal that did not finish: when the user's passphrase still opens the bundle, sealing it again takes that marker's UUID; when it does not, the message says the earlier seal may have changed it and `recover` opens it. `volume import` registers a marked bundle from the marker without opening it; `volume open` shows whether sealctl's key opens it | `hdiutil attach -nomount -stdinpass`, then `detach`, with the new key; the old fails |
 | LUKS | Its passphrase | `cryptsetup luksAddKey` with the volume key on a file descriptor; token `sealctl` imported; the user's slot killed with `luksKillSlot` unless `--keep-old-passphrase` | `cryptsetup open --test-passphrase` with the new key names the new slot. The volume id is the LUKS UUID it already has |
 | Restic repository | Its password and storage credentials | Repository id: the last path segment of the URL (`[A-Za-z0-9._-]{1,64}`, refused if another backup in the inventory uses it); credentials stored as `backup/<name>/<VAR>`; `restic key add --user sealctl --host sealctl-<fp>` with the backup key; the user's key removed unless `--keep-old-password` | `restic cat config` opens with the backup key, and `restic key list --json` marks it current |
 | SSH key | The OpenSSH private key file (its passphrase asked if it has one) | Stored as `ssh/<n>`; `~/.ssh/sealctl_<n>.pub` written | The stored key's public half equals the file's. The original file stays; the output says `Once logins work, delete the original: rm <file>` |
@@ -873,10 +873,10 @@ Journal line:
 {"v": 1, "t": "2026-11-21T10:14:02+01:00", "n": 7, "step": "volume:safe", "state": "done", "note": "passphrase changed; verify passed"}
 ```
 
-`state` is `start`, `done`, `failed` or `skipped`. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed.
+`state` is `start`, `done`, `failed` or `skipped`; a volume or backup step also writes `password` (its note: where the step's new password went, as in `handback.json`) before the object changes, and `changed` once the object opens only with that password. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed.
 
 - `--resume` takes the newest run folder that has a `plan.json` and no `done`; without one it exits 9 (`No unfinished run to resume.`).
-- For each step not `done`, the step's check runs first against the object (does the new password already open it? is sealctl's key already gone?), so a step interrupted after it took effect is recorded, not repeated.
+- For each step not `done`, the step's check runs first against the object (does the new password already open it? is sealctl's key already gone?), so a step interrupted after it took effect is recorded, not repeated. A resumed volume or backup step reads its new password back from where its `password` line says when sealctl's key no longer opens the object, or when that password already opens it (a LUKS slot or restic key added beside sealctl's). While sealctl's key opens the object and the stored password does not, the object has not changed: the step makes a new password as on a first attempt and says so, so a passphrase typed back for `--to show` is never applied unchecked.
 - Ctrl-C lets the current OS call finish, writes the journal line, and exits 13.
 - The final message names the folder and says to delete it once everything opens with the new passwords.
 
@@ -1161,6 +1161,7 @@ into its section.
 | 10.4, 16 | `scan` as specified. `migrate`: the daemon starts `sealctl migrate --depth rewrap --auto` itself after a move; re-encryption covers sparse bundles and restic repositories (APFS and LUKS volumes keep their data key); the job runs detached (`--foreground` hidden for tests), with no battery pause yet |
 | 13 | `seal volume` of a LUKS file adds sealctl's key, then removes the user's slot with `luksRemoveKey` once the new key opens it |
 | 14 | Backups of a volume exclude `.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.TemporaryItems` and `lost+found` |
+| 17 | `recover` takes a store folder, a `.sealed` file, a sparse bundle and a restic repository. LUKS files and APFS volume UUIDs are not taken yet: until they are, the words alone do not open such a volume, and `unseal` (with the phone) hands it back under a passphrase of the user's |
 | 18.2 | A paired machine whose store was handed back gets a new store when a secret is next stored |
 | 18.9 | The delayed wait reads the relay every 60 seconds and at `releaseAt`; a cancelled approval names `your phone`, this machine's name, or `another paired machine` |
 | 20 | Hidden input (words, passphrases, values) is read from stdin with echo off through termios, so it works on any terminal stdin and never from a pipe for the words |
