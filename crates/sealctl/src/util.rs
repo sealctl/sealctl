@@ -13,6 +13,12 @@ pub fn new_uuid() -> Result<String> {
 
 /// Runs `cmd` with each `(fd, bytes)` written to a pipe that the child sees as that file
 /// descriptor (`/dev/fd/3`, `/dev/fd/4`). Values never go through argv or the environment.
+///
+/// The copies of the values live in `Zeroizing` buffers from the start, so an early return
+/// (pipe, mapping or spawn failure) wipes them too. Once the child runs, `cmd` is replaced by an
+/// empty command: that drops the parent's read ends held by the fd mappings, so a writer blocked
+/// on a full pipe gets `BrokenPipe` when the child exits without reading, instead of hanging.
+/// `cmd` must not be used again by the caller.
 pub fn run_with_fds(
     cmd: &mut Command,
     fds: &[(i32, &[u8])],
@@ -28,7 +34,7 @@ pub fn run_with_fds(
             parent_fd: OwnedFd::from(r),
             child_fd: *fd,
         });
-        writers.push((w, data.to_vec()));
+        writers.push((w, Zeroizing::new(data.to_vec())));
     }
     cmd.fd_mappings(mappings)
         .map_err(|e| anyhow::anyhow!("fd mapping: {e:?}"))?;
@@ -41,10 +47,11 @@ pub fn run_with_fds(
     .stderr(Stdio::piped());
     let name = format!("{:?}", cmd.get_program());
     let mut child = cmd.spawn().with_context(|| format!("starting {name}"))?;
-    // the parent's read ends were moved into the mappings; write and close each pipe
+    // the parent's read ends were moved into the mappings: drop them with the command
+    drop(std::mem::replace(cmd, Command::new("/nonexistent")));
+    // write and close each pipe
     let mut threads = Vec::new();
     for (mut w, data) in writers {
-        let data = Zeroizing::new(data);
         threads.push(std::thread::spawn(move || {
             let _ = w.write_all(&data);
         }));
@@ -332,5 +339,35 @@ impl Since {
     pub fn elapsed(&self) -> std::time::Duration {
         let wall = self.wall.elapsed().unwrap_or_default();
         self.mono.elapsed().max(wall)
+    }
+}
+
+#[cfg(test)]
+mod fd_tests {
+    use super::*;
+
+    /// A child that exits without reading a value larger than a pipe holds: the call returns.
+    #[test]
+    fn a_child_that_does_not_read_does_not_hang() {
+        let big = vec![b'x'; 4 << 20];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", "exit 3"]);
+            let out = run_with_fds(&mut c, &[(3, &big)], None).map(|o| o.status.code());
+            let _ = tx.send(out.ok().flatten());
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("run_with_fds hung on an unread pipe");
+        assert_eq!(code, Some(3));
+    }
+
+    #[test]
+    fn values_reach_the_child() {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "cat /dev/fd/3; cat /dev/fd/4"]);
+        let out = run_with_fds(&mut c, &[(3, b"one"), (4, b"two")], None).unwrap();
+        assert_eq!(out.stdout, b"onetwo");
     }
 }
