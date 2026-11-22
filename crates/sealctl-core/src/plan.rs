@@ -195,7 +195,9 @@ impl PlanAssembler {
 
     /// Adds one part. Returns the whole plan once every part is in and the hash checks out;
     /// the plan is then also attached to `request`, which the final answer is sealed for.
-    /// A part for another machine or plan hash starts over.
+    /// A part for another machine or plan hash starts over. A later key request of an
+    /// approved plan (`plan: {h}` only, no part) is not a part: it returns `None` and leaves
+    /// the parts collected so far as they are.
     pub fn add(&self, request: Arc<Request>) -> Result<Option<RequestPlan>> {
         if request.kind() != RequestKind::Unseal {
             return Err(CoreError::BadPlan);
@@ -203,6 +205,9 @@ impl PlanAssembler {
         let plan = request.plan().ok_or(CoreError::BadPlan)?;
         if plan.complete {
             return Ok(Some(plan));
+        }
+        if plan.part.is_none() && plan.parts.is_none() && plan.items.is_empty() {
+            return Ok(None);
         }
         let (part, parts) = (
             plan.part.ok_or(CoreError::BadPlan)?,

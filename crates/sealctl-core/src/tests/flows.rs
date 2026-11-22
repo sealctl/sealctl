@@ -187,6 +187,9 @@ fn unseal_in_parts_then_later_keys() {
     });
     b.keys = vec![item_b(Purpose::Volume, VOL)];
     let (sent, req) = send(b);
+    // The apps pass every `unseal` through the assembler: a later request is not a part.
+    let req = Arc::new(req);
+    assert_eq!(assembler.add(req.clone()).unwrap(), None);
     let r = read_reply(
         &sent,
         &reply::plan_keys_body(&root_b(), &req, &approval, T + 1)
@@ -198,6 +201,34 @@ fn unseal_in_parts_then_later_keys() {
         r.keys[0].k.as_deref().map(|s| s.to_string()),
         Some(key_b64u(&root_b(), Purpose::Volume, VOL))
     );
+}
+
+#[test]
+fn a_later_plan_request_between_parts_keeps_the_parts() {
+    let items = plan_items();
+    let h = crypto::b64u(&plan::plan_hash(&machine().id(), &items));
+    let part = |i: u32| {
+        let mut b = body("unseal");
+        b.plan = Some(PlanBody {
+            all: false,
+            h: h.clone(),
+            items: items.chunks(2).nth(i as usize - 1).unwrap().to_vec(),
+            n: Some(2),
+            i: Some(i),
+        });
+        Arc::new(send(b).1)
+    };
+    let assembler = PlanAssembler::new();
+    assert_eq!(assembler.add(part(1)).unwrap(), None);
+    let mut b = body("unseal");
+    b.plan = Some(PlanBody {
+        h: h.clone(),
+        ..Default::default()
+    });
+    b.keys = vec![item_b(Purpose::Volume, VOL)];
+    assert_eq!(assembler.add(Arc::new(send(b).1)).unwrap(), None);
+    let whole = assembler.add(part(2)).unwrap().unwrap();
+    assert_eq!((whole.complete, whole.items), (true, items));
 }
 
 /// Seals a body built by a `pub(crate)` builder, for the tests above.

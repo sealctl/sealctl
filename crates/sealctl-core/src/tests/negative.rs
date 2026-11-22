@@ -193,6 +193,26 @@ fn a_request_is_answered_once() {
         reply::seal_reply(None, &keys, &req, Decision::Deny).err(),
         Some(CoreError::Replay)
     );
+
+    // Answers from several threads at once: exactly one is sealed.
+    for _ in 0..20 {
+        let req = Arc::new(send(body("open")).1);
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let sealed = (0..8)
+            .map(|_| {
+                let (req, start) = (req.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    reply::seal_reply(None, &keys_b(), &req, Decision::Deny).is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|&ok| ok)
+            .count();
+        assert_eq!(sealed, 1);
+    }
 }
 
 #[test]
@@ -293,6 +313,42 @@ fn level_3_needs_a_right_pick() {
     });
     assert_eq!(send(unseal_body(items, false)).1.level(), 3);
     assert_eq!(send(unseal_body(plan_items(), false)).1.level(), 2);
+
+    // `rewrap` and `old_words` raised to level 3 need the pick too.
+    let (old, new) = (root_a(), root_b());
+    for kind in ["rewrap", "old_words"] {
+        let mut b = body(kind);
+        b.lvl = Some(3);
+        b.has_match = true;
+        b.keys = vec![item("volume", VOL)];
+        let (sent, req) = send(b);
+        assert_eq!(req.level(), 3);
+        let sealed = if kind == "rewrap" {
+            reply::seal_rewrap_reply(&old, &new, &keys, &req)
+        } else {
+            reply::seal_old_words_reply(&old, &new, &keys, &req)
+        };
+        let r = read_reply(&sent, &sealed.unwrap());
+        assert_eq!((r.ok, r.err.as_deref()), (false, Some("no_match")), "{kind}");
+        assert!(r.keys.is_empty());
+
+        let mut b = body(kind);
+        b.lvl = Some(3);
+        b.has_match = true;
+        b.keys = vec![item("volume", VOL)];
+        b.keys[0].words = Some(old.fingerprint());
+        let (sent, req) = send(b);
+        let n = sent.number.unwrap() as u32;
+        req.match_choices();
+        assert!(req.check_match(n));
+        let sealed = if kind == "rewrap" {
+            reply::seal_rewrap_reply(&old, &new, &keys, &req)
+        } else {
+            reply::seal_old_words_reply(&old, &new, &keys, &req)
+        };
+        let r = read_reply(&sent, &sealed.unwrap());
+        assert!(r.ok && r.keys[0].k.is_some(), "{kind}");
+    }
 }
 
 #[test]

@@ -272,16 +272,17 @@ impl Request {
         Ok(())
     }
 
-    pub(crate) fn ensure_unanswered(&self) -> Result<()> {
-        if self.answered.load(Ordering::SeqCst) {
-            Err(CoreError::Replay)
-        } else {
-            Ok(())
-        }
+    /// Claims the one answer of this request; `Replay` when it is already claimed.
+    pub(crate) fn claim_answer(&self) -> Result<()> {
+        self.answered
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| CoreError::Replay)
     }
 
-    pub(crate) fn mark_answered(&self) {
-        self.answered.store(true, Ordering::SeqCst);
+    /// Gives the claim back after an answer could not be sealed.
+    pub(crate) fn release_answer(&self) {
+        self.answered.store(false, Ordering::SeqCst);
     }
 
     /// The one-time public key the reply is sealed to.
