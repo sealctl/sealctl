@@ -31,7 +31,9 @@ pub struct Entry {
 
 /// The assignments of a dotenv file in order, with where each one is (see [`parse_dotenv`]).
 pub fn entries(text: &str) -> Result<Vec<Entry>> {
-    let chars: Zeroizing<Vec<char>> = Zeroizing::new(text.chars().collect());
+    // sized up front: a growing Vec would leave its earlier, unwiped buffers behind
+    let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(text.chars().count()));
+    chars.extend(text.chars());
     let chars: &[char] = &chars;
     let n = chars.len();
     // byte offset of each character (and of the end)

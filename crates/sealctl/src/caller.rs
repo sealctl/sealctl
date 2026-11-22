@@ -194,19 +194,50 @@ fn is_git(p: &Proc) -> bool {
     n == "git" || n.starts_with("git-")
 }
 
+/// git's options that take the next argument as their value.
+const GIT_OPTS_WITH_VALUE: &[&str] = &[
+    "-c",
+    "-C",
+    "--config-env",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--exec-path",
+    "--list-cmds",
+    "--attr-source",
+];
+
 /// A git process asked for a credential on someone else's behalf: `git credential fill` (also
-/// through `-c alias.x=credential`), whose answer goes to whoever ran it.
+/// through an alias given with `-c alias.x=…credential…`), whose answer goes to whoever ran it.
+/// Other arguments that mention credentials (a repository URL, a `credential.*` setting) do
+/// not make one.
 fn is_git_front_end(p: &Proc) -> bool {
-    p.argv.iter().skip(1).any(|a| a.contains("credential"))
+    let mut args = p.argv.iter().skip(1);
+    while let Some(a) = args.next() {
+        if GIT_OPTS_WITH_VALUE.contains(&a.as_str()) {
+            let v = args.next().map(String::as_str).unwrap_or("");
+            if a == "-c" && v.starts_with("alias.") && v.contains("credential") {
+                return true;
+            }
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        // the subcommand
+        return a == "credential";
+    }
+    false
 }
 
 fn is_aws(p: &Proc) -> bool {
     let n = p.name();
-    if n == "aws" {
-        return true;
-    }
-    // AWS CLI v1: `python3 /usr/local/bin/aws …`
-    n.starts_with("python") && p.argv.get(1).is_some_and(|a| base(a) == "aws")
+    // AWS CLI v1: `python3 /usr/local/bin/aws …`; a macOS framework build runs as `Python`
+    let aws = n == "aws"
+        || (n.to_ascii_lowercase().starts_with("python") && p.argv.get(1).is_some_and(|a| base(a) == "aws"));
+    // `aws configure export-credentials` prints what the helper gives it
+    aws && !p.argv.iter().any(|a| a == "export-credentials")
 }
 
 /// Whether `chain` (parent first) shows the helper started by `tool` itself: git (or one of its
@@ -338,6 +369,30 @@ mod tests {
         assert!(started_by(Tool::Git, &chain));
         // without the shell (a helper configured without `!`)
         assert!(started_by(Tool::Git, &chain[1..]));
+        // arguments that only mention credentials: git itself still asks
+        let clone = [
+            p(
+                "/usr/libexec/git-core/git-remote-https",
+                &[
+                    "git-remote-https",
+                    "origin",
+                    "https://github.com/o/git-credential-manager",
+                ],
+            ),
+            p(
+                "/usr/bin/git",
+                &[
+                    "git",
+                    "-c",
+                    "credential.useHttpPath=true",
+                    "clone",
+                    "https://github.com/o/git-credential-manager",
+                ],
+            ),
+            agent_shell(),
+            agent(),
+        ];
+        assert!(started_by(Tool::Git, &clone));
         // git-lfs runs `git credential fill`, which runs the helper
         let lfs = [
             p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
@@ -382,6 +437,16 @@ mod tests {
                 agent_shell(),
                 agent(),
             ],
+            // with options before the subcommand
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "-C", "/tmp", "-c", "a.b=c", "credential", "fill"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
             // two shells deep
             vec![
                 p("/bin/sh", &["sh", "-c", "x"]),
@@ -409,8 +474,25 @@ mod tests {
                 &["python3", "/usr/local/bin/aws", "s3", "ls"]
             )]
         ));
+        // a macOS framework Python (Homebrew, python.org) runs as `Python`
+        assert!(started_by(
+            Tool::Aws,
+            &[p(
+                "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+                &["/opt/homebrew/opt/python@3.12/bin/python3.12", "/opt/homebrew/bin/aws", "s3", "ls"]
+            )]
+        ));
         for chain in [
             vec![agent_shell(), agent()],
+            // prints the credentials it resolves
+            vec![
+                p(
+                    "/usr/local/aws-cli/aws",
+                    &["aws", "configure", "export-credentials", "--profile", "p"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
             vec![
                 p("/usr/bin/python3.12", &["python3", "-c", "import subprocess"]),
                 agent(),
