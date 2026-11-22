@@ -686,6 +686,17 @@ fn test_keychain() -> Option<security_framework::os::macos::keychain::SecKeychai
     None
 }
 
+/// Tests only (`test-hooks`, `SEALCTL_TEST_KEYCHAIN_NO_UI`): the default keychain, with any
+/// dialog turned into an error, to find which call would wait for one.
+#[cfg(target_os = "macos")]
+fn test_no_ui() -> Option<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("SEALCTL_TEST_KEYCHAIN_NO_UI").is_some() {
+        return security_framework::os::macos::keychain::SecKeychain::disable_user_interaction().ok();
+    }
+    None
+}
+
 /// Reads a keychain item into memory.
 #[cfg(target_os = "macos")]
 fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -704,6 +715,8 @@ fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
             _ => bail!("no keychain item {account}"),
         };
     }
+    let _no_ui = test_no_ui();
+    log::debug!("keychain: keyring get (default keychain)");
     let e = keyring::Entry::new(service, account)?;
     Ok(Zeroizing::new(e.get_secret()?))
 }
@@ -736,8 +749,10 @@ fn keychain_set(service: &str, account: &str, label: &str, value: &[u8]) -> Resu
             .set_location(Location::FileKeychain(kc));
         return Ok(add.add()?);
     }
+    let _no_ui = test_no_ui();
     let mut o = PasswordOptions::new_generic_password(service, account);
     o.set_label(label);
+    log::debug!("keychain: SecItemAdd (default keychain)");
     match set_generic_password_options(value, o) {
         Ok(()) => Ok(()),
         // errSecItemNotFound: the item exists (same service and account) with another label

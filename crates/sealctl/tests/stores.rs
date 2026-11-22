@@ -303,16 +303,24 @@ fn plan_rows_name_the_chosen_store() {
 #[test]
 fn secrets_to_the_keychain_with_readable_labels() {
     use std::process::Command;
-    let Some(keychain) = std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH") else {
+    // a keychain file made by CI, or (diagnosis) the default keychain with dialogs as errors
+    let keychain = std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH");
+    let default = std::env::var_os("SEALCTL_TEST_KEYCHAIN_DEFAULT").is_some();
+    if keychain.is_none() && !default {
         return;
-    };
+    }
     let (env, _, _) = setup();
     let service = format!("sealctl-test-{}", &canary()[6..14]);
     let mut c = env.cmd();
     c.env("SEALCTL_TEST_KEYCHAIN_SERVICE", &service)
-        .env("SEALCTL_TEST_KEYCHAIN_PATH", &keychain)
         .env("SEALCTL_LOG", "debug")
         .args(["unseal", "secrets", "--keep-store", "--secrets-to", "keychain"]);
+    if let Some(k) = &keychain {
+        c.env("SEALCTL_TEST_KEYCHAIN_PATH", k);
+    }
+    if default {
+        c.env("SEALCTL_TEST_KEYCHAIN_NO_UI", "1");
+    }
     let mut pty = Pty::spawn(c);
     pty.expect("Start?", Duration::from_secs(30));
     let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
@@ -322,7 +330,8 @@ fn secrets_to_the_keychain_with_readable_labels() {
         if let Some(st) = pty.child.try_wait().unwrap() {
             break st.code().unwrap_or(-1);
         }
-        if start.elapsed() > Duration::from_secs(90) {
+        // watchdog: a keychain call waiting for a dialog fails the test, not the job
+        if start.elapsed() > Duration::from_secs(60) {
             let _ = pty.child.kill();
             panic!(
                 "timed out; the phone answered {:?}\nscreen (with the debug log):\n{}",
@@ -338,7 +347,7 @@ fn secrets_to_the_keychain_with_readable_labels() {
     for account in ["secret/shop/api-key", "secret/shop/db.url"] {
         let o = Command::new("/usr/bin/security")
             .args(["find-generic-password", "-s", &service, "-a", account])
-            .arg(&keychain)
+            .args(keychain.iter())
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&o.stdout);

@@ -66,6 +66,28 @@ jobs:
       - if: runner.os == 'macOS'
         run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture
 
+  # TEMPORARY diagnosis: the keychain store on the runner's default keychain (fresh and
+  # unlocked), with dialogs turned into errors, to see which call would wait for one
+  keychain-diag:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: fresh unlocked default keychain
+        run: |
+          kc="$RUNNER_TEMP/diag.keychain-db"
+          pw="$(uuidgen)"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security list-keychains -d user -s "$kc"
+          security default-keychain -d user -s "$kc"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture
+        env:
+          SEALCTL_TEST_KEYCHAIN_DEFAULT: "1"
+
   msrv:
     runs-on: ubuntu-latest
     steps:
