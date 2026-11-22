@@ -47,6 +47,11 @@ jobs:
       # Integration tests run the real binary in temporary HOMEs against the in-process fake
       # relay and a scripted phone, with the real OS tools (hdiutil on macOS, restic).
       - run: cargo test --locked
+      # the real keychain under a test service name (macOS runner only; items removed after)
+      - if: runner.os == 'macOS'
+        run: cargo test --locked -p sealctl --features test-hooks --test stores keychain
+        env:
+          SEALCTL_TEST_KEYCHAIN: "1"
 
   msrv:
     runs-on: ubuntu-latest

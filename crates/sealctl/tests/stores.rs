@@ -252,3 +252,37 @@ fn ctrl_c_stops_between_steps_and_resume_finishes() {
         .unwrap()
         .contains(&a));
 }
+
+/// The real keychain, under a test service name: CI only (`--features test-hooks` and
+/// `SEALCTL_TEST_KEYCHAIN=1` on the macOS runner); items are removed afterwards.
+#[cfg(all(feature = "test-hooks", target_os = "macos"))]
+#[test]
+fn secrets_to_the_keychain_with_readable_labels() {
+    use std::process::Command;
+    if std::env::var_os("SEALCTL_TEST_KEYCHAIN").is_none() {
+        return;
+    }
+    let (env, _, _) = setup();
+    let service = format!("sealctl-test-{}", &canary()[6..14]);
+    let (code, screen) = unseal(
+        &env,
+        &["secrets", "--keep-store", "--secrets-to", "keychain"],
+        &[("SEALCTL_TEST_KEYCHAIN_SERVICE", service.clone())],
+    );
+    assert_eq!(code, 0, "{screen}");
+    for account in ["secret/shop/api-key", "secret/shop/db.url"] {
+        let o = Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", &service, "-a", account])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&o.stdout);
+        let name = account.strip_prefix("secret/").unwrap();
+        assert!(
+            text.contains(&format!("\"labl\"<blob>=\"sealctl: secret {name}\"")),
+            "{text}"
+        );
+        let _ = Command::new("/usr/bin/security")
+            .args(["delete-generic-password", "-s", &service, "-a", account])
+            .output();
+    }
+}
