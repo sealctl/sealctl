@@ -42,8 +42,9 @@ jobs:
       - name: macOS dependencies (restic)
         if: runner.os == 'macOS'
         run: brew install restic
-      # The runner's login keychain can be locked, and then the first keychain write waits
-      # for an unlock dialog nobody sees. Use a fresh, unlocked default keychain instead.
+      # A keychain file of its own for the keychain store test (SEALCTL_TEST_KEYCHAIN_PATH,
+      # test-hooks only): created and unlocked here, not the default and not in the search list.
+      # On the runner a write to the default keychain wants a dialog no session can show.
       - name: macOS test keychain
         if: runner.os == 'macOS'
         run: |
@@ -52,8 +53,7 @@ jobs:
           security create-keychain -p "$pw" "$kc"
           security set-keychain-settings "$kc"
           security unlock-keychain -p "$pw" "$kc"
-          security list-keychains -d user -s "$kc"
-          security default-keychain -d user -s "$kc"
+          echo "SEALCTL_TEST_KEYCHAIN_PATH=$kc" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

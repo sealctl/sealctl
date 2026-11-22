@@ -128,15 +128,34 @@ fn a_changed_read_back_stops_before_sealctls_key_goes() {
         .exists());
 }
 
-/// The keychain store against a test service name (macOS login keychain, or the Secret
-/// Service on Linux). Only with SEALCTL_TEST_KEYCHAIN=1 (CI).
+/// The keychain store against a test service name: on macOS in a keychain file of its own
+/// (SEALCTL_TEST_KEYCHAIN_PATH, made and unlocked by CI; never the default or login
+/// keychain), on Linux the Secret Service. Only with SEALCTL_TEST_KEYCHAIN=1 (CI). A watchdog
+/// fails the test after 60 s instead of letting a keychain call hold the job.
 #[test]
 fn keychain_store_roundtrip() {
     if !common::flag("SEALCTL_TEST_KEYCHAIN") {
         eprintln!("set SEALCTL_TEST_KEYCHAIN=1 to test the OS keychain store");
         return;
     }
+    if cfg!(target_os = "macos") && std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH").is_none() {
+        eprintln!("set SEALCTL_TEST_KEYCHAIN_PATH to a keychain file to test the macOS keychain store");
+        return;
+    }
     let _g = serial();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(keychain_roundtrip_body);
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(Ok(())) => {}
+        Ok(Err(p)) => std::panic::resume_unwind(p),
+        Err(_) => panic!("the keychain store did not answer in 60 s (a keychain call waiting for a dialog?)"),
+    }
+}
+
+fn keychain_roundtrip_body() {
     use sealctl::unseal::store::{self, Config, Item, StoreKind, Stores};
     let service = format!("sealctl-unseal-test-{}", std::process::id());
     std::env::set_var("SEALCTL_TEST_KEYCHAIN_SERVICE", &service);
@@ -165,6 +184,8 @@ fn keychain_store_roundtrip() {
     assert_eq!(&*s.read(&loc).unwrap(), value.as_bytes());
     // the item has a readable label (Keychain Access shows it)
     #[cfg(target_os = "macos")]
+    let keychain = std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH").unwrap();
+    #[cfg(target_os = "macos")]
     {
         let out = std::process::Command::new("security")
             .args([
@@ -174,11 +195,16 @@ fn keychain_store_roundtrip() {
                 "-a",
                 "volume/unseal-test",
             ])
+            .arg(&keychain)
             .output()
             .unwrap();
         let attrs = String::from_utf8_lossy(&out.stdout);
+        // the label attribute: printed as "labl" or by its number, 0x00000007
+        let label = "<blob>=\"sealctl: volume unseal-test\"";
         assert!(
-            attrs.contains("\"labl\"<blob>=\"sealctl: volume unseal-test\""),
+            attrs
+                .lines()
+                .any(|l| (l.contains("\"labl\"") || l.contains("0x00000007")) && l.contains(label)),
             "{attrs}"
         );
     }
@@ -199,6 +225,22 @@ fn keychain_store_roundtrip() {
         .put_checked(StoreKind::Keychain, &item, again.as_bytes(), &|_| Ok(()))
         .unwrap();
     assert_eq!(&*s.read(&loc).unwrap(), again.as_bytes());
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("security")
+            .args([
+                "delete-generic-password",
+                "-s",
+                &service,
+                "-a",
+                "volume/unseal-test",
+            ])
+            .arg(&keychain)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    #[cfg(not(target_os = "macos"))]
     keyring::Entry::new(&service, "volume/unseal-test")
         .unwrap()
         .delete_credential()

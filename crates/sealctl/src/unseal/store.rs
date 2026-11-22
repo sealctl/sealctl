@@ -425,13 +425,12 @@ impl Stores {
         match loc.store {
             StoreKind::Folder => folder::read(loc),
             StoreKind::Keychain => {
-                let e = keyring::Entry::new(
-                    loc.service.as_deref().unwrap_or(SERVICE),
-                    loc.account.as_deref().context("keychain account")?,
-                )?;
-                Ok(Zeroizing::new(
-                    e.get_secret().context("reading from the keychain")?,
-                ))
+                let service = loc.service.as_deref().unwrap_or(SERVICE);
+                let account = loc.account.as_deref().context("keychain account")?;
+                log::debug!("keychain: reading {account} of {service}");
+                let v = keychain_get(service, account).context("reading from the keychain")?;
+                log::debug!("keychain: read {account}");
+                Ok(v)
             }
             StoreKind::Op => {
                 let field = loc.field.as_deref().unwrap_or("password");
@@ -671,6 +670,68 @@ fn env_upsert(file: &Path, var: &str, value: &[u8]) -> Result<()> {
     crate::paths::write_private(file, text.as_bytes())
 }
 
+/// Tests only (`test-hooks`): a keychain file given by `SEALCTL_TEST_KEYCHAIN_PATH`, created and
+/// unlocked by the test, so nothing depends on the default or login keychain.
+#[cfg(target_os = "macos")]
+fn test_keychain() -> Option<security_framework::os::macos::keychain::SecKeychain> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(p) = std::env::var_os("SEALCTL_TEST_KEYCHAIN_PATH").filter(|p| !p.is_empty()) {
+        return security_framework::os::macos::keychain::SecKeychain::open(p).ok();
+    }
+    None
+}
+
+/// Keychain calls never wait for a dialog: without a window session (SSH, CI, a locked login
+/// keychain nobody can unlock) such a dialog never comes, and the command would hang. A call
+/// that needs one fails with errSecInteractionNotAllowed, which [`no_dialog`] explains.
+#[cfg(target_os = "macos")]
+fn no_ui() -> Result<security_framework::os::macos::keychain::KeychainUserInteractionLock> {
+    Ok(security_framework::os::macos::keychain::SecKeychain::disable_user_interaction()?)
+}
+
+/// The text for a keychain call that needed a dialog.
+#[cfg(target_os = "macos")]
+fn no_dialog(e: security_framework::base::Error) -> anyhow::Error {
+    if e.code() == -25308 {
+        return anyhow::anyhow!(
+            "the macOS Keychain wants a dialog (it may be locked). Unlock it in this terminal: \
+             security unlock-keychain. Then run sealctl unseal --resume, or choose another store: --to folder|op|bw"
+        );
+    }
+    e.into()
+}
+
+/// Reads a keychain item into memory.
+#[cfg(target_os = "macos")]
+fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    let _no_ui = no_ui()?;
+    if let Some(kc) = test_keychain() {
+        let found = ItemSearchOptions::new()
+            .keychains(&[kc])
+            .class(ItemClass::generic_password())
+            .service(service)
+            .account(account)
+            .load_data(true)
+            .search()
+            .map_err(no_dialog)?;
+        return match found.into_iter().next() {
+            Some(SearchResult::Data(d)) => Ok(Zeroizing::new(d)),
+            _ => bail!("no keychain item {account}"),
+        };
+    }
+    log::debug!("keychain: get (default keychain)");
+    let v = security_framework::passwords::get_generic_password(service, account).map_err(no_dialog)?;
+    Ok(Zeroizing::new(v))
+}
+
+/// Reads a keychain item into memory.
+#[cfg(not(target_os = "macos"))]
+fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let e = keyring::Entry::new(service, account)?;
+    Ok(Zeroizing::new(e.get_secret()?))
+}
+
 /// macOS: the Keychain item with a readable label (`sealctl: volume safe`); Keychain Access
 /// shows the label, and every item of `sealctl unseal` had the same name before. An item that
 /// already exists under another label keeps that label and gets the new value.
@@ -679,13 +740,47 @@ fn keychain_set(service: &str, account: &str, label: &str, value: &[u8]) -> Resu
     use security_framework::passwords::{
         set_generic_password, set_generic_password_options, PasswordOptions,
     };
+    let _no_ui = no_ui()?;
+    if let Some(kc) = test_keychain() {
+        use security_framework::item::{
+            ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, Location,
+        };
+        // a resumed step: replace the item of the same service and account
+        if let Ok(found) = ItemSearchOptions::new()
+            .keychains(std::slice::from_ref(&kc))
+            .class(ItemClass::generic_password())
+            .service(service)
+            .account(account)
+            .load_refs(true)
+            .search()
+        {
+            for r in found {
+                if let security_framework::item::SearchResult::Ref(
+                    security_framework::item::Reference::KeychainItem(i),
+                ) = r
+                {
+                    i.delete();
+                }
+            }
+        }
+        let mut add = ItemAddOptions::new(ItemAddValue::Data {
+            class: ItemClass::generic_password(),
+            data: core_foundation::data::CFData::from_buffer(value),
+        });
+        add.set_service(service)
+            .set_account_name(account)
+            .set_label(label)
+            .set_location(Location::FileKeychain(kc));
+        return add.add().map_err(no_dialog);
+    }
     let mut o = PasswordOptions::new_generic_password(service, account);
     o.set_label(label);
+    log::debug!("keychain: add (default keychain)");
     match set_generic_password_options(value, o) {
         Ok(()) => Ok(()),
         // errSecItemNotFound: the item exists (same service and account) with another label
-        Err(e) if e.code() == -25300 => Ok(set_generic_password(service, account, value)?),
-        Err(e) => Err(e.into()),
+        Err(e) if e.code() == -25300 => set_generic_password(service, account, value).map_err(no_dialog),
+        Err(e) => Err(no_dialog(e)),
     }
 }
 

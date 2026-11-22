@@ -2534,6 +2534,7 @@ dependencies = [
  "bip39",
  "clap",
  "clap_complete",
+ "core-foundation 0.10.1",
  "curve25519-dalek",
  "env_logger",
  "getrandom 0.3.4",
