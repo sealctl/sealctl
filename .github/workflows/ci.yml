@@ -31,11 +31,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Linux dependencies (build, restic, LUKS)
+      - name: Linux dependencies (restic, LUKS)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config restic cryptsetup
+          sudo apt-get install -y restic cryptsetup
       - name: macOS dependencies (restic)
         if: runner.os == 'macOS'
         run: brew install restic
@@ -43,18 +43,15 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked
-      # Integration tests drive the real OS tools (hdiutil/diskutil, cryptsetup via sudo, restic)
-      # with a software OpenPGP key standing in for the Ledger.
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      # Integration tests run the real binary in temporary HOMEs against the in-process fake
+      # relay and a scripted phone, with the real OS tools (hdiutil on macOS, restic).
       - run: cargo test --locked
-        env:
-          SEALCTL_TEST_SUDO: ${{ runner.os == 'Linux' && '1' || '' }}
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
