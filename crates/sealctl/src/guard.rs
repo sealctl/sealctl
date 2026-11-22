@@ -26,6 +26,11 @@ const AGENT_ENV: &[(&str, &str)] = &[
     ("AI_AGENT", "an AI agent"),
 ];
 
+/// The variables that mark a command as run by an agent (`SEALCTL_AGENT` first).
+pub fn agent_variables() -> impl Iterator<Item = &'static str> {
+    std::iter::once("SEALCTL_AGENT").chain(AGENT_ENV.iter().map(|(v, _)| *v))
+}
+
 /// The AI agent running this process, if one is recognisable. `SEALCTL_AGENT=1` forces it
 /// (for agents we don't recognise yet); `SEALCTL_AGENT=0` disables detection.
 pub fn ai_agent() -> Option<&'static str> {
@@ -117,6 +122,55 @@ fn preview(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let head: String = chars.iter().take(6).collect();
     format!("{head}…({} chars)", chars.len())
+}
+
+/// The secret-looking values in `text` with their kind (for `scan`, which masks them in
+/// shell histories). Same rules as [`mask_command`].
+pub fn find_secret_values(text: &str) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for (kind, re) in patterns() {
+        for cap in re.captures_iter(text) {
+            let m = cap.get(1).unwrap_or_else(|| cap.get(0).expect("match"));
+            if *kind == "credential" && entropy(m.as_str()) < 3.5 {
+                continue;
+            }
+            if *kind == "private key" {
+                continue;
+            }
+            out.push((*kind, m.as_str().to_string()));
+        }
+    }
+    out
+}
+
+/// `text` with every secret-looking substring replaced by `****` (commands shown on the phone).
+/// A PEM private key goes whole, from its BEGIN line through its END line (or to the end of
+/// the text when the END line is missing), not just its header.
+pub fn mask_command(text: &str) -> String {
+    static PEM: OnceLock<Regex> = OnceLock::new();
+    let pem = PEM.get_or_init(|| {
+        Regex::new(
+            r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?s:.*?)(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|\z)",
+        )
+        .expect("valid pattern")
+    });
+    // The scratch copy holds the unmasked text while it is being masked: wipe it on drop, and
+    // return a separate copy of the masked result.
+    let mut out = zeroize::Zeroizing::new(pem.replace_all(text, "****").into_owned());
+    for (kind, re) in patterns() {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for cap in re.captures_iter(&out) {
+            let m = cap.get(1).unwrap_or_else(|| cap.get(0).expect("match"));
+            if *kind == "credential" && entropy(m.as_str()) < 3.5 {
+                continue;
+            }
+            spans.push((m.start(), m.end()));
+        }
+        for (a, b) in spans.into_iter().rev() {
+            out.replace_range(a..b, "****");
+        }
+    }
+    out.as_str().to_owned()
 }
 
 /// Secret-looking strings in `text`. Known token formats always count; a generic
@@ -313,6 +367,20 @@ mod tests {
             find_secrets("commit 5baf0dc2a7c4e1f9 and 0dc23bb, id fa5a93d5-28d9-4c08-b608-c2b6f344b4d8")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn private_keys_are_masked_whole() {
+        let body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2g";
+        let key = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\nQyNTUxOQ\n-----END OPENSSH PRIVATE KEY-----"
+        );
+        let m = mask_command(&format!("printf '%s' '{key}' | ssh-add -"));
+        assert_eq!(m, "printf '%s' '****' | ssh-add -");
+        // no END line: everything after BEGIN goes
+        let m = mask_command(&format!("echo '-----BEGIN RSA PRIVATE KEY-----\n{body}"));
+        assert_eq!(m, "echo '****");
+        assert!(!mask_command(&format!("x -----BEGIN PRIVATE KEY----- {body}")).contains(body));
     }
 
     #[test]

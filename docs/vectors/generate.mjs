@@ -438,4 +438,4 @@ put("pair.link", link);
   fs.writeFileSync(new URL("./relay-signing.json", import.meta.url), JSON.stringify(relay, null, 2) + "\n");
 }
 
-fs.writeFileSync(new URL("./vectors.json", import.meta.url), JSON.stringify(out, null, 2) + "\n");
+fs.writeFileSync(new URL("./v1.json", import.meta.url), JSON.stringify(out, null, 2) + "\n");

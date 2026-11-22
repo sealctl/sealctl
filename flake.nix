@@ -1,5 +1,5 @@
 {
-  description = "sealctl — hardware-wallet backed encryption: volumes, backups, secrets, SSH";
+  description = "sealctl — phone-approved keys: secrets, SSH, git signing, volumes, backups";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -17,10 +17,9 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = [ "-p" "sealctl" ];
-          # integration tests need hdiutil / sudo + cryptsetup; unit tests only here
-          cargoTestFlags = [ "-p" "sealctl" "-p" "sealctl-ledger" "--lib" ];
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.installShellFiles ];
-          buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.udev pkgs.dbus ];
+          # integration tests need hdiutil and the fake relay; unit tests only here
+          cargoTestFlags = [ "-p" "sealctl" "-p" "sealctl-core" "--lib" ];
+          nativeBuildInputs = [ pkgs.installShellFiles ];
           postInstall = ''
             installShellCompletion --cmd sealctl \
               --bash <($out/bin/sealctl completions bash) \
@@ -28,7 +27,7 @@
               --fish <($out/bin/sealctl completions fish)
           '';
           meta = with pkgs.lib; {
-            description = "Hardware-wallet backed encryption: volumes, backups, secrets, SSH";
+            description = "Phone-approved keys: secrets kept from AI agents, SSH, git signing, volumes, backups";
             homepage = "https://github.com/sealctl/sealctl";
             license = licenses.mit;
             mainProgram = "sealctl";

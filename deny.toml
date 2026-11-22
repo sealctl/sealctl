@@ -5,13 +5,19 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # rsa (via rPGP / openpgp-card-rpgp): Marvin timing attack on RSA *private-key*
-    # decryption. sealctl never performs RSA private-key operations on the host —
-    # private keys live on the Ledger, and sealctl uses Curve25519 keys.
-    { id = "RUSTSEC-2023-0071", reason = "no host-side RSA private-key operations" },
-    # crypto-bigint 0.5 (via rPGP NIST/X448 curves): non-constant-time arithmetic.
-    # sealctl performs no private-key operations on these curves on the host.
-    { id = "RUSTSEC-2026-0387", reason = "no host-side private-key ops on NIST/X448 curves" },
+    # rsa (via ssh-key and ssh-agent-lib): Marvin timing attack on RSA *decryption*.
+    # sealctl never decrypts with RSA; SSH keys only sign, and `ssh keygen` makes Ed25519 keys.
+    { id = "RUSTSEC-2023-0071", reason = "no RSA decryption anywhere in sealctl" },
+    # crypto-bigint 0.5 (via ssh-key's p256/p384 support): non-constant-time arithmetic.
+    # sealctl's own keys are Ed25519 and X25519; only an ECDSA SSH key a user imports with
+    # `seal ssh` would sign on these curves, locally. No ssh-key 0.6 release avoids it.
+    { id = "RUSTSEC-2026-0387", reason = "NIST curves only for user-imported ECDSA SSH keys" },
+    # zvariant, zbus_names, zvariant_derive (via keyring 3 → zbus 4, the Linux Secret
+    # Service): "unmaintained" because they were merged into zbus 6, not a vulnerability.
+    # No keyring release uses zbus 6 yet; move when one does.
+    { id = "RUSTSEC-2026-0370", reason = "merged into zbus 6; keyring still on zbus 4" },
+    { id = "RUSTSEC-2026-0371", reason = "merged into zbus 6; keyring still on zbus 4" },
+    { id = "RUSTSEC-2026-0372", reason = "merged into zbus 6; keyring still on zbus 4" },
 ]
 
 [licenses]
@@ -32,11 +38,76 @@ allow = [
     "CDLA-Permissive-2.0",
     "bzip2-1.0.6",
 ]
+# workspace-only crates that are never published (the fuzz targets)
+private = { ignore = true }
+exceptions = [
+    # LLVM's libFuzzer, in the fuzz workspace only (never in a release binary)
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
+deny = [
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+    { crate = "native-tls", use-instead = "rustls" },
+]
+
+# Build scripts run arbitrary code on the build machine (and on the release runners), so
+# only these crates may have one. A crate that adds a build script, or a new dependency
+# that has one, fails `cargo deny check` until it is reviewed and added here. Both
+# workspaces (the fuzz one adds libfuzzer-sys).
+[bans.build]
+allow-build-scripts = [
+    { crate = "anyhow" },
+    { crate = "async-io" },
+    { crate = "camino" },
+    { crate = "crossbeam-utils" },
+    { crate = "curve25519-dalek" },
+    { crate = "fs-err" },
+    { crate = "generic-array" },
+    { crate = "getrandom" },
+    { crate = "httparse" },
+    { crate = "icu_normalizer_data" },
+    { crate = "icu_properties_data" },
+    { crate = "jni" },
+    { crate = "jni-macros" },
+    { crate = "libc" },
+    { crate = "libfuzzer-sys" },
+    { crate = "libm" },
+    { crate = "memoffset" },
+    { crate = "nix" },
+    { crate = "num-bigint-dig" },
+    { crate = "num-traits" },
+    { crate = "portable-atomic" },
+    { crate = "portable-atomic-util" },
+    { crate = "proc-macro2" },
+    { crate = "quote" },
+    { crate = "ring" },
+    { crate = "rustix" },
+    { crate = "rustls" },
+    { crate = "rustversion" },
+    { crate = "serde" },
+    { crate = "serde_core" },
+    { crate = "serde_json" },
+    { crate = "signal-hook" },
+    { crate = "thiserror" },
+    { crate = "wasm-bindgen" },
+    { crate = "wasm-bindgen-shared" },
+    { crate = "windows_aarch64_gnullvm" },
+    { crate = "windows_aarch64_msvc" },
+    { crate = "windows_i686_gnu" },
+    { crate = "windows_i686_gnullvm" },
+    { crate = "windows_i686_msvc" },
+    { crate = "windows_x86_64_gnu" },
+    { crate = "windows_x86_64_gnullvm" },
+    { crate = "windows_x86_64_msvc" },
+    { crate = "wit-bindgen" },
+    { crate = "zerocopy" },
+    { crate = "zmij" },
+]
 
 [sources]
 unknown-registry = "deny"

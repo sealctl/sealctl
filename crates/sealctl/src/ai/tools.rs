@@ -37,9 +37,9 @@ fn exists(p: Result<PathBuf>) -> bool {
 
 fn yes(b: bool) -> &'static str {
     if b {
-        "✅"
+        "yes"
     } else {
-        "—"
+        "no"
     }
 }
 

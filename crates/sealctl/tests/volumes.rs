@@ -1,211 +1,294 @@
-//! End-to-end volume + backup tests against the real OS tools (no Ledger needed).
-//!
-//! * macOS: hdiutil sparse bundles and diskutil APFS volumes (no root required)
-//! * Linux: LUKS2 — only with `SEALCTL_TEST_SUDO=1` (needs passwordless sudo, e.g. CI)
-//!
-//! Everything runs in one test function per OS because the tests change process-wide
-//! environment variables (XDG directories).
+//! Volumes and backups on derived keys with the real OS tools (SPEC 13, 14, 18): sparse bundles
+//! with `hdiutil` on macOS, restic folder repositories. Disk images live in temporary folders.
+//! Against the fake relay or the live one (`SEALCTL_TEST_RELAY`).
+#![cfg(target_os = "macos")]
 
 mod common;
 
-use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use sealctl::volume::{self, Kind, Volume};
+use common::{canary, have, Env, PhoneThread, Pick, Pty};
+use sealctl_fakerelay::Answer;
 
-fn unique(prefix: &str) -> String {
-    format!("{prefix}{}", std::process::id())
+fn restic(repo: &std::path::Path, password: &str, args: &[&str]) -> std::process::Output {
+    let mut c = Command::new("restic")
+        .env("RESTIC_REPOSITORY", repo)
+        .env("RESTIC_PASSWORD_FILE", "/dev/stdin")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(password.as_bytes()).unwrap();
+    c.wait_with_output().unwrap()
 }
 
-#[allow(dead_code)]
-fn lifecycle(kind: Kind, mount_in_tmp: bool) {
-    let (_sk, pk) = common::software_key();
-    let tmp = tempfile::tempdir().unwrap();
-    common::isolated_home(tmp.path(), &pk);
-    let mut ledger = common::SoftOracle::fixed();
-    let name = unique("sct");
+/// `name: value` from passwords.txt.
+fn password_in(run: &std::path::Path, name: &str) -> String {
+    std::fs::read_to_string(run.join("passwords.txt"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{name}: ")).map(str::to_owned))
+        .expect("password line")
+}
 
-    // create: passphrase derived from the "seed" + a fresh volume id, then mounted with it
-    let mountpoint = mount_in_tmp.then(|| tmp.path().join("mnt").join(&name));
-    let image = tmp.path().join(if kind == Kind::Luks {
-        "v.luks"
-    } else {
-        "v.sparsebundle"
-    });
-    let vol = volume::create(
-        &mut ledger,
-        volume::CreateOpts {
-            name: name.clone(),
-            kind,
-            size: "64m".into(),
-            path: Some(image.clone()),
-            container: None,
-            mountpoint: mountpoint.clone(),
-        },
-    )
-    .expect("create volume");
-    assert!(vol.is_unlocked().unwrap(), "mounted after create");
-    assert_eq!(vol.id.len(), 36, "volume id is a UUID");
-    // nothing secret was written next to the config
-    let leftovers: Vec<_> = fs::read_dir(sealctl::paths::volumes_dir().unwrap())
+fn run_dir(env: &Env) -> std::path::PathBuf {
+    std::fs::read_dir(env.h())
         .unwrap()
         .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.ends_with(".toml"))
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sealctl-unsealed-")
+        })
+        .expect("run folder")
+}
+
+#[cfg(target_os = "macos")]
+fn hdiutil_opens(bundle: &std::path::Path, pass: &str) -> bool {
+    let mut c = Command::new("/usr/bin/hdiutil")
+        .args(["attach", "-nomount", "-plist", "-stdinpass"])
+        .arg(bundle)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(pass.as_bytes()).unwrap();
+    let o = c.wait_with_output().unwrap();
+    if !o.status.success() {
+        return false;
+    }
+    let t = String::from_utf8_lossy(&o.stdout);
+    let devs: Vec<&str> = t
+        .split("<string>")
+        .filter_map(|s| s.split("</string>").next())
+        .filter(|s| s.starts_with("/dev/disk"))
         .collect();
-    assert!(leftovers.is_empty(), "no key files: {leftovers:?}");
-    fs::write(vol.mountpoint.join("hello.txt"), b"hello from sealctl").unwrap();
-
-    // backups: a repository as sealctl 0.2.0 made it (password derived from the URL) ...
-    let have_restic = common::have("restic");
-    let repo = tmp.path().join("repo").to_string_lossy().into_owned();
-    if have_restic {
-        sealctl::backup::init(&mut ledger, &name, &repo, Some(&repo), &[]).expect("backup init");
-        sealctl::backup::run(std::slice::from_ref(&name), false, false, true).expect("backup run");
-        // ... moved to the portable key id (the volume name) by restic key add/remove
-        sealctl::backup::rekey(&mut ledger, &name, None).expect("backup rekey");
-        let policy = Volume::load(&name).unwrap().backup.unwrap();
-        assert_eq!(policy.password_id(), name, "key id is the volume name");
-        sealctl::backup::run(std::slice::from_ref(&name), false, false, true).expect("backup after rekey");
-        let st = sealctl::backup::load_state(&name);
-        assert!(st.last_success.is_some() && st.last_error.is_none());
-    } else {
-        eprintln!("restic not installed — skipping backup part");
+    if let Some(d) = devs.iter().min_by_key(|d| d.len()) {
+        let _ = Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-quiet", d])
+            .status();
     }
-
-    // lock (runs the on-lock backup)
-    volume::lock(&name, false, false).expect("lock");
-    assert!(!Volume::load(&name).unwrap().is_unlocked().unwrap(), "locked");
-
-    // a different seed cannot open it
-    let mut other = common::SoftOracle(x25519_dalek::StaticSecret::from([9u8; 32]));
-    assert!(volume::unlock(&mut other, &name).is_err(), "other seed rejected");
-
-    // forget everything on this machine except the disk, then recover from "seed" + disk
-    volume::remove(&name, false).unwrap();
-    let target = image.to_string_lossy().into_owned();
-    volume::import(&name, kind, &target, mountpoint).expect("import from disk");
-    let vol = volume::unlock(&mut ledger, &name).expect("unlock with the seed-derived key");
-    assert_eq!(
-        fs::read(vol.mountpoint.join("hello.txt")).unwrap(),
-        b"hello from sealctl"
-    );
-
-    // re-init with only the seed and the volume name reconnects to the same repository; the old
-    // URL-derived password no longer opens it
-    if have_restic {
-        fs::remove_dir_all(vol.inner_dir()).unwrap();
-        let err = sealctl::backup::init(&mut ledger, &name, &repo, Some(&repo), &[])
-            .expect_err("URL key was removed by rekey");
-        assert!(format!("{err:#}").contains("not for key id"), "{err:#}");
-        assert!(!vol.inner_dir().exists(), "a failed init writes no credentials");
-        sealctl::backup::init(&mut ledger, &name, &repo, None, &[]).expect("reconnect to existing repo");
-        sealctl::backup::run(std::slice::from_ref(&name), false, false, true)
-            .expect("backup after reconnect");
-    }
-
-    volume::lock(&name, true, true).expect("final lock");
-    volume::remove(&name, true).unwrap();
-    assert!(!image.exists(), "data deleted");
+    true
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_sparsebundle_lifecycle() {
-    lifecycle(Kind::Sparsebundle, true);
+fn sparse_bundle_volume_with_backup_lock_and_unseal() {
+    let mut env = Env::new();
+    env.pair();
+    let bundle = env.h().join("v1.sparsebundle");
+    let mnt = env.h().join("mnt/v1");
+    let repos = env.h().join("repos");
+    let marker = canary();
+    let ((code, out, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&[
+            "volume",
+            "create",
+            "v1",
+            "--kind",
+            "sparsebundle",
+            "--size",
+            "64m",
+            "--path",
+            bundle.to_str().unwrap(),
+            "--mountpoint",
+            mnt.to_str().unwrap(),
+        ])
+    });
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), mnt.to_str().unwrap());
+    std::fs::write(mnt.join("hello.txt"), &marker).unwrap();
+    let id: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(bundle.join("sealctl.id")).unwrap()).unwrap();
+    assert_eq!(id["kind"], "volume");
+    assert_eq!(id["words"], env.phone.fingerprint());
+    assert!(mnt.join(".sealctl/volume.id").exists());
+
+    let restic_ok = have("restic");
+    if restic_ok {
+        let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+            env.run(&[
+                "backup",
+                "init",
+                "b1",
+                "--from",
+                "v1",
+                "--repo",
+                repos.to_str().unwrap(),
+            ])
+        });
+        assert_eq!(code, 0, "{err}");
+        let (code, _, err) = env.run(&["backup", "run", "b1", "--quiet"]);
+        assert_eq!(code, 0, "{err}");
+        // restic's key names the words
+        let repo = std::fs::read_dir(&repos).unwrap().next().unwrap().unwrap().path();
+        let keys: Vec<_> = std::fs::read_dir(repo.join("keys")).unwrap().flatten().collect();
+        assert_eq!(keys.len(), 1);
+        let k: serde_json::Value = serde_json::from_slice(&std::fs::read(keys[0].path()).unwrap()).unwrap();
+        assert_eq!(k["hostname"], format!("sealctl-{}", env.phone.fingerprint()));
+    }
+
+    // lock: on-lock backup, then the volume closes
+    let (code, out, err) = env.run(&["lock"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Volume v1 closed."), "{out}");
+    if restic_ok {
+        assert!(out.contains("Backed up b1."), "{out}");
+    }
+    assert!(!mnt.join("hello.txt").exists());
+
+    // open asks the phone again (Locked)
+    let ((code, _, err), log) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "v1"]));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(log, vec!["Open"]);
+    assert_eq!(std::fs::read_to_string(mnt.join("hello.txt")).unwrap(), marker);
+    let (_, out, _) = env.run(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["volumes"][0]["mounted"], true, "{out}");
+    let (code, _, err) = env.run(&["volume", "close", "v1"]);
+    assert_eq!(code, 0, "{err}");
+
+    // unseal the volume (and the backup): new passwords in the folder, sealctl's gone
+    let mut c = env.cmd();
+    c.args(["unseal", "volume", "v1"]);
+    let pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("y");
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    let run = run_dir(&env);
+    let pw = password_in(&run, "volume v1");
+    assert!(hdiutil_opens(&bundle, &pw), "the new passphrase opens it");
+    assert!(!bundle.join("sealctl.id").exists());
+    assert!(!env.h().join(".config/sealctl/volumes/v1.toml").exists());
+
+    if restic_ok {
+        let mut c = env.cmd();
+        c.args(["unseal", "backup", "b1"]);
+        let pty = Pty::spawn(c);
+        pty.expect("Start?", Duration::from_secs(30));
+        let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+        pty.line("y");
+        let (code, _, screen) = pty.wait(Duration::from_secs(180));
+        assert_eq!(code, 0, "{screen}");
+        let run2 = std::fs::read_dir(env.h())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("sealctl-unsealed-")
+            })
+            .max()
+            .unwrap();
+        let pw = password_in(&run2, "backup b1");
+        let repo = std::fs::read_dir(&repos).unwrap().next().unwrap().unwrap().path();
+        let o = restic(&repo, &pw, &["snapshots", "--json"]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let keys = restic(&repo, &pw, &["key", "list", "--json"]);
+        let ks: serde_json::Value = serde_json::from_slice(&keys.stdout).unwrap();
+        assert_eq!(ks.as_array().unwrap().len(), 1, "only the user's key is left");
+        let envfile = std::fs::read_to_string(run2.join("backup-b1.env")).unwrap();
+        assert!(envfile.contains("RESTIC_REPOSITORY="));
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
 #[test]
-fn linux_luks_lifecycle() {
-    if std::env::var_os("SEALCTL_TEST_SUDO").is_none() {
-        eprintln!("set SEALCTL_TEST_SUDO=1 (passwordless sudo) to run the LUKS test");
+fn seal_an_existing_sparse_bundle_and_restic_repository() {
+    let mut env = Env::new();
+    env.pair();
+    let own = canary();
+    let bundle = env.h().join("mine.sparsebundle");
+    let mut c = Command::new("/usr/bin/hdiutil")
+        .args([
+            "create",
+            "-quiet",
+            "-size",
+            "32m",
+            "-type",
+            "SPARSEBUNDLE",
+            "-fs",
+            "APFS",
+            "-encryption",
+            "AES-256",
+            "-stdinpass",
+            "-volname",
+            "mine",
+        ])
+        .arg(&bundle)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(own.as_bytes()).unwrap();
+    assert!(c.wait().unwrap().success());
+
+    let mut c = env.cmd();
+    c.args([
+        "seal",
+        "volume",
+        "mine",
+        bundle.to_str().unwrap(),
+        "--mountpoint",
+        env.h().join("mnt/mine").to_str().unwrap(),
+    ]);
+    let pty = Pty::spawn(c);
+    pty.expect("Passphrase of", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line(&own);
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    assert!(screen.contains("pick "), "level 2 with the number: {screen}");
+    assert!(phone.kinds().contains(&"Keys".to_string()));
+    drop(phone);
+    assert!(
+        !hdiutil_opens(&bundle, &own),
+        "the old passphrase no longer opens it"
+    );
+    let ((code, out, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "mine"]));
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("mnt/mine"));
+    env.run(&["volume", "close", "mine"]);
+
+    if !have("restic") {
         return;
     }
-    std::env::set_var("SEALCTL_SUDO_NONINTERACTIVE", "1");
-    lifecycle(Kind::Luks, true);
-}
-
-/// APFS volume inside a throwaway (unencrypted) APFS disk image — never touches real disks.
-#[cfg(target_os = "macos")]
-#[test]
-fn macos_apfs_volume_backend() {
-    use std::process::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let img = tmp.path().join("container.sparseimage");
-    let ok = Command::new("hdiutil")
-        .args([
-            "create", "-quiet", "-size", "2g", "-type", "SPARSE", "-fs", "APFS", "-volname", "sctbase",
-        ])
-        .arg(&img)
-        .status()
-        .unwrap();
-    assert!(ok.success());
-    let out = Command::new("hdiutil")
-        .args(["attach", "-nomount", "-plist"])
-        .arg(&img)
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Each <dict> of system-entities has a content-hint and a dev-entry; the synthesized APFS
-    // container has content-hint EF57347C-0000-11AA-AA11-00306543ECAC.
-    let entry = |d: &str, key: &str| -> Option<String> {
-        let i = d.find(&format!("<key>{key}</key>"))?;
-        let rest = &d[i..];
-        let a = rest.find("<string>")? + "<string>".len();
-        let b = rest[a..].find("</string>")?;
-        Some(rest[a..a + b].to_string())
-    };
-    let mut whole = None;
-    let mut container = None;
-    for d in text.split("<dict>") {
-        let (Some(hint), Some(dev)) = (entry(d, "content-hint"), entry(d, "dev-entry")) else {
-            continue;
-        };
-        let dev = dev.trim_start_matches("/dev/").to_string();
-        if hint == "GUID_partition_scheme" {
-            whole = Some(dev.clone());
-        }
-        if hint.starts_with("EF57347C") {
-            container = Some(dev);
-        }
-    }
-    let whole = whole.expect("whole disk");
-    let container = container.expect("APFS container");
-    let name = unique("sctapfs");
-    let mut v = Volume {
-        name: name.clone(),
-        kind: Kind::ApfsVolume,
-        path: None,
-        id: container.clone(),
-        mountpoint: std::path::Path::new("/Volumes").join(&name),
-        backup: None,
-    };
-    let be = volume::backend(Kind::ApfsVolume);
-    let mut ledger = common::SoftOracle::fixed();
-    let res = (|| -> anyhow::Result<()> {
-        use sealctl::derive::{canonical_id, passphrase, Purpose};
-        // created with a temporary passphrase, then switched to the one derived from its UUID
-        let mut key_for = |id: &str| passphrase(&mut ledger, Purpose::Volume, &canonical_id(id));
-        let pass = be.create(&mut v, "", &mut key_for)?;
-        assert_eq!(v.id.len(), 36, "volume UUID recorded");
-        assert_eq!(
-            be.read_id(&v)?.to_lowercase(),
-            v.id.to_lowercase(),
-            "UUID readable while locked"
-        );
-        be.unlock(&v, pass.as_bytes())?;
-        assert!(be.is_unlocked(&v)?);
-        be.lock(&v, false)?;
-        assert!(!be.is_unlocked(&v)?);
-        assert!(be.unlock(&v, b"nope").is_err());
-        // re-derived from the UUID alone
-        let again = passphrase(&mut ledger, Purpose::Volume, &canonical_id(&v.id))?;
-        be.unlock(&v, again.as_bytes())?;
-        be.lock(&v, false)?;
-        Ok(())
-    })();
-    let _ = Command::new("hdiutil")
-        .args(["detach", "-force", &format!("/dev/{whole}")])
-        .status();
-    res.expect("apfs volume lifecycle");
+    let repo = env.h().join("myrepo");
+    let rpw = canary();
+    assert!(restic(&repo, &rpw, &["init"]).status.success());
+    let src = env.h().join("data");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), "x").unwrap();
+    let mut c = env.cmd();
+    c.args([
+        "seal",
+        "backup",
+        "mine-b",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--from",
+        src.to_str().unwrap(),
+    ]);
+    let pty = Pty::spawn(c);
+    pty.expect("Password of the restic repository:", Duration::from_secs(30));
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line(&rpw);
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    assert!(
+        !restic(&repo, &rpw, &["cat", "config"]).status.success(),
+        "old password removed"
+    );
+    let (code, _, err) = env.run(&["backup", "run", "mine-b", "--quiet"]);
+    assert_eq!(code, 0, "{err}");
 }
