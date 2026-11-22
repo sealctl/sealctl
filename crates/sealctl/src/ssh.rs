@@ -156,10 +156,15 @@ impl Session for Agent {
             return Err(agent_err("unknown key"));
         };
         // refused before the phone is asked, which would approve a signature nobody can make
-        if matches!(wanted, KeyData::Rsa(_)) && rsa_hash(req.flags).is_none() {
-            return Err(agent_err(
-                "ssh-rsa (SHA-1) signatures are not supported; use rsa-sha2-256 or rsa-sha2-512",
-            ));
+        if let KeyData::Rsa(public) = wanted {
+            if rsa_hash(req.flags).is_none() {
+                return Err(agent_err(
+                    "ssh-rsa (SHA-1) signatures are not supported; use rsa-sha2-256 or rsa-sha2-512",
+                ));
+            }
+            if rsa_bits(&public.n) < MIN_RSA_BITS {
+                return Err(agent_err(RSA_TOO_SHORT));
+            }
         }
         let name = names()
             .into_iter()
@@ -228,16 +233,31 @@ fn sign_with(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature> {
     Ok(Signature::new(Algorithm::Rsa { hash: Some(hash) }, sig)?)
 }
 
+/// The shortest RSA modulus the agent signs with, as ssh-key's own conversion requires.
+const MIN_RSA_BITS: usize = 2048;
+const RSA_TOO_SHORT: &str = "RSA keys shorter than 2048 bits are not supported";
+
+/// The size of an RSA modulus in bits, counted in whole bytes as ssh-key and the `rsa` crate do.
+fn rsa_bits(n: &ssh_key::Mpint) -> usize {
+    n.as_positive_bytes().map_or(0, |b| b.len() * 8)
+}
+
 /// The `rsa` crate's key for an OpenSSH RSA key pair. Built here from its components: ssh-key
 /// 0.6's own conversion passes `p` twice instead of `p` and `q`, which the `rsa` crate rejects.
+/// Like that conversion, it refuses a modulus under 2048 bits.
 fn rsa_private_key(pair: &ssh_key::private::RsaKeypair) -> Result<rsa::RsaPrivateKey> {
+    use rsa::traits::PublicKeyParts;
     let big = |m: &ssh_key::Mpint| rsa::BigUint::try_from(m);
-    Ok(rsa::RsaPrivateKey::from_components(
+    let key = rsa::RsaPrivateKey::from_components(
         big(&pair.public.n)?,
         big(&pair.public.e)?,
         big(&pair.private.d)?,
         vec![big(&pair.private.p)?, big(&pair.private.q)?],
-    )?)
+    )?;
+    if key.size().saturating_mul(8) < MIN_RSA_BITS {
+        anyhow::bail!(RSA_TOO_SHORT);
+    }
+    Ok(key)
 }
 
 /// The agent socket.
@@ -298,6 +318,31 @@ mod tests {
             key.public_key().key_data().verify(data, &sig).unwrap();
         }
         assert!(sign_with(&key, data, 0).is_err(), "ssh-rsa (SHA-1) is refused");
+        let KeyData::Rsa(public) = key.public_key().key_data() else {
+            unreachable!()
+        };
+        assert_eq!(rsa_bits(&public.n), 2048);
+    }
+
+    #[test]
+    fn rsa_keys_under_2048_bits_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k");
+        let made = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "rsa", "-b", "1024", "-N", "", "-f"])
+            .arg(&file)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipped: needs ssh-keygen that still makes 1024-bit RSA keys");
+            return;
+        }
+        let key = PrivateKey::from_openssh(std::fs::read_to_string(&file).unwrap()).unwrap();
+        let KeyData::Rsa(public) = key.public_key().key_data() else {
+            unreachable!()
+        };
+        assert!(rsa_bits(&public.n) < MIN_RSA_BITS);
+        let err = sign_with(&key, b"x", RSA_SHA2_256).unwrap_err();
+        assert!(err.to_string().contains("2048"), "{err}");
     }
 
     #[test]
