@@ -4,7 +4,9 @@
 //! or from the 24 words with `--words`. Each object is opened with the new key before the old
 //! way in is removed.
 
+pub mod handback;
 pub mod journal;
+pub mod store;
 pub mod unseal;
 
 use std::collections::BTreeMap;

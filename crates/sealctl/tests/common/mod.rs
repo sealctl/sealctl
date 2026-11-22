@@ -125,6 +125,9 @@ impl Env {
             .env("NO_COLOR", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(h);
+        if let Ok(l) = std::env::var("SEALCTL_LOG") {
+            c.env("SEALCTL_LOG", l);
+        }
         c
     }
 
@@ -369,6 +372,10 @@ pub struct PhoneThread {
     stop: Arc<AtomicBool>,
     h: Option<std::thread::JoinHandle<()>>,
     kinds: Arc<Mutex<Vec<String>>>,
+    /// A report request arrived.
+    pub report_seen: Arc<AtomicBool>,
+    /// Reports are answered only once this is set.
+    pub report_release: Arc<AtomicBool>,
 }
 
 impl PhoneThread {
@@ -378,9 +385,23 @@ impl PhoneThread {
         pick: Pick,
         delay: Option<u64>,
     ) -> PhoneThread {
+        Self::start_gated(phone, screen, pick, delay, true)
+    }
+
+    /// As `start`; with `release_reports` false, a report is held until `report_release`.
+    pub fn start_gated(
+        phone: Arc<Phone>,
+        screen: Arc<Mutex<String>>,
+        pick: Pick,
+        delay: Option<u64>,
+        release_reports: bool,
+    ) -> PhoneThread {
         let stop = Arc::new(AtomicBool::new(false));
         let kinds = Arc::new(Mutex::new(Vec::new()));
+        let report_seen = Arc::new(AtomicBool::new(false));
+        let report_release = Arc::new(AtomicBool::new(release_reports));
         let (s2, k2) = (stop.clone(), kinds.clone());
+        let (seen2, rel2) = (report_seen.clone(), report_release.clone());
         let h = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -414,7 +435,13 @@ impl PhoneThread {
                             };
                             phone.answer_unseal(&r, &req, p, delay).await.unwrap();
                         }
-                        RequestKind::Report => phone.answer_report(&r, &req).await.unwrap(),
+                        RequestKind::Report => {
+                            seen2.store(true, Ordering::SeqCst);
+                            while !rel2.load(Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            phone.answer_report(&r, &req).await.unwrap()
+                        }
                         _ => {
                             phone.auto(&r, &Answer::Session).await.unwrap();
                         }
@@ -426,6 +453,8 @@ impl PhoneThread {
             stop,
             h: Some(h),
             kinds,
+            report_seen,
+            report_release,
         }
     }
 

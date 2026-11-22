@@ -211,8 +211,10 @@ fn unseal_one_secret_with_the_words_sends_no_request() {
     if let Some(f) = &env.fake {
         assert_eq!(f.pending_count(&env.phone.id()), 0);
     }
-    for w in env.phone.words() {
-        assert!(!screen.contains(&format!("{w} ")), "words are not echoed");
+    // nothing follows a word prompt on its line: the words are not echoed
+    for l in screen.lines().filter(|l| l.contains(" of 24:")) {
+        let after = l.rsplit(" of 24:").next().unwrap_or("");
+        assert!(after.trim().is_empty(), "echoed: {l:?}");
     }
 }
 

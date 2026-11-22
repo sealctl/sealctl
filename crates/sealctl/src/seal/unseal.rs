@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use super::journal::{env_name, new_password, quote_env, Run};
+use super::handback::{self as hb, Credential};
+use super::journal::Run;
+use super::store::{self, Item, Location, StoreKind, Stores};
 use crate::approve::{self, Asked};
 use crate::backup::{Backup, Repo};
 use crate::daemon::session;
@@ -64,8 +66,20 @@ pub struct Opts {
     pub keep_store: bool,
     /// `--skip <kind>/<name>`.
     pub skip: Vec<String>,
-    /// `--to`.
-    pub to: Option<String>,
+    /// `--to`: new passwords.
+    pub to: Option<StoreKind>,
+    /// `--secrets-to`: secrets and storage credentials.
+    pub secrets_to: Option<StoreKind>,
+    /// `--env-file`.
+    pub env_file: Option<PathBuf>,
+    /// `--op-vault`.
+    pub op_vault: Option<String>,
+    /// `--bw-folder`.
+    pub bw_folder: Option<String>,
+    /// `--type-passwords`.
+    pub type_passwords: bool,
+    /// `--no-ssh-passphrase`.
+    pub no_ssh_passphrase: bool,
     /// `--relay`.
     pub relay: Option<String>,
 }
@@ -128,6 +142,11 @@ pub struct PlanFile {
     /// Keys came from the words.
     #[serde(default)]
     pub words: bool,
+    /// Where passwords and secrets go.
+    pub stores: store::Config,
+    /// SSH keys end without a passphrase.
+    #[serde(default)]
+    pub no_ssh_passphrase: bool,
 }
 
 fn line(n: usize, kind: &str, name: &str, what: &str) -> String {
@@ -344,6 +363,9 @@ pub fn build(target: &Target, keep_store: bool, skip: &[String]) -> Result<Vec<S
             None,
             "stopped and removed.".into(),
         );
+        if let Ok(p) = machine::load() {
+            push("pairing", &p.label(), None, "is unpaired from your phone.".into());
+        }
         push(
             "local",
             "settings",
@@ -355,9 +377,6 @@ pub fn build(target: &Target, keep_store: bool, skip: &[String]) -> Result<Vec<S
                     .into()
             },
         );
-        if let Ok(p) = machine::load() {
-            push("pairing", &p.label(), None, "is unpaired from your phone.".into());
-        }
     }
     Ok(steps)
 }
@@ -640,7 +659,11 @@ fn take_keys(reply: &ReplyBody, items: &[RequestItem], into: &mut BTreeMap<Strin
 
 /// Gets the plan's keys from the phone: plan parts, the number match, the plan signature,
 /// the delay, then continuation requests for keys that did not fit.
-fn keys_from_phone(plan: &mut PlanFile, run: Option<&Run>) -> Result<BTreeMap<String, ObjectKey>> {
+fn keys_from_phone(
+    plan: &mut PlanFile,
+    pending: &[Step],
+    run: Option<&Run>,
+) -> Result<BTreeMap<String, ObjectKey>> {
     let mut paired = machine::load()?;
     let relay = Relay::new(&paired.file.relay)?;
     let rt = relay::runtime()?;
@@ -652,7 +675,7 @@ fn keys_from_phone(plan: &mut PlanFile, run: Option<&Run>) -> Result<BTreeMap<St
     } else {
         2
     };
-    let all_keys = key_items(&plan.steps);
+    let all_keys = key_items(pending);
     let mut keys = BTreeMap::new();
     let still_valid = plan.h.as_deref() == Some(h.as_str())
         && plan
@@ -788,8 +811,9 @@ struct Ctx<'a> {
     keys: &'a BTreeMap<String, ObjectKey>,
     plan: &'a PlanFile,
     handback: Vec<HandbackItem>,
-    objects: Vec<serde_json::Value>,
+    objects: Vec<hb::Object>,
     paired: Option<Paired>,
+    stores: Stores,
 }
 
 impl Ctx<'_> {
@@ -802,12 +826,45 @@ impl Ctx<'_> {
         })
     }
 
-    fn append(&self, file: &str, text: &str) -> Result<()> {
-        let p = self.run.dir.join(file);
-        let mut cur = Zeroizing::new(std::fs::read_to_string(&p).unwrap_or_default());
-        cur.push_str(text);
-        self.run.write(file, cur.as_bytes())
+    /// Puts a value into a store, reads it back, and returns where it went.
+    fn put(&mut self, kind: StoreKind, item: &Item, value: &[u8]) -> Result<Location> {
+        let run = &*self.run;
+        self.stores.put_checked(kind, item, value, &|f| run.keep_copy(f))
     }
+
+    /// A new password: generated, or typed with `--type-passwords`.
+    fn new_password(&self, what: &str) -> Result<Zeroizing<String>> {
+        if self.plan.stores.type_passwords {
+            store::type_password(what)
+        } else {
+            store::generate_password()
+        }
+    }
+
+    fn done(&mut self, kind: &str, name: &str, to: String, obj: hb::Object) -> Result<()> {
+        self.handback.push(HandbackItem {
+            kind: kind.into(),
+            name: name.into(),
+            to,
+            state: "done".into(),
+        });
+        self.objects.push(obj);
+        save_handback(self.run, &self.objects)
+    }
+}
+
+fn save_handback(run: &Run, objects: &[hb::Object]) -> Result<()> {
+    let mut h = hb::Handback::new(&machine::default_name());
+    h.objects = objects.to_vec();
+    run.write("handback.json", &serde_json::to_vec_pretty(&h)?)
+}
+
+fn load_handback(run: &Run) -> Vec<hb::Object> {
+    std::fs::read(run.dir.join("handback.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<hb::Handback>(&b).ok())
+        .map(|h| h.objects)
+        .unwrap_or_default()
 }
 
 fn store_key_of(c: &Ctx<'_>, store: &Store) -> Result<ObjectKey> {
@@ -824,39 +881,34 @@ fn read_secret(c: &Ctx<'_>, store: &Store, name: &str) -> Result<Zeroizing<Vec<u
     }
 }
 
-fn secrets_env(c: &Ctx<'_>, store: &Store, names: &[String]) -> Result<usize> {
-    let existing = crate::dotenv::parse_dotenv(
-        &std::fs::read_to_string(c.run.dir.join("secrets.env")).unwrap_or_default(),
-    )
-    .unwrap_or_default();
-    let mut text = Zeroizing::new(String::new());
-    let mut wanted: Vec<(String, String)> = Vec::new();
-    let mut taken: Vec<String> = existing.keys().cloned().collect();
+/// Every named secret to the secrets store, each read back.
+fn hand_back_secrets(c: &mut Ctx<'_>, store: &Store, names: &[String]) -> Result<usize> {
+    let vars = store::env_vars(names);
+    let kind = c.plan.stores.secrets_to;
     for n in names {
-        let mut var = env_name(n);
-        let mut i = 2;
-        while taken.contains(&var) {
-            var = format!("{}_{i}", env_name(n));
-            i += 1;
-        }
-        taken.push(var.clone());
         let v = read_secret(c, store, n)?;
-        let s = Zeroizing::new(String::from_utf8_lossy(&v).into_owned());
-        text.push_str(&format!("# {n}\n{var}={}\n", quote_env(&s)));
-        wanted.push((var, util::sha256_hex(&v)));
+        let item = Item {
+            kind: "secret",
+            name: n,
+            notes: format!("sealctl secret {n}"),
+            credential: true,
+            var: vars.get(n).cloned(),
+        };
+        let loc = c.put(kind, &item, &v)?;
+        let to = loc.describe();
+        c.done(
+            "secret",
+            n,
+            to,
+            hb::Object {
+                kind: "secret".into(),
+                name: n.clone(),
+                value: Some(loc),
+                ..Default::default()
+            },
+        )?;
     }
-    c.append("secrets.env", &text)?;
-    // read back by SHA-256
-    let back = crate::dotenv::parse_dotenv(&std::fs::read_to_string(c.run.dir.join("secrets.env"))?)?;
-    for (var, sum) in &wanted {
-        if back.get(var).map(|v| util::sha256_hex(v.as_bytes())).as_deref() != Some(sum.as_str()) {
-            return Err(fail(
-                exit::ERROR,
-                format!("{var} did not read back the same from secrets.env. The run stops."),
-            ));
-        }
-    }
-    Ok(wanted.len())
+    Ok(names.len())
 }
 
 fn hostname() -> String {
@@ -870,7 +922,7 @@ fn hostname() -> String {
 fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     if let Some(base) = name.strip_suffix(" credentials") {
         let _ = base;
-        return Ok("credentials go into the backup env file".into());
+        return Ok("credentials go with the backup.".into());
     }
     let b = Backup::load(name)?;
     let key = c.key("backup", &b.repo_id)?;
@@ -886,19 +938,59 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         }
     }
     let derived = Repo::new(&b.repo, key, env.clone());
-    let pw = new_password()?;
-    // the new password is saved before it is set
-    c.append("passwords.txt", &format!("backup {}: {}\n", b.name, pw.as_str()))?;
-    let mut envfile = Zeroizing::new(format!(
-        "RESTIC_REPOSITORY={}\nRESTIC_PASSWORD={}\n",
-        quote_env(&b.repo),
-        quote_env(&pw)
-    ));
-    for (k, v) in &env {
-        envfile.push_str(&format!("{k}={}\n", quote_env(v)));
+    let pw = c.new_password(&format!("backup {}", b.name))?;
+    // the new password and the credentials are saved before anything changes
+    let pw_name = format!("{}/password", b.name);
+    let loc = c.put(
+        c.plan.stores.to,
+        &Item {
+            kind: "backup",
+            name: &pw_name,
+            notes: format!("restic repository {}", b.repo),
+            credential: false,
+            var: None,
+        },
+        pw.as_bytes(),
+    )?;
+    let mut creds = Vec::new();
+    for (var, v) in &env {
+        let n = format!("{}/{var}", b.name);
+        let l = c.put(
+            c.plan.stores.secrets_to,
+            &Item {
+                kind: "backup",
+                name: &n,
+                notes: format!("storage credential of restic repository {}", b.repo),
+                credential: true,
+                var: Some(var.clone()),
+            },
+            v.as_bytes(),
+        )?;
+        creds.push(Credential {
+            var: var.clone(),
+            location: l,
+        });
     }
-    c.run
-        .write(&format!("backup-{}.env", b.name), envfile.as_bytes())?;
+    if c.plan.stores.to == StoreKind::Folder {
+        // restic settings in one file people can source
+        for (var, v) in [
+            ("RESTIC_REPOSITORY", b.repo.as_bytes()),
+            ("RESTIC_PASSWORD", pw.as_bytes()),
+        ] {
+            let n = format!("{}/{var}", b.name);
+            c.put(
+                StoreKind::Folder,
+                &Item {
+                    kind: "backup",
+                    name: &n,
+                    notes: String::new(),
+                    credential: false,
+                    var: Some(var.into()),
+                },
+                v,
+            )?;
+        }
+    }
     let own = Repo::with_password(&b.repo, pw.clone(), env.clone());
     let opens_already = own.opens().unwrap_or(false);
     let ours = derived
@@ -937,14 +1029,20 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     if Backup::list()?.is_empty() {
         let _ = crate::backup::schedule_uninstall();
     }
-    c.handback.push(HandbackItem {
-        kind: "backup".into(),
-        name: b.name.clone(),
-        to: "passwords.txt".into(),
-        state: "done".into(),
-    });
-    c.objects.push(json!({"kind": "backup", "name": b.name, "url": b.repo, "password": {"store": "folder", "file": "passwords.txt"},
-        "credentials": b.credentials.iter().map(|v| json!({"var": v, "store": "folder", "file": format!("backup-{}.env", b.name)})).collect::<Vec<_>>()}));
+    let to = loc.describe();
+    c.done(
+        "backup",
+        &b.name,
+        to,
+        hb::Object {
+            kind: "backup".into(),
+            name: b.name.clone(),
+            url: Some(b.repo.clone()),
+            password: Some(loc),
+            credentials: creds,
+            ..Default::default()
+        },
+    )?;
     Ok("your password works; sealctl's key is removed.".into())
 }
 
@@ -964,8 +1062,41 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             Kind::Luks => volume::luks::verify(path.as_ref().context("path")?, pass),
         }
     };
-    let pw = new_password()?;
-    c.append("passwords.txt", &format!("volume {}: {}\n", v.name, pw.as_str()))?;
+    let pw = c.new_password(&format!("volume {}", v.name))?;
+    let notes = match v.kind {
+        Kind::Apfs => format!(
+            "APFS volume {} (UUID {}). Open with: diskutil apfs unlockVolume {}",
+            v.name, v.id, v.id
+        ),
+        Kind::Sparsebundle => format!(
+            "Sparse bundle {}. Open with: hdiutil attach {}",
+            v.name,
+            v.path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ),
+        Kind::Luks => format!(
+            "LUKS volume {}. Open with: sudo cryptsetup open {} {}",
+            v.name,
+            v.path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            v.name
+        ),
+    };
+    let loc = c.put(
+        c.plan.stores.to,
+        &Item {
+            kind: "volume",
+            name: &v.name,
+            notes,
+            credential: false,
+            var: None,
+        },
+        pw.as_bytes(),
+    )?;
     if !opens(pw.as_bytes())? {
         match v.kind {
             Kind::Sparsebundle => volume::sparsebundle::change_passphrase(
@@ -1033,14 +1164,21 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     let _ = std::fs::remove_dir_all(v.mountpoint.join(".sealctl"));
     let cfg = paths::volumes_dir()?.join(format!("{}.toml", v.name));
     let _ = std::fs::remove_file(cfg);
-    c.handback.push(HandbackItem {
-        kind: "volume".into(),
-        name: v.name.clone(),
-        to: "passwords.txt".into(),
-        state: "done".into(),
-    });
-    c.objects.push(json!({"kind": "volume", "name": v.name, "volume": v.kind.as_str(), "uuid": v.id,
-        "path": v.path.as_ref().map(|p| paths::tilde(p)), "password": {"store": "folder", "file": "passwords.txt"}}));
+    let to = loc.describe();
+    c.done(
+        "volume",
+        &v.name,
+        to,
+        hb::Object {
+            kind: "volume".into(),
+            name: v.name.clone(),
+            volume: Some(v.kind.as_str().into()),
+            uuid: Some(v.id.clone()),
+            path: v.path.as_ref().map(|p| paths::tilde(p)),
+            password: Some(loc),
+            ..Default::default()
+        },
+    )?;
     Ok("your passphrase works; sealctl's is removed.".into())
 }
 
@@ -1065,14 +1203,49 @@ fn step_ssh(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         dest = dir.join(format!("{name}-{i}"));
         i += 1;
     }
-    let text = Zeroizing::new(key.to_openssh(ssh_key::LineEnding::LF)?.to_string());
+    let (text, loc, pass) = if c.plan.no_ssh_passphrase {
+        (
+            Zeroizing::new(key.to_openssh(ssh_key::LineEnding::LF)?.to_string()),
+            None,
+            None,
+        )
+    } else {
+        let pass = c.new_password(&format!("ssh key {name}"))?;
+        let loc = c.put(
+            c.plan.stores.to,
+            &Item {
+                kind: "ssh",
+                name,
+                notes: format!("passphrase of the SSH key {}", paths::tilde(&dest)),
+                credential: false,
+                var: None,
+            },
+            pass.as_bytes(),
+        )?;
+        let enc = key.encrypt(&mut ssh_key::rand_core::OsRng, pass.as_bytes())?;
+        (
+            Zeroizing::new(enc.to_openssh(ssh_key::LineEnding::LF)?.to_string()),
+            Some(loc),
+            Some(pass),
+        )
+    };
     paths::write_private(&dest, text.as_bytes())?;
     paths::write_mode(
         &dest.with_extension("pub"),
         format!("{}\n", key.public_key().to_openssh()?).as_bytes(),
         0o644,
     )?;
-    let back = ssh_key::PrivateKey::from_openssh(std::fs::read_to_string(&dest)?)?;
+    let mut back = ssh_key::PrivateKey::from_openssh(std::fs::read_to_string(&dest)?)?;
+    if let (Some(l), Some(_)) = (&loc, &pass) {
+        // the passphrase read back from its store opens the file
+        let p = c.stores.read(l)?;
+        back = back.decrypt(&p).map_err(|_| {
+            fail(
+                exit::ERROR,
+                format!("{} does not open with its stored passphrase.", dest.display()),
+            )
+        })?;
+    }
     if back.public_key().key_data() != key.public_key().key_data() {
         return Err(fail(
             exit::ERROR,
@@ -1100,15 +1273,25 @@ fn step_ssh(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     if let Ok(p) = crate::ssh::pub_path(name) {
         c.run.keep(&p, &format!("ssh/sealctl_{name}.pub"))?;
     }
-    c.handback.push(HandbackItem {
-        kind: "ssh".into(),
-        name: name.into(),
-        to: paths::tilde(&dest),
-        state: "done".into(),
-    });
-    c.objects.push(
-        json!({"kind": "ssh", "name": name, "path": paths::tilde(&dest), "password": {"store": "none"}}),
-    );
+    let to = match &loc {
+        Some(l) => format!("{}, passphrase: {}", paths::tilde(&dest), l.describe()),
+        None => paths::tilde(&dest),
+    };
+    c.done(
+        "ssh",
+        name,
+        to,
+        hb::Object {
+            kind: "ssh".into(),
+            name: name.into(),
+            path: Some(paths::tilde(&dest)),
+            password: loc.clone(),
+            ..Default::default()
+        },
+    )?;
+    if loc.is_some() {
+        return Ok(format!("{} with a passphrase of your own.", paths::tilde(&dest)));
+    }
     Ok(format!("{} with no passphrase.", paths::tilde(&dest)))
 }
 
@@ -1184,23 +1367,17 @@ fn run_step(c: &mut Ctx<'_>, s: &Step) -> Result<String> {
         "secrets" => {
             let store = Store::configured()?;
             let names: Vec<String> = store.list()?.into_iter().map(|l| l.name).collect();
-            let n = secrets_env(c, &store, &names)?;
+            let n = hand_back_secrets(c, &store, &names)?;
             if c.plan.target == Target::Secrets && !c.plan.keep_store {
                 c.run.keep(&store.dir, "store")?;
                 let mut cfg = crate::config::Config::load()?;
                 cfg.store = None;
                 cfg.save()?;
             }
-            c.handback.push(HandbackItem {
-                kind: "secrets".into(),
-                name: s.name.clone(),
-                to: "secrets.env".into(),
-                state: "done".into(),
-            });
-            c.objects.push(
-                json!({"kind": "secrets", "count": n, "value": {"store": "folder", "file": "secrets.env"}}),
-            );
-            Ok(format!("{n} values in secrets.env, read back."))
+            Ok(format!(
+                "{n} values to {}, read back.",
+                c.plan.stores.secrets_to.describe()
+            ))
         }
         "secret" => {
             if c.plan.target == Target::All || c.plan.target == Target::Secrets {
@@ -1208,15 +1385,11 @@ fn run_step(c: &mut Ctx<'_>, s: &Step) -> Result<String> {
                 return Ok("handed back with the store.".into());
             }
             let store = Store::configured()?;
-            secrets_env(c, &store, std::slice::from_ref(&s.name))?;
-            c.handback.push(HandbackItem {
-                kind: "secret".into(),
-                name: s.name.clone(),
-                to: "secrets.env".into(),
-                state: "done".into(),
-            });
-            c.objects.push(json!({"kind": "secret", "name": s.name, "value": {"store": "folder", "file": "secrets.env", "var": env_name(&s.name)}}));
-            Ok("value in secrets.env, read back.".into())
+            hand_back_secrets(c, &store, std::slice::from_ref(&s.name))?;
+            Ok(format!(
+                "value to {}, read back.",
+                c.plan.stores.secrets_to.describe()
+            ))
         }
         "backup" => step_backup(c, &s.name),
         "volume" => step_volume(c, &s.name),
@@ -1283,14 +1456,6 @@ fn run_step(c: &mut Ctx<'_>, s: &Step) -> Result<String> {
 /// `sealctl unseal`.
 pub fn unseal(o: Opts) -> Result<()> {
     term::require_person("sealctl unseal", None)?;
-    if let Some(to) = &o.to {
-        if to != "folder" {
-            return Err(fail(
-                exit::USAGE,
-                format!("--to {to} is not in this build; the default folder store is."),
-            ));
-        }
-    }
     if machine::is_paired() {
         machine::load_for(o.relay.as_deref())?;
     }
@@ -1309,6 +1474,31 @@ pub fn unseal(o: Opts) -> Result<()> {
         if steps.is_empty() {
             return Err(fail(exit::NOT_FOUND, "Nothing to hand back."));
         }
+        let to = o.to.unwrap_or(StoreKind::Folder);
+        // secrets follow the password store, except that `show` can't take them
+        let secrets_to = o.secrets_to.unwrap_or(match to {
+            StoreKind::Show => StoreKind::Folder,
+            t => t,
+        });
+        let uses_to = steps
+            .iter()
+            .any(|s| s.kind == "volume" || (s.kind == "backup" && !s.name.ends_with(" credentials")))
+            || (steps.iter().any(|s| s.kind == "ssh") && !o.no_ssh_passphrase && to != StoreKind::Folder);
+        let uses_secrets = steps
+            .iter()
+            .any(|s| matches!(s.kind.as_str(), "secrets" | "secret" | "backup"));
+        if uses_to {
+            store::usable(to, false)
+                .map_err(|e| fail(exit::USAGE, format!("--to {}: {e:#}", to.as_str())))?;
+        }
+        if uses_secrets {
+            store::usable(secrets_to, true).map_err(|e| {
+                fail(
+                    exit::USAGE,
+                    format!("--secrets-to {}: {e:#}", secrets_to.as_str()),
+                )
+            })?;
+        }
         let plan = PlanFile {
             target,
             all,
@@ -1318,7 +1508,23 @@ pub fn unseal(o: Opts) -> Result<()> {
             nb: None,
             sig: None,
             words: o.words,
+            stores: store::Config {
+                to,
+                secrets_to,
+                env_file: o.env_file.clone(),
+                op_vault: o.op_vault.clone(),
+                bw_folder: o.bw_folder.clone(),
+                type_passwords: o.type_passwords,
+            },
+            no_ssh_passphrase: o.no_ssh_passphrase || to == StoreKind::Folder,
         };
+        let mut plan = plan;
+        if !plan.no_ssh_passphrase {
+            let with = format!("with a passphrase in {}", to.describe());
+            for s in plan.steps.iter_mut().filter(|s| s.kind == "ssh") {
+                s.text = s.text.replace("with no passphrase", &with);
+            }
+        }
         show_plan(&plan);
         if o.dry_run {
             if o.json {
@@ -1346,6 +1552,7 @@ pub fn unseal(o: Opts) -> Result<()> {
                  secrets.env      secrets, NAME=\"value\"\n\
                  backup-*.env     restic settings: source one with  set -a; . ./backup-NAME.env  then run restic\n\
                  handback.json    what went where (no passwords in it)\n\
+                 Passwords and secrets that went to a password manager or the keychain are not here.\n\
                  Delete this folder (rm -rf) once the new passwords and keys work. sealctl never deletes it.\n",
                 machine::default_name()
             )
@@ -1361,35 +1568,66 @@ pub fn unseal(o: Opts) -> Result<()> {
         (run, plan)
     };
 
-    let keys = if plan.words || o.words {
-        keys_from_words(&plan.steps)?
-    } else if key_items(&plan.steps).is_empty() && !plan.all {
-        BTreeMap::new()
-    } else {
-        keys_from_phone(&mut plan, Some(&run))?
-    };
     let done = run.done_steps();
+    let pending: Vec<Step> = plan
+        .steps
+        .iter()
+        .filter(|s| !done.contains(&s.id))
+        .cloned()
+        .collect();
+    let keys = if key_items(&pending).is_empty() && (o.resume || !plan.all) {
+        BTreeMap::new()
+    } else if plan.words || o.words {
+        keys_from_words(&pending)?
+    } else {
+        keys_from_phone(&mut plan, &pending, Some(&run))?
+    };
     let total = plan.steps.len();
     let paired = machine::load().ok();
     let plan_c = plan.clone();
+    let mut stores = Stores::new(plan.stores.clone());
+    stores.folder = Some(run.dir.clone());
+    let objects = load_handback(&run);
     let mut c = Ctx {
         run: &mut run,
         keys: &keys,
         plan: &plan_c,
         handback: Vec::new(),
-        objects: Vec::new(),
+        objects,
         paired,
+        stores,
+    };
+    // Ctrl-C (or a TERM) from here on lets the current step finish, then stops with the
+    // journal resumable
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        let _ = signal_hook::flag::register(sig, stop.clone());
+    }
+    let stopped = |c: &mut Ctx<'_>, step: &str| -> Result<()> {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = c.run.log(step, "skipped", "stopped by Ctrl-C");
+            return Err(fail(
+                exit::PARTWAY,
+                format!(
+                    "Stopped before {step}. Steps before it are done. Run sealctl unseal --resume to go on.\nThe run folder is {}.",
+                    paths::tilde(&c.run.dir)
+                ),
+            ));
+        }
+        Ok(())
     };
     let mut report_note = None;
     for (i, s) in plan.steps.iter().enumerate() {
         if done.contains(&s.id) {
             continue;
         }
+        stopped(&mut c, &s.id)?;
         if s.kind == "pairing" && !plan.words {
             // the hand-back report goes before the pairing step
             if !send_report(&mut c) {
                 report_note = Some("Your phone did not get the report.");
             }
+            stopped(&mut c, &s.id)?;
         }
         c.run.log(&s.id, "start", "")?;
         match run_step(&mut c, s) {
@@ -1415,16 +1653,7 @@ pub fn unseal(o: Opts) -> Result<()> {
             }
         }
     }
-    let handback = json!({
-        "sealctl": 1,
-        "kind": "handback",
-        "created": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-        "machine": machine::default_name(),
-        "from": env!("CARGO_PKG_VERSION"),
-        "objects": c.objects,
-    });
-    c.run
-        .write("handback.json", &serde_json::to_vec_pretty(&handback)?)?;
+    save_handback(c.run, &c.objects)?;
     c.run.finish()?;
     let dir = paths::tilde(&c.run.dir);
     if plan.all {
@@ -1451,6 +1680,14 @@ pub fn unseal(o: Opts) -> Result<()> {
         "Everything is in {dir}: {}README.txt, handback.json (no passwords in it).",
         files.iter().map(|f| format!("{f}, ")).collect::<String>()
     );
+    for kind in [plan.stores.to, plan.stores.secrets_to] {
+        if !matches!(kind, StoreKind::Folder | StoreKind::Show) {
+            eprintln!(
+                "Some went to {} (labels start with \"sealctl: \").",
+                kind.describe()
+            );
+        }
+    }
     if plan.all {
         eprintln!("Remove the program: {}", uninstall_hint());
     }
@@ -1482,6 +1719,18 @@ fn show_plan(plan: &PlanFile) {
         chrono::Local::now().format("%Y-%m-%d")
     );
     eprintln!("  Only you can read the folder. Delete it yourself once the new passwords and keys work.");
+    eprintln!();
+    eprintln!(
+        "New passwords go to: {}   (change with --to folder|keychain|op|bw|show)",
+        plan.stores.to.describe()
+    );
+    eprintln!(
+        "Secrets go to:       {}   (change with --secrets-to folder|keychain|op|bw|env)",
+        plan.stores.secrets_to.describe()
+    );
+    if plan.stores.secrets_to == StoreKind::Env {
+        eprintln!("  This file holds your keys in plain text, where AI agents can read them. Move them to a password manager, then delete it.");
+    }
     eprintln!();
     for s in &plan.steps {
         eprintln!("{}", s.text);

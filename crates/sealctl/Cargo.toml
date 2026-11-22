@@ -36,10 +36,21 @@ signature = "2"
 hex = "0.4"
 base64 = "0.22"
 regex = "1"
+signal-hook = "0.3"
 qrcode = { version = "0.15", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 command-fds = "0.3"
-nix = { version = "0.31", default-features = false, features = ["fs", "user", "resource", "socket", "term", "process"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "user", "resource", "socket", "term", "process", "signal"] }
+# `unseal --to keychain`: macOS Keychain, or the Secret Service over zbus (no libdbus)
+keyring = { version = "3", features = ["apple-native", "async-secret-service", "tokio", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keychain items with a readable label (keyring can't set one)
+security-framework = "3"
+
+[features]
+# Tests only: the keychain service name can be overridden (SEALCTL_TEST_KEYCHAIN_SERVICE).
+test-hooks = []
 
 [dev-dependencies]
 tempfile = "3"

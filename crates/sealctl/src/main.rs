@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
+use sealctl::seal::store::StoreKind;
 use sealctl::seal::unseal::{self, Target};
 use sealctl::volume::{CreateOpts, Kind};
 use sealctl::{cli, exit, git, pair, seal, ssh, status};
@@ -498,9 +499,27 @@ struct UnsealArgs {
     /// Leave one object out: <kind>/<name>.
     #[arg(long, global = true)]
     skip: Vec<String>,
-    /// Where new passwords go (this build: folder).
+    /// Where new passwords go (default: the unsealed folder).
+    #[arg(long, global = true, value_enum)]
+    to: Option<StoreKind>,
+    /// Where secrets and storage credentials go (default: as --to).
+    #[arg(long, global = true, value_enum)]
+    secrets_to: Option<StoreKind>,
+    /// The .env file for --secrets-to env (default ~/sealctl-secrets.env).
     #[arg(long, global = true)]
-    to: Option<String>,
+    env_file: Option<PathBuf>,
+    /// 1Password vault for --to op.
+    #[arg(long, global = true)]
+    op_vault: Option<String>,
+    /// Bitwarden folder for --to bw.
+    #[arg(long, global = true)]
+    bw_folder: Option<String>,
+    /// Type each new password (twice, at least 12 characters) instead of generating it.
+    #[arg(long, global = true)]
+    type_passwords: bool,
+    /// SSH keys end without a passphrase (always with the folder store).
+    #[arg(long, global = true)]
+    no_ssh_passphrase: bool,
 }
 
 #[derive(Subcommand)]
@@ -764,6 +783,12 @@ fn run(cli: Cli) -> Result<i32> {
                 keep_store: a.keep_store,
                 skip: a.skip,
                 to: a.to,
+                secrets_to: a.secrets_to,
+                env_file: a.env_file,
+                op_vault: a.op_vault,
+                bw_folder: a.bw_folder,
+                type_passwords: a.type_passwords,
+                no_ssh_passphrase: a.no_ssh_passphrase,
                 relay,
             })
             .map(|_| 0)
