@@ -19,6 +19,10 @@ crates/sealctl/src/seal/**            @oleksiyp
 Cargo.toml                            @oleksiyp
 Cargo.lock                            @oleksiyp
 deny.toml                             @oleksiyp
+rust-toolchain.toml                   @oleksiyp
+flake.nix                             @oleksiyp
+flake.lock                            @oleksiyp
+scripts/**                            @oleksiyp
 supply-chain/**                       @oleksiyp
 fuzz/**                               @oleksiyp
 .github/**                            @oleksiyp
