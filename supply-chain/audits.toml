@@ -6,3 +6,9 @@ who = "oleksiyp"
 criteria = "safe-to-deploy"
 delta = "0.3.18 -> 0.4.6"
 notes = "Delta reviewed with AI assistance (Claude Code) for the sealctl maintainer; the 0.3.18 base is an exemption, not an audit. build.rs is unchanged apart from a Windows guard and only compiles src/low_level/extract.c (identical to 0.3.18) when the off-by-default extended-siginfo-raw feature is on. No new dependencies, no proc macros, no file, network or process access. Unsafe changes: flag::register now takes any T: BorrowSignalSafe (an unsafe trait implemented only for Arc<T> and &'static T); low_level::pipe moves from RawFd to OwnedFd (fixes a double close on unregister) and sets FD_CLOEXEC with F_SETFD instead of the no-op O_CLOEXEC via F_SETFL; the hand-rolled 32-bit Android sigset code is replaced by libc sigemptyset/sigaddset. All are correctness fixes; nothing suspicious."
+
+[[audits.toml]]
+who = "oleksiyp"
+criteria = "safe-to-deploy"
+delta = "0.9.12+spec-1.1.0 -> 1.1.8+spec-1.1.0"
+notes = "Delta reviewed with AI assistance (Claude Code) for the sealctl maintainer; the 0.9.12 base is an exemption, not an audit. Still #![forbid(unsafe_code)], no build script, no proc macros, no file, network, process or env access. Dependencies are the same crates at newer versions (toml_datetime/serde_spanned/toml_parser/toml_writer 1.1, winnow 1.0), plus optional anstream/anstyle only behind the off-by-default debug feature. Changes are parser/serializer fixes: dotted-key vs table-header mixing rules, keys encoded with toml_writer when serializing (quoted when needed), duplicate-key errors in Value/Table deserialization, borrowed-str visiting, Datetime via deserialize_struct, core::error::Error (edition 2024, MSRV 1.85)."
