@@ -1,6 +1,15 @@
 # Contributing to sealctl
 
-Thanks for helping! A few ground rules keep this tool trustworthy.
+Thanks for your interest in sealctl.
+
+**Issues are welcome:** bug reports, questions and ideas, on
+[GitHub issues](https://github.com/sealctl/sealctl/issues). **Security reports are welcome**,
+privately: see [SECURITY.md](SECURITY.md), never a public issue.
+
+**Code pull requests are not accepted for now.** The terms for outside contributions (a
+contributor licence agreement, and an AGPL section 7 permission for the phone app) are not
+settled yet, so pull requests can only be opened by maintainers. This file will say when that
+changes. The rules below are how the code is written and apply to maintainers today.
 
 ## The hard rule: no new cryptography
 
@@ -38,13 +47,12 @@ Backup tests need `restic`; on Linux, volume tests need `cryptsetup`.
 Tests that kill a run at a set point and resume it need the test hooks:
 `cargo test -p sealctl --features test-hooks --test unseal resume_after_a_kill`.
 
-## Pull requests
+## Pull requests (maintainers)
 
 - Keep PRs focused; describe what you tested (OS, and the phone's OS and app version if the
   phone was involved).
 - Add tests for pure logic (parsing, formats, plans).
 - Update `CHANGELOG.md` under *Unreleased*.
-- By contributing you agree that your work is licensed under the MIT license.
 
 ## Code of conduct
 
