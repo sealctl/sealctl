@@ -178,7 +178,10 @@ mod tests {
             "Asia/Kolkata",
             "Pacific/Chatham",
         ] {
-            let zone = jiff::tz::TimeZone::get(tz).unwrap();
+            // build sandboxes (nix) may have no time zone database
+            let Ok(zone) = jiff::tz::TimeZone::get(tz) else {
+                continue;
+            };
             let start = crate::clock::from_ms(t0).unwrap().to_zoned(zone.clone());
             let two = start.date().at(2, 0, 0, 0).to_zoned(zone.clone()).unwrap();
             let two = if two.timestamp() > start.timestamp() {
