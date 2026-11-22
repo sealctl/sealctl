@@ -601,6 +601,10 @@ fn unreadable_files_still_make_a_backup_and_retention_runs() {
     // restic exits 3: the snapshot is made, one file is missing from it
     let (code, _, err) = env.run(&["backup", "run", "docs", "--quiet"]);
     assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("Backed up docs (some files could not be read)."),
+        "{err}"
+    );
     let state = std::fs::read_to_string(env.h().join("s/sealctl/backup/docs.toml")).unwrap();
     assert!(state.contains("last_success"), "{state}");
     assert!(state.contains("last_prune"), "forget ran: {state}");

@@ -479,13 +479,14 @@ pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Resu
     Ok((b, key))
 }
 
-/// Runs one backup now, then `forget` with the policy (`--prune` at most weekly).
+/// Runs one backup now, then `forget` with the policy (`--prune` at most weekly). `Some` is a
+/// warning: the snapshot was made but is missing something.
 pub fn run_one(
     b: &Backup,
     key: &ObjectKey,
     env: BTreeMap<String, Zeroizing<String>>,
     quiet: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if key.check() != b.check {
         return Err(fail(
             exit::WRONG_KEY,
@@ -568,7 +569,7 @@ pub fn run_one(
         Err(e) => st.last_error = Some(format!("{e:#}")),
     }
     b.save_state(&st)?;
-    r.map(|_| ())
+    r
 }
 
 /// `1 h 5 min ago`.
