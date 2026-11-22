@@ -1,0 +1,50 @@
+#!/usr/bin/env perl
+# Fake Bitwarden CLI for the unseal tests. Records argv in $FAKE_STORE/argv.log and keeps
+# item passwords in $FAKE_STORE/bw/<id>.
+use strict;
+use warnings;
+use JSON::PP;
+use MIME::Base64;
+
+my $dir = $ENV{FAKE_STORE} or die "FAKE_STORE not set\n";
+mkdir "$dir";
+mkdir "$dir/bw";
+open(my $log, '>>', "$dir/argv.log") or die;
+print $log join(' ', 'bw', @ARGV), "\n";
+close $log;
+
+local $/;
+if ($ARGV[0] eq 'status') {
+    print encode_json({ status => 'unlocked' }), "\n";
+    exit 0;
+}
+if ($ARGV[0] eq 'encode') {
+    my $in = <STDIN>;
+    print encode_base64($in, '');
+    exit 0;
+}
+if ($ARGV[0] eq 'create' && $ARGV[1] eq 'item') {
+    die "the item must come on stdin\n" if @ARGV > 2;
+    my $in = <STDIN>;
+    my $item = decode_json(decode_base64($in));
+    my $n = 1;
+    $n++ while -e "$dir/bw/id$n";
+    my $id = "id$n";
+    open(my $f, '>', "$dir/bw/$id") or die;
+    print $f $item->{login}{password};
+    close $f;
+    print encode_json({ id => $id, name => $item->{name} }), "\n";
+    exit 0;
+}
+if ($ARGV[0] eq 'get' && $ARGV[1] eq 'password') {
+    open(my $f, '<', "$dir/bw/$ARGV[2]") or do { print STDERR "Not found.\n"; exit 1 };
+    print <$f>;
+    exit 0;
+}
+if ($ARGV[0] eq 'list' && $ARGV[1] eq 'folders') {
+    my $name = $ARGV[3] // '';
+    print encode_json([{ id => 'folder1', name => $name }]), "\n";
+    exit 0;
+}
+print STDERR "fake bw: unsupported: @ARGV\n";
+exit 2;

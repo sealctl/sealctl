@@ -1,7 +1,7 @@
 ## What and why
 
 ## How it was tested
-<!-- device model, transport (USB/Bluetooth), OS; unit tests added? -->
+<!-- OS; phone OS and app version if the phone was involved; tests added? -->
 
 ## Checklist
 - [ ] No new cryptographic constructions (only standard components)

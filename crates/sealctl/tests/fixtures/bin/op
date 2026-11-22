@@ -1,0 +1,52 @@
+#!/usr/bin/env perl
+# Fake 1Password CLI for the unseal tests. Records argv (one line per call) in
+# $FAKE_STORE/argv.log and keeps item values in $FAKE_STORE/op/<id>.
+# FAKE_OP_CORRUPT=1 makes `op read` return a different value.
+use strict;
+use warnings;
+use JSON::PP;
+
+my $dir = $ENV{FAKE_STORE} or die "FAKE_STORE not set\n";
+mkdir "$dir";
+mkdir "$dir/op";
+open(my $log, '>>', "$dir/argv.log") or die;
+print $log join(' ', 'op', @ARGV), "\n";
+close $log;
+
+my $cmd = join(' ', @ARGV[0 .. ($#ARGV < 1 ? $#ARGV : 1)]);
+if ($ARGV[0] eq 'whoami') {
+    print "test\@example.org\n";
+    exit 0;
+}
+if ($cmd eq 'item create') {
+    local $/;
+    my $in = <STDIN>;
+    my $item = decode_json($in);
+    my ($field) = grep { $_->{id} eq 'password' || $_->{id} eq 'credential' } @{ $item->{fields} };
+    die "no value field\n" unless $field;
+    my $vault = 'Private';
+    for my $i (0 .. $#ARGV) { $vault = $ARGV[$i + 1] if $ARGV[$i] eq '--vault'; }
+    my $n = 1;
+    $n++ while -e "$dir/op/item$n";
+    my $id = "item$n";
+    open(my $f, '>', "$dir/op/$id") or die;
+    print $f $field->{value};
+    close $f;
+    open(my $t, '>', "$dir/op/$id.title") or die;
+    print $t $item->{title};
+    close $t;
+    print encode_json({ id => $id, title => $item->{title}, vault => { id => $vault } }), "\n";
+    exit 0;
+}
+if ($ARGV[0] eq 'read') {
+    my ($ref) = grep { m{^op://} } @ARGV;
+    my (undef, undef, $vault, $id, $fieldname) = split m{/}, $ref;
+    open(my $f, '<', "$dir/op/$id") or do { print STDERR "[ERROR] item not found\n"; exit 1 };
+    local $/;
+    my $v = <$f>;
+    $v .= 'x' if $ENV{FAKE_OP_CORRUPT};
+    print $v;
+    exit 0;
+}
+print STDERR "fake op: unsupported: @ARGV\n";
+exit 2;

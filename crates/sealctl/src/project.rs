@@ -12,107 +12,136 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::derive::Oracle;
-use crate::secrets;
+use crate::exit::{self, fail};
 
+/// The project file name.
 pub const FILE: &str = ".sealctl.toml";
 
+/// `.sealctl.toml`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ProjectFile {
+    /// Variables for every command.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Variables for commands starting with these words.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub command: BTreeMap<String, BTreeMap<String, String>>,
 }
 
-/// Find `.sealctl.toml` in `start` or any parent directory.
+/// Finds `.sealctl.toml` in `start` or any parent folder.
 pub fn find(start: &Path) -> Option<PathBuf> {
     start.ancestors().map(|d| d.join(FILE)).find(|p| p.is_file())
 }
 
+/// Reads a project file.
 pub fn load(path: &Path) -> Result<ProjectFile> {
     let text = std::fs::read_to_string(path)?;
-    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    toml::from_str(&text).with_context(|| format!("reading {}", path.display()))
 }
 
-/// Parse `NAME=secret` pairs given on the command line.
+/// Parses `NAME=secret` pairs given on the command line.
 pub fn parse_pairs(pairs: &[String]) -> Result<BTreeMap<String, String>> {
     pairs
         .iter()
         .map(|p| {
             let (k, v) = p
                 .split_once('=')
-                .with_context(|| format!("expected NAME=secret, got {p:?}"))?;
+                .ok_or_else(|| fail(exit::USAGE, format!("Expected NAME=secret, got {p:?}.")))?;
             if k.is_empty() || v.is_empty() {
-                bail!("expected NAME=secret, got {p:?}");
+                return Err(fail(exit::USAGE, format!("Expected NAME=secret, got {p:?}.")));
             }
             Ok((k.to_string(), v.to_string()))
         })
         .collect()
 }
 
-/// Resolve env mappings (project file + command line, command line wins).
-pub fn mappings(extra: &[String], use_project: bool) -> Result<BTreeMap<String, String>> {
+/// The mappings for `argv`: `[env]`, then `[command."<words>"]` sections whose words are a prefix
+/// of the command line (the longest prefix wins per variable), then `-e`.
+pub fn mappings_for(
+    project: Option<&ProjectFile>,
+    argv: &[String],
+    extra: &[String],
+) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
-    if use_project {
-        if let Some(p) = find(&std::env::current_dir()?) {
-            eprintln!("sealctl: secrets mapped in {}", p.display());
-            map.extend(load(&p)?.env);
+    if let Some(p) = project {
+        map.extend(p.env.clone());
+        let mut sections: Vec<(&String, &BTreeMap<String, String>)> = p
+            .command
+            .iter()
+            .filter(|(words, _)| {
+                let w: Vec<&str> = words.split_whitespace().collect();
+                !w.is_empty() && w.len() <= argv.len() && w.iter().zip(argv).all(|(a, b)| a == b)
+            })
+            .collect();
+        sections.sort_by_key(|(w, _)| w.split_whitespace().count());
+        for (_, vars) in sections {
+            map.extend(vars.clone());
         }
     }
     map.extend(parse_pairs(extra)?);
     Ok(map)
 }
 
-/// Run `argv` with secrets injected into its environment only.
-pub fn run(oracle: &mut dyn Oracle, extra: &[String], use_project: bool, argv: &[String]) -> Result<()> {
+/// `sealctl run`: starts `argv` with the mapped secrets in its environment only.
+pub fn run(extra: &[String], use_project: bool, argv: &[String]) -> Result<()> {
     let Some((prog, args)) = argv.split_first() else {
-        bail!("no command given — usage: sealctl run [--env NAME=secret] -- <command>");
+        return Err(fail(
+            exit::USAGE,
+            "No command given. Usage: sealctl run [-e NAME=secret] -- <command>",
+        ));
     };
-    let map = mappings(extra, use_project)?;
-    if map.is_empty() {
-        eprintln!("note: no secrets mapped (no {FILE} found and no --env given)");
-    }
-    let names: Vec<&str> = map.values().map(|s| s.as_str()).collect();
-    // say which secrets go to the program — a .sealctl.toml can come from a cloned repository
+    let project = if use_project {
+        match find(&std::env::current_dir()?) {
+            Some(p) => Some(load(&p)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let map = mappings_for(project.as_ref(), argv, extra)?;
+    // say which secrets go to the program: a .sealctl.toml can come from a cloned repository
     for (var, name) in &map {
         eprintln!("sealctl: {var} ← {name}");
     }
+    let names: Vec<String> = map
+        .values()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let values = if names.is_empty() {
         vec![]
     } else {
-        secrets::get_many(oracle, &names)?
+        crate::daemon::client::values(&names, None)?
     };
+    let by_name: BTreeMap<&str, &[u8]> = values.iter().map(|(n, v)| (n.as_str(), v.as_slice())).collect();
 
     let mut cmd = Command::new(prog);
     cmd.args(args);
-    for (k, v) in map.keys().zip(values.iter()) {
-        cmd.env(k, v.as_str());
+    let mut secrets = Vec::new();
+    for (var, name) in &map {
+        let v = by_name.get(name.as_str()).copied().unwrap_or_default();
+        let text = zeroize::Zeroizing::new(String::from_utf8_lossy(v).into_owned());
+        cmd.env(var, text.as_str());
+        secrets.push(v.to_vec());
     }
 
     // Inside an AI agent, or whenever output isn't a terminal (logs, CI, pipes), whatever the
     // program prints passes through a filter that replaces the secret values with ****.
     use std::io::IsTerminal;
-    let mask = crate::guard::ai_agent().is_some()
-        || !std::io::stdout().is_terminal()
-        || !std::io::stderr().is_terminal();
+    let agent = crate::guard::ai_agent().is_some();
+    let mask = agent || !std::io::stdout().is_terminal() || !std::io::stderr().is_terminal();
     // SEALCTL_NO_MASK is for humans debugging; an agent can't switch masking off
-    let opt_out = std::env::var_os("SEALCTL_NO_MASK").is_some() && crate::guard::ai_agent().is_none();
-    if mask && !values.is_empty() && !opt_out {
-        return run_masked(cmd, prog, values.iter().map(|v| v.as_bytes().to_vec()).collect());
+    let opt_out = std::env::var_os("SEALCTL_NO_MASK").is_some() && !agent;
+    if mask && !secrets.is_empty() && !opt_out {
+        return run_masked(cmd, prog, secrets);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = cmd.exec(); // replaces this process; secrets live only in the child
-        bail!("starting {prog}: {err}");
-    }
-    #[cfg(not(unix))]
-    {
-        let status = cmd.status().with_context(|| format!("starting {prog}"))?;
-        std::process::exit(status.code().unwrap_or(1));
-    }
+    use std::os::unix::process::CommandExt;
+    let err = cmd.exec(); // replaces this process; secrets live only in the child
+    Err(fail(127, format!("Cannot start {prog}: {err}")))
 }
 
 fn run_masked(mut cmd: Command, prog: &str, secrets: Vec<Vec<u8>>) -> Result<()> {
@@ -121,7 +150,7 @@ fn run_masked(mut cmd: Command, prog: &str, secrets: Vec<Vec<u8>>) -> Result<()>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("starting {prog}"))?;
+        .map_err(|e| fail(127, format!("Cannot start {prog}: {e}")))?;
     let out = child.stdout.take().context("stdout")?;
     let err = child.stderr.take().context("stderr")?;
     let s2 = secrets.clone();
@@ -130,93 +159,11 @@ fn run_masked(mut cmd: Command, prog: &str, secrets: Vec<Vec<u8>>) -> Result<()>
     let status = child.wait().with_context(|| format!("waiting for {prog}"))?;
     let _ = t1.join();
     let _ = t2.join();
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            std::process::exit(128 + sig);
-        }
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(sig) = status.signal() {
+        std::process::exit(128 + sig);
     }
     std::process::exit(status.code().unwrap_or(1));
-}
-
-/// Move a `.env` file into the secret store and write `.sealctl.toml`.
-pub fn import_dotenv(
-    oracle: &mut dyn Oracle,
-    dotenv: &Path,
-    prefix: &str,
-    delete: bool,
-    force: bool,
-) -> Result<()> {
-    let text = zeroize::Zeroizing::new(
-        std::fs::read_to_string(dotenv).with_context(|| format!("reading {}", dotenv.display()))?,
-    );
-    let vars = secrets::parse_dotenv(&text)
-        .with_context(|| format!("{} — nothing was imported", dotenv.display()))?;
-    if vars.is_empty() {
-        bail!("no variables found in {}", dotenv.display());
-    }
-    let dir = dotenv
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let pfile = dir.join(FILE);
-    let mut project = if pfile.exists() {
-        load(&pfile)?
-    } else {
-        ProjectFile::default()
-    };
-    let named: Vec<(String, String)> = vars
-        .keys()
-        .map(|k| {
-            (
-                k.clone(),
-                format!("{prefix}/{}", k.to_lowercase().replace('_', "-")),
-            )
-        })
-        .collect();
-    // never silently replace secrets that exist already (e.g. a second .env with the same prefix)
-    let existing: Vec<&str> = named
-        .iter()
-        .filter(|(_, n)| secrets::exists(n).unwrap_or(false))
-        .map(|(_, n)| n.as_str())
-        .collect();
-    if !existing.is_empty() && !force {
-        bail!(
-            "these secrets exist already: {} — use another --prefix, or --force to replace them",
-            existing.join(", ")
-        );
-    }
-    for (k, name) in &named {
-        secrets::set(oracle, name, vars[k].as_bytes(), true)?;
-        project.env.insert(k.clone(), name.clone());
-        println!("  {k:<28} → {name}");
-    }
-    // read everything back before the plaintext file may be deleted
-    let names: Vec<&str> = named.iter().map(|(_, n)| n.as_str()).collect();
-    let back = secrets::get_many(oracle, &names)?;
-    for ((k, _), v) in named.iter().zip(back.iter()) {
-        if v.as_str() != vars[k].as_str() {
-            bail!("{k} did not read back identically — keeping {}", dotenv.display());
-        }
-    }
-    std::fs::write(&pfile, toml::to_string_pretty(&project)?)?;
-    println!(
-        "✅ {} variables stored; mapping written to {}",
-        vars.len(),
-        pfile.display()
-    );
-    if delete {
-        std::fs::remove_file(dotenv)?;
-        println!("   removed {}", dotenv.display());
-    } else {
-        println!(
-            "   You can now delete {} (it still contains the plaintext values).",
-            dotenv.display()
-        );
-    }
-    println!("   Run your app with: sealctl run -- <command>");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -236,5 +183,21 @@ mod tests {
     fn project_file_roundtrip() {
         let f: ProjectFile = toml::from_str("[env]\nOPENAI_API_KEY = \"openai\"\n").unwrap();
         assert_eq!(f.env["OPENAI_API_KEY"], "openai");
+    }
+
+    #[test]
+    fn command_sections() {
+        let f: ProjectFile = toml::from_str(
+            "[env]\nA = \"shop/a\"\nT = \"shop/t\"\n[command.\"npm run\"]\nT = \"shop/run\"\n[command.\"npm run deploy\"]\nT = \"shop/deploy\"\n",
+        )
+        .unwrap();
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let m = mappings_for(Some(&f), &argv("npm run deploy --prod"), &[]).unwrap();
+        assert_eq!(m["T"], "shop/deploy");
+        assert_eq!(m["A"], "shop/a");
+        let m = mappings_for(Some(&f), &argv("npm run test"), &[]).unwrap();
+        assert_eq!(m["T"], "shop/run");
+        let m = mappings_for(Some(&f), &argv("npm test"), &["T=x/y".into()]).unwrap();
+        assert_eq!(m["T"], "x/y");
     }
 }

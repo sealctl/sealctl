@@ -1,6 +1,6 @@
 [package]
 name = "sealctl"
-description = "Hardware-wallet backed encryption for everyday developer use: volumes, backups, secrets, SSH"
+description = "Phone-approved keys for developer machines: secrets kept from AI agents, SSH, git signing, volumes, backups"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,43 +8,58 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 readme = "../../README.md"
-keywords = ["openpgp", "ledger", "encryption", "smartcard", "cli"]
+keywords = ["secrets", "encryption", "ssh", "restic", "cli"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
-sealctl-ledger = { path = "../sealctl-ledger", version = "0.5.0" }
+sealctl-core = { path = "../sealctl-core", version = "0.7.0" }
 anyhow.workspace = true
 log.workspace = true
-openpgp-card.workspace = true
-openpgp-card-rpgp.workspace = true
-pgp.workspace = true
 clap.workspace = true
 clap_complete = "4.6"
 env_logger.workspace = true
-tokio = { workspace = true, features = ["net", "macros", "signal"] }
+tokio.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-platform-verifier = "0.7"
 ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "encryption", "getrandom"] }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
 toml = "0.9"
 zeroize = "1"
 getrandom = "0.3"
-rand = "0.8"
 sha2 = "0.10"
 signature = "2"
 hex = "0.4"
-serde_json = { version = "1", features = ["preserve_order"] }
-rpassword = "7"
-hkdf = "0.12"
-num-bigint = "0.4"
-curve25519-dalek = "4"
-bip39 = { version = "2", features = ["std", "zeroize"] }
-hmac = "0.12"
-sha3 = "0.10"
+base64 = "0.22"
 regex = "1"
+signal-hook = "0.3"
+qrcode = { version = "0.15", default-features = false }
+jiff = "0.2"
+command-fds = "0.3"
+nix = { version = "0.31", default-features = false, features = ["fs", "user", "resource", "socket", "term", "process", "signal"] }
+# `unseal --to keychain`: macOS Keychain, or the Secret Service over zbus (no libdbus)
+keyring = { version = "3", features = ["apple-native", "async-secret-service", "tokio", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# proc_pidinfo, proc_pidpath and KERN_PROCARGS2: who started a credential helper
+libc = "0.2"
+# Keychain items with a readable label (keyring can't set one)
+security-framework = "3"
+core-foundation = "0.10"
+
+[features]
+# Tests only: the keychain service name can be overridden (SEALCTL_TEST_KEYCHAIN_SERVICE).
+test-hooks = []
 
 [dev-dependencies]
 tempfile = "3"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+sealctl-fakerelay = { path = "../sealctl-fakerelay" }
+nix = { version = "0.31", default-features = false, features = ["term", "fs"] }
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519"] }
 
 # ---- Linux packages (built on CI: cargo deb / cargo generate-rpm) ----
 # Shell completions are generated into crates/sealctl/completions/ before packaging.
@@ -54,13 +69,13 @@ maintainer = "Oleksiy Pylypenko"
 copyright = "2026 Oleksiy Pylypenko and sealctl contributors"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
-sealctl uses the OpenPGP application on a Ledger hardware wallet, over USB or Bluetooth, \
-to unlock encrypted LUKS volumes, back them up with restic, keep API keys out of .env files, \
-and sign SSH logins and git commits. Private keys never leave the device."""
+sealctl keeps API keys out of .env files and away from AI agents, signs SSH logins and \
+git commits, unlocks encrypted LUKS volumes and backs them up with restic. Keys are derived \
+from 24 words held by the sealctl phone app, which approves their use."""
 section = "utils"
 priority = "optional"
 # built on Rocky 9 (glibc 2.34) without dpkg-shlibdeps, so dependencies are explicit
-depends = "libc6 (>= 2.34), libgcc-s1, libudev1, libdbus-1-3"
+depends = "libc6 (>= 2.34), libgcc-s1"
 recommends = "restic, cryptsetup"
 suggests = "git, openssh-client"
 assets = [
@@ -72,7 +87,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
-summary = "Hardware-wallet backed encryption: volumes, backups, secrets, SSH"
+summary = "Phone-approved keys: secrets, SSH, git signing, volumes, backups"
 license = "MIT"
 url = "https://github.com/sealctl/sealctl"
 assets = [

@@ -34,7 +34,29 @@ fn uid() -> String {
 }
 
 fn unit_name(label: &str) -> String {
+    if label == DAEMON_LABEL {
+        return "sealctl".into();
+    }
     format!("sealctl-{}", label.rsplit('.').next().unwrap_or(label))
+}
+
+/// The session daemon's service label.
+pub const DAEMON_LABEL: &str = "com.sealctl.daemon";
+/// The backup schedule's label.
+pub const BACKUP_LABEL: &str = "com.sealctl.backup";
+
+/// Whether login services may be installed here. Not when `SEALCTL_NO_SERVICE` is set, and not
+/// when `$HOME` is not this user's home folder (a temporary HOME for tests or trials): a
+/// launchd or systemd unit would be loaded into the real login session.
+pub fn allowed() -> bool {
+    if std::env::var_os("SEALCTL_NO_SERVICE").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    let Ok(home) = home() else { return false };
+    match nix::unistd::User::from_uid(nix::unistd::getuid()) {
+        Ok(Some(u)) => crate::volume::same_path(&u.dir, &home),
+        _ => false,
+    }
 }
 
 fn xml_escape(s: &str) -> String {
@@ -48,6 +70,9 @@ fn plist_path(label: &str) -> Result<PathBuf> {
 }
 
 pub fn install(s: &Service) -> Result<()> {
+    if !allowed() {
+        bail!("login services are not installed from a temporary HOME or with SEALCTL_NO_SERVICE");
+    }
     let log = paths::state_dir()?.join(format!("{}.log", unit_name(s.label)));
     fs::create_dir_all(paths::state_dir()?)?;
     // Services run with a minimal PATH; keep the user's so restic/ssh-keygen are found.
@@ -144,6 +169,9 @@ pub fn install(s: &Service) -> Result<()> {
 }
 
 pub fn uninstall(label: &str) -> Result<()> {
+    if !allowed() {
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         let p = plist_path(label)?;
         let _ = crate::util::system_cmd("launchctl")
@@ -163,11 +191,14 @@ pub fn uninstall(label: &str) -> Result<()> {
             .args(["--user", "daemon-reload"])
             .output();
     }
-    println!("removed {label}");
+    log::info!("removed {label}");
     Ok(())
 }
 
 pub fn is_installed(label: &str) -> bool {
+    if !allowed() {
+        return false;
+    }
     if cfg!(target_os = "macos") {
         crate::util::system_cmd("launchctl")
             .args(["print", &format!("gui/{}/{label}", uid())])

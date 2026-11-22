@@ -6,16 +6,23 @@ use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
 use super::{Backend, Volume};
-use crate::derive;
+
 use crate::util::{check, run_with_stdin};
 
 pub struct Sparsebundle;
 
 const ID_FILE: &str = "sealctl.id";
 
-pub fn write_id(v: &Volume, id: &str) -> Result<()> {
+/// Writes `<bundle>/sealctl.id`: the volume's `.id` file (public).
+pub fn write_id(v: &Volume, text: &str) -> Result<()> {
     let path = v.path.as_ref().context("sparsebundle needs a path")?;
-    std::fs::write(path.join(ID_FILE), format!("{id}\n")).context("writing the volume id into the bundle")
+    crate::paths::write_mode(&path.join(ID_FILE), text.as_bytes(), 0o644)
+        .context("writing the volume id into the bundle")
+}
+
+/// `<bundle>/sealctl.id`.
+pub fn id_path(v: &Volume) -> Option<std::path::PathBuf> {
+    v.path.as_ref().map(|p| p.join(ID_FILE))
 }
 
 /// Mount points of attached images whose image-path equals `path` (from `hdiutil info`).
@@ -57,7 +64,7 @@ impl Backend for Sparsebundle {
         key_for: &mut dyn FnMut(&str) -> Result<Zeroizing<String>>,
     ) -> Result<Zeroizing<String>> {
         let path = v.path.clone().context("sparsebundle needs a path")?;
-        let id = derive::new_uuid()?;
+        let id = crate::util::new_uuid()?;
         let pass = key_for(&id)?;
         let out = run_with_stdin(
             crate::util::system_cmd("hdiutil")
@@ -77,15 +84,17 @@ impl Backend for Sparsebundle {
         )?;
         check(out, "hdiutil create")?;
         v.id = id.clone();
-        write_id(v, &id)?;
         Ok(pass)
     }
 
     fn read_id(&self, v: &Volume) -> Result<String> {
         let path = v.path.as_ref().context("sparsebundle needs a path")?;
-        let id = std::fs::read_to_string(path.join(ID_FILE))
-            .with_context(|| format!("{} has no {ID_FILE} — not a sealctl volume?", path.display()))?;
-        Ok(id.trim().to_string())
+        let text = std::fs::read_to_string(path.join(ID_FILE))
+            .with_context(|| format!("{} has no {ID_FILE}: not a sealctl volume?", path.display()))?;
+        match sealctl_core::ids::IdFile::parse(&text) {
+            Ok(f) => Ok(f.id),
+            Err(_) => anyhow::bail!("{} is damaged", path.join(ID_FILE).display()),
+        }
     }
 
     fn unlock(&self, v: &Volume, passphrase: &[u8]) -> Result<()> {
@@ -152,4 +161,54 @@ impl Backend for Sparsebundle {
         }
         Ok(())
     }
+}
+
+/// Does `passphrase` open the bundle? Attaches without mounting, then detaches.
+pub fn verify(path: &std::path::Path, passphrase: &[u8]) -> Result<bool> {
+    let out = run_with_stdin(
+        crate::util::system_cmd("hdiutil")
+            .args(["attach", "-nomount", "-plist", "-stdinpass"])
+            .arg(path),
+        passphrase,
+    )?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // the first /dev/diskN entity is the whole image
+    if let Some(dev) = text
+        .split("<string>")
+        .filter_map(|s| s.split("</string>").next())
+        .find(|s| s.starts_with("/dev/disk"))
+    {
+        let base: String = dev.trim_start_matches("/dev/").to_string();
+        let whole = base
+            .char_indices()
+            .skip(4)
+            .find(|(_, c)| *c == 's')
+            .map_or(base.clone(), |(i, _)| base[..i].to_string());
+        let _ = crate::util::system_cmd("hdiutil")
+            .args(["detach", "-quiet", &format!("/dev/{whole}")])
+            .output();
+    }
+    Ok(true)
+}
+
+/// Replaces the passphrase (`hdiutil chpass`).
+pub fn change_passphrase(path: &std::path::Path, old: &[u8], new: &[u8]) -> Result<()> {
+    let mut input = Zeroizing::new(Vec::with_capacity(old.len() + new.len() + 2));
+    input.extend_from_slice(old);
+    input.push(0);
+    input.extend_from_slice(new);
+    input.push(0);
+    check(
+        run_with_stdin(
+            crate::util::system_cmd("hdiutil")
+                .args(["chpass", "-oldstdinpass", "-newstdinpass"])
+                .arg(path),
+            &input,
+        )?,
+        "hdiutil chpass",
+    )?;
+    Ok(())
 }
