@@ -739,10 +739,10 @@ fn keys_from_phone(
         // never before nb by this machine's clock
         let now = machine::now_ms();
         if nb > now {
-            if nb - now > 70 * 60_000 {
+            if nb - now > 130 * 60_000 {
                 return Err(fail(
                     exit::ERROR,
-                    "The approval starts more than an hour from now. Nothing was changed.",
+                    "The approval starts more than two hours from now. Nothing was changed.",
                 ));
             }
             std::thread::sleep(Duration::from_millis(nb - now));

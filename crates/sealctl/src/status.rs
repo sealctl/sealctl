@@ -304,8 +304,17 @@ pub fn cancel(id: Option<String>, yes: bool, relay_flag: Option<&str>) -> Result
         return Err(fail(exit::NOT_FOUND, "It already ended."));
     }
     println!("Cancelled.");
+    println!("{LOST_PHONE}");
     Ok(())
 }
+
+/// After a cancel: the approval came from the phone, so if it wasn't the user, the phone is in
+/// someone else's hands.
+const LOST_PHONE: &str = "\
+If you didn't approve this on your phone, someone else may have it:
+  - Find, lock or erase it: Google Find My Device (google.com/android/find)
+    or Apple Find My (icloud.com/find).
+  - Then restore sealctl on another phone from your card, and change your words there.";
 
 /// `sealctl inventory [--json]`.
 pub fn inventory(json_out: bool) -> Result<()> {

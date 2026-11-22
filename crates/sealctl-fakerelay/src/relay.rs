@@ -456,7 +456,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                 p.days_used += 1;
             }
             match delay {
-                Some(d) if (1..=3600).contains(&d) => {
+                Some(d) if (1..=7200).contains(&d) => {
                     if p.delayed.len() >= 4 {
                         p.pending.insert(id.to_string(), pend);
                         return err(429, "too_many_delayed");
@@ -630,7 +630,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             if id.len() != 22 {
                 return err(400, "bad_id");
             }
-            if !(1..=3600).contains(&delay) {
+            if !(1..=7200).contains(&delay) {
                 return err(400, "bad_delay");
             }
             let mut g = app.inner.lock().unwrap();

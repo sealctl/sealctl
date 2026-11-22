@@ -467,9 +467,9 @@ The machine checks `sig` with `P` against its own `ph`, the request id and `nb`,
 
 ### Delayed approvals
 
-A level 3 approval away from a trusted place takes effect one hour later. At a trusted place there is no delay.
+A level 3 approval away from a trusted place takes effect two hours later. At a trusted place there is no delay.
 
-- **From a machine (`unseal --all`).** The phone seals the reply as usual, with `nb` = now + 1 hour, and posts it with `"delay": 3600`. The relay holds it and tells the machine `{"type": "delayed", "id", "releaseAt"}`. The machine keeps its one-time key in memory, shows the time left, and fetches the reply once `releaseAt` passes. If the CLI stops during the hour, the approval is lost; running it again starts a new one.
+- **From a machine (`unseal --all`).** The phone seals the reply as usual, with `nb` = now + 2 hours, and posts it with `"delay": 7200`. The relay holds it and tells the machine `{"type": "delayed", "id", "releaseAt"}`. The machine keeps its one-time key in memory, shows the time left, and fetches the reply once `releaseAt` passes. If the CLI stops during the two hours, the approval is lost; running it again starts a new one.
 - **On the phone (Leave sealctl, showing the words, deleting the relay data).** The phone registers a delayed action with the relay and finishes it after `releaseAt`, only when the relay confirms it was not cancelled. Finishing asks for biometrics again.
 - **Announced** on every install of the phone (push) and on every paired machine: the relay's own `delayed` note, so an offline phone cannot hide it, and the phone's sealed `notice` message saying what and where.
 - **Cancellable** from the phone or any paired machine until it finishes (`sealctl cancel`). A cancelled `unseal --all` ends with `Cancelled from <where>.`; nothing was handed back.
@@ -796,9 +796,9 @@ Proposed by the phone app and needed for Open time left, the usage log and locki
 
 ### Delayed approvals (planned)
 
-A level 3 approval away from a trusted place waits one hour (see [Delayed approvals](#delayed-approvals)). The relay holds it, announces it and lets anyone paired cancel it.
+A level 3 approval away from a trusted place waits two hours (see [Delayed approvals](#delayed-approvals)). The relay holds it, announces it and lets anyone paired cancel it.
 
-**Why storage.** Normal approvals live only in a socket's attachment. A delayed one cannot: the machine's socket would have to survive an hour of sleep and network changes, a delay on the phone alone has no machine socket, and a cancel must work while the machine that asked is offline. So the Phone object stores one record per delayed approval, `delayed:<id>`, and deletes it when it is fetched, finished, cancelled-and-expired, or expired. The record holds `{machine or null, sealed or null, created, releaseAt, expires, cancelled?: {by, at}}`. `sealed` is the reply sealed to the machine's one-time key, which the relay cannot open. These are rare: a few in a person's use of sealctl.
+**Why storage.** Normal approvals live only in a socket's attachment. A delayed one cannot: the machine's socket would have to survive two hours of sleep and network changes, a delay on the phone alone has no machine socket, and a cancel must work while the machine that asked is offline. So the Phone object stores one record per delayed approval, `delayed:<id>`, and deletes it when it is fetched, finished, cancelled-and-expired, or expired. The record holds `{machine or null, sealed or null, created, releaseAt, expires, cancelled?: {by, at}}`. `sealed` is the reply sealed to the machine's one-time key, which the relay cannot open. These are rare: a few in a person's use of sealctl.
 
 | Call | Who | Does |
 | --- | --- | --- |

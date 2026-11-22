@@ -136,7 +136,7 @@ sealctl unseal --all                                     # everything, then seal
 Taking over or handing back one object is confirmation level 2 on the phone (biometrics; the
 number shown at the terminal when the phone cannot tell it is near). `unseal --all` is level 3:
 pick the number shown at the terminal, the phone signs the plan, and away from a trusted place
-it takes effect an hour later. Every paired machine is told and can stop it with
+it takes effect two hours later. Every paired machine is told and can stop it with
 `sealctl cancel`. `--words` uses the 24 words instead of the phone.
 
 `unseal` writes everything into one new folder, `~/sealctl-unsealed-<date>`: `passwords.txt`,

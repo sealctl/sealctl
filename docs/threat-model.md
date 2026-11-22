@@ -21,7 +21,7 @@ when the phone approves. Wire formats and keys: [protocol.md](protocol.md).
 - **A reflexive tap on a sensitive request.** Handing objects back (`unseal`) and taking over
   existing ones (`seal`) are level 2 (biometrics on the phone, proximity or the number shown at
   the terminal); `unseal --all` is level 3: the number match, a signed plan the CLI cannot leave,
-  and an hour's delay away from a trusted place, announced on every paired machine and
+  and a two-hour delay away from a trusted place, announced on every paired machine and
   cancellable from any of them.
 - **Losing the phone or the machine.** The 24 words open every object (`sealctl recover`), and
   a phone restored from the same words has the same keys and pairings.
