@@ -81,6 +81,7 @@ suggests = "git, openssh-client"
 assets = [
     ["target/release/sealctl", "usr/bin/", "755"],
     ["../../README.md", "usr/share/doc/sealctl/README.md", "644"],
+    ["../../THIRD-PARTY-NOTICES.md", "usr/share/doc/sealctl/THIRD-PARTY-NOTICES.md", "644"],
     ["completions/sealctl.bash", "usr/share/bash-completion/completions/sealctl", "644"],
     ["completions/_sealctl", "usr/share/zsh/vendor-completions/_sealctl", "644"],
     ["completions/sealctl.fish", "usr/share/fish/vendor_completions.d/sealctl.fish", "644"],
@@ -93,6 +94,7 @@ url = "https://github.com/sealctl/sealctl"
 assets = [
     { source = "target/release/sealctl", dest = "/usr/bin/sealctl", mode = "755" },
     { source = "../../LICENSE", dest = "/usr/share/licenses/sealctl/LICENSE", mode = "644", doc = true },
+    { source = "../../THIRD-PARTY-NOTICES.md", dest = "/usr/share/licenses/sealctl/THIRD-PARTY-NOTICES.md", mode = "644", doc = true },
     { source = "../../README.md", dest = "/usr/share/doc/sealctl/README.md", mode = "644", doc = true },
     { source = "completions/sealctl.bash", dest = "/usr/share/bash-completion/completions/sealctl", mode = "644" },
     { source = "completions/_sealctl", dest = "/usr/share/zsh/site-functions/_sealctl", mode = "644" },

@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `THIRD-PARTY-NOTICES.md`: the licence texts of every crate in the binary, generated with
+  cargo-about (`scripts/notices.sh`) and shipped in every tarball, .deb, .rpm, PKGBUILD,
+  Homebrew and Nix package.
+
 ## 0.7.0
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes

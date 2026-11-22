@@ -25,6 +25,7 @@
               --bash <($out/bin/sealctl completions bash) \
               --zsh <($out/bin/sealctl completions zsh) \
               --fish <($out/bin/sealctl completions fish)
+            install -Dm644 THIRD-PARTY-NOTICES.md $out/share/doc/sealctl/THIRD-PARTY-NOTICES.md
           '';
           meta = with pkgs.lib; {
             description = "Phone-approved keys: secrets kept from AI agents, SSH, git signing, volumes, backups";
