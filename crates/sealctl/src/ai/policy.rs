@@ -172,8 +172,11 @@ fn denied_verb(verb: &str, sub: Option<&str>) -> Option<&'static str> {
 /// separate commands. Not a full shell parser: it is meant to find which program each command
 /// runs and with which arguments, erring towards splitting more. With `resume`, the text after a
 /// substitution inside double quotes is double-quoted again (as the shell reads it); without, it
-/// is not. A `)` can be misread either way, so callers check both readings.
-fn simple_commands(text: &str, resume: bool) -> Vec<Vec<String>> {
+/// is not. With `track_case`, a `case … esac` is followed so that a pattern's `)` closes nothing
+/// (as bash 4+ and zsh read it); without, a pattern's `)` closes an open `$(` (as bash 3.2, the
+/// macOS `/bin/bash` and `/bin/sh`, reads it inside double quotes). Shells differ here and a `)`
+/// can be misread either way, so callers check every reading.
+fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
@@ -189,7 +192,7 @@ fn simple_commands(text: &str, resume: bool) -> Vec<Vec<String>> {
         |word: &mut String, in_word: &mut bool, words: &mut Vec<String>, open: &mut Vec<(char, bool)>| {
             if *in_word {
                 let w = std::mem::take(word);
-                if words.iter().all(|w| is_keyword(w)) {
+                if track_case && words.iter().all(|w| is_keyword(w)) {
                     if w == "case" {
                         open.push(('c', false));
                     } else if w == "esac" && open.last() == Some(&('c', false)) {
@@ -304,11 +307,16 @@ fn sealctl_in(text: &str, depth: usize) -> Option<&'static str> {
     if depth > 8 {
         return None;
     }
-    [true, false].into_iter().find_map(|resume| {
-        simple_commands(text, resume)
-            .iter()
-            .find_map(|words| sealctl_argv(words, depth))
-    })
+    // deny if any plausible reading finds a denied command: double quotes resumed after a
+    // substitution or not, `case` patterns followed or not (bash 3.2 closes `$(` at a pattern's
+    // `)`)
+    [(true, true), (true, false), (false, true), (false, false)]
+        .into_iter()
+        .find_map(|(resume, track_case)| {
+            simple_commands(text, resume, track_case)
+                .iter()
+                .find_map(|words| sealctl_argv(words, depth))
+        })
 }
 
 /// The same for one command's words: the program is found past variable assignments, shell
@@ -769,6 +777,8 @@ mod tests {
             "echo \"$(case x in a) echo '\"';; esac)\"; sealctl secret get k",
             "echo \"$(case x in (a) y;; b) z;; esac) w\"; sealctl recover",
             "echo \"$(date)\" \"$(case x in a) y;; esac)\"; sealctl unseal --all",
+            "echo \"$(case x in a) X\"; sealctl secret get k; echo \"Y)\"",
+            "bash -c 'echo \"$(case x in a) X\"; sealctl secret get k; echo \"Y)\"'",
             "x=`sealctl secret get k`; echo $x",
             "if sealctl secret get k >/dev/null; then echo y; fi",
             "true && (sealctl seal ssh ~/.ssh/id_ed25519)",
