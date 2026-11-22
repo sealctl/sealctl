@@ -155,9 +155,10 @@ fn env_files_with_any_line_ending_lose_only_what_was_sealed() {
     assert_eq!(kept, "# keep me\rEMPTY_KEY=\r\n");
 }
 
-/// A name the store or the same scan already has with another value gets `-2`, `-3`; a zsh
-/// history that is not UTF-8 is masked byte for byte; a symlinked `~/.zshrc` is rewritten where
-/// it points, and stays a link.
+/// A name the store or the same scan already has with another value gets `-2`, `-3`, and
+/// .env files of one folder that give a variable different values stop the scan before anything
+/// is stored; a zsh history that is not UTF-8 is masked byte for byte; a symlinked `~/.zshrc` is
+/// rewritten where it points, and stays a link.
 #[test]
 fn scan_keeps_other_values_history_bytes_and_links() {
     let mut env = Env::new();
@@ -168,28 +169,61 @@ fn scan_keeps_other_values_history_bytes_and_links() {
     let z = format!("Zc3{}", random_alnum(30));
     let one = h.join("one/shop");
     let two = h.join("two/shop");
-    std::fs::create_dir_all(&one).unwrap();
-    std::fs::create_dir_all(&two).unwrap();
+    let three = h.join("three/shop");
+    for d in [&one, &two, &three] {
+        std::fs::create_dir_all(d).unwrap();
+    }
     std::fs::write(one.join(".env"), format!("API_KEY={x}\n")).unwrap();
     std::fs::write(two.join(".env"), format!("API_KEY={y}\n")).unwrap();
-    std::fs::write(two.join(".env.local"), format!("API_KEY={z}\n")).unwrap();
+    std::fs::write(three.join(".env"), format!("API_KEY={z}\n")).unwrap();
     let ((code, _, err), _) = env.with_phone(Answer::Session, || {
         env.run(&["scan", one.to_str().unwrap(), "--yes"])
     });
     assert_eq!(code, 0, "{err}");
+    // two folders in one scan (found in path order: three, then two): the store has
+    // shop/api-key, so three takes -2 and two, which this scan has just named, -3
     let ((code, _, err), _) = env.with_phone(Answer::Session, || {
-        env.run(&["scan", two.to_str().unwrap(), "--yes"])
+        env.run(&["scan", two.to_str().unwrap(), three.to_str().unwrap(), "--yes"])
     });
     assert_eq!(code, 0, "{err}");
-    for (n, v) in [
-        ("shop/api-key", &x),
-        ("shop/api-key-2", &y),
-        ("shop/api-key-3", &z),
+    for (n, v, d) in [
+        ("shop/api-key", &x, &one),
+        ("shop/api-key-2", &z, &three),
+        ("shop/api-key-3", &y, &two),
     ] {
         let (code, got, err) = env.run(&["secret", "get", n]);
         assert_eq!(code, 0, "{n}: {err}");
         assert_eq!(&got, v, "{n} keeps its own value");
+        let toml = std::fs::read_to_string(d.join(".sealctl.toml")).unwrap();
+        assert!(toml.contains(&format!("API_KEY = \"{n}\"")), "{toml}");
     }
+
+    // one folder, two files, two values of API_KEY: refused, nothing stored or changed
+    let four = h.join("four/shop");
+    std::fs::create_dir_all(&four).unwrap();
+    let w = format!("Wd4{}", random_alnum(30));
+    let env_text = format!("API_KEY={y}\n");
+    let local_text = format!("API_KEY={w}\n");
+    std::fs::write(four.join(".env"), &env_text).unwrap();
+    std::fs::write(four.join(".env.local"), &local_text).unwrap();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&["scan", four.to_str().unwrap(), "--yes"])
+    });
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("API_KEY has different values in .env and .env.local"),
+        "{err}"
+    );
+    assert!(!err.contains(&w) && !err.contains(&y), "a value was printed");
+    assert_eq!(std::fs::read_to_string(four.join(".env")).unwrap(), env_text);
+    assert_eq!(
+        std::fs::read_to_string(four.join(".env.local")).unwrap(),
+        local_text
+    );
+    assert!(!four.join(".sealctl.toml").exists());
+    let (code, _, _) = env.run(&["secret", "get", "shop/api-key-4"]);
+    assert_ne!(code, 0, "nothing was stored");
+    std::fs::remove_dir_all(h.join("four")).unwrap();
 
     // zsh keeps non-ASCII text metafied: not UTF-8
     let token = ["gh", "p_", &random_alnum(36)].concat();

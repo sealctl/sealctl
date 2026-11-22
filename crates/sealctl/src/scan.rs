@@ -379,6 +379,35 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
             texts.insert(f.file.clone(), Zeroizing::new(bytes));
         }
     }
+    // a folder's .sealctl.toml maps a variable to one secret: .env files of one folder that
+    // give it different values stop the scan here, before anything is stored
+    let mut per_var: BTreeMap<(PathBuf, &str), Vec<(&Path, String)>> = BTreeMap::new();
+    for f in findings.iter().filter(|f| f.kind == "env file") {
+        let dir = f.file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        per_var
+            .entry((dir, f.source.as_str()))
+            .or_default()
+            .push((&f.file, util::sha256_hex(f.value.as_bytes())));
+    }
+    for ((dir, var), seen) in &per_var {
+        if seen.iter().any(|(_, s)| *s != seen[0].1) {
+            let files: Vec<String> = seen
+                .iter()
+                .map(|(f, _)| f.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                .collect();
+            return Err(fail(
+                exit::ERROR,
+                format!(
+                    "{var} has different values in {} in {}, and the folder's {} maps it to one \
+                     secret. Nothing was stored and no file was changed. Keep one value of {var} \
+                     in that folder, then scan again.",
+                    files.join(" and "),
+                    paths::tilde(dir),
+                    project::FILE
+                ),
+            ));
+        }
+    }
     // one secret per value: the first name it was found under, never another value's
     let store = crate::store::Store::configured()?;
     let mut by_value: BTreeMap<String, String> = BTreeMap::new();
