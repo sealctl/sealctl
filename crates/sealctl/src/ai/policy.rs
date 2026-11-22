@@ -170,24 +170,36 @@ fn denied_verb(verb: &str, sub: Option<&str>) -> Option<&'static str> {
 /// The simple commands of a shell command line, each as its words with quotes removed. Pipes,
 /// lists, subshells and command substitutions (`$(…)`, backquotes, also inside double quotes)
 /// separate commands. Not a full shell parser: it is meant to find which program each command
-/// runs and with which arguments, erring towards splitting more.
-fn simple_commands(text: &str) -> Vec<Vec<String>> {
+/// runs and with which arguments, erring towards splitting more. With `resume`, the text after a
+/// substitution inside double quotes is double-quoted again (as the shell reads it); without, it
+/// is not. A `)` can be misread either way, so callers check both readings.
+fn simple_commands(text: &str, resume: bool) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
     // open subshells and command substitutions: `'('` or `` '`' ``, and whether the text after
-    // the matching `)` or backquote is inside double quotes again (`"a $(b) c"`)
+    // the matching `)` or backquote is inside double quotes again (`"a $(b) c"`); `'c'` for an
+    // open `case … esac`, whose patterns' `)` close nothing
     let mut open: Vec<(char, bool)> = Vec::new();
     let cs: Vec<char> = text.chars().collect();
     let mut i = 0;
-    let end_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
-        if *in_word {
-            words.push(std::mem::take(word));
-            *in_word = false;
-        }
-    };
+    let end_word =
+        |word: &mut String, in_word: &mut bool, words: &mut Vec<String>, open: &mut Vec<(char, bool)>| {
+            if *in_word {
+                let w = std::mem::take(word);
+                if words.iter().all(|w| is_keyword(w)) {
+                    if w == "case" {
+                        open.push(('c', false));
+                    } else if w == "esac" && open.last() == Some(&('c', false)) {
+                        open.pop();
+                    }
+                }
+                words.push(w);
+                *in_word = false;
+            }
+        };
     let end_cmd = |words: &mut Vec<String>, cmds: &mut Vec<Vec<String>>| {
         if !words.is_empty() {
             cmds.push(std::mem::take(words));
@@ -213,16 +225,16 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
                 // resume after it
                 '`' => {
                     quote = None;
-                    open.push(('`', true));
-                    end_word(&mut word, &mut in_word, &mut words);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open);
                     end_cmd(&mut words, &mut cmds);
+                    open.push(('`', true));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     quote = None;
-                    open.push(('(', true));
                     i += 1;
-                    end_word(&mut word, &mut in_word, &mut words);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open);
                     end_cmd(&mut words, &mut cmds);
+                    open.push(('(', true));
                 }
                 c => word.push(c),
             },
@@ -238,33 +250,33 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
                         in_word = true;
                     }
                 }
-                ' ' | '\t' => end_word(&mut word, &mut in_word, &mut words),
+                ' ' | '\t' => end_word(&mut word, &mut in_word, &mut words, &mut open),
                 // `2>&1`, `>&2`, `&>file`: redirections, not separators
                 '&' if i > 0 && matches!(cs[i - 1], '>' | '<') => word.push(c),
                 '&' if cs.get(i + 1) == Some(&'>') => word.push(c),
                 '|' | ';' | '&' | '\n' | '{' | '}' => {
-                    end_word(&mut word, &mut in_word, &mut words);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open);
                     end_cmd(&mut words, &mut cmds);
                 }
                 '(' => {
-                    end_word(&mut word, &mut in_word, &mut words);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open);
                     end_cmd(&mut words, &mut cmds);
                     open.push(('(', false));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     i += 1;
-                    end_word(&mut word, &mut in_word, &mut words);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open);
                     end_cmd(&mut words, &mut cmds);
                     open.push(('(', false));
                 }
                 ')' | '`' => {
-                    end_word(&mut word, &mut in_word, &mut words);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open);
                     end_cmd(&mut words, &mut cmds);
                     let opener = if c == ')' { '(' } else { '`' };
                     match open.last() {
                         Some(&(o, dq)) if o == opener => {
                             open.pop();
-                            if dq {
+                            if dq && resume {
                                 quote = Some('"');
                                 in_word = true;
                             }
@@ -282,7 +294,7 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
         }
         i += 1;
     }
-    end_word(&mut word, &mut in_word, &mut words);
+    end_word(&mut word, &mut in_word, &mut words, &mut open);
     end_cmd(&mut words, &mut cmds);
     cmds
 }
@@ -292,9 +304,11 @@ fn sealctl_in(text: &str, depth: usize) -> Option<&'static str> {
     if depth > 8 {
         return None;
     }
-    simple_commands(text)
-        .iter()
-        .find_map(|words| sealctl_argv(words, depth))
+    [true, false].into_iter().find_map(|resume| {
+        simple_commands(text, resume)
+            .iter()
+            .find_map(|words| sealctl_argv(words, depth))
+    })
 }
 
 /// The same for one command's words: the program is found past variable assignments, shell
@@ -627,6 +641,8 @@ mod tests {
             "gh pr list",
             "ls -la",
             "echo hello",
+            "echo \"$(date) and $(case $x in a) echo sealctl;; esac)\" done",
+            "echo \"`date`\" \"$(git rev-parse HEAD)\"",
             "env FOO=bar cargo run",
             "grep -r environment src/",
             "cat README.md",
@@ -693,6 +709,10 @@ mod tests {
             "echo \"`id`\" && sealctl recover",
             "echo \"a $(echo \"b\") c\" | sealctl unseal --all",
             "x=\"$(echo \")\")\"; sealctl buy",
+            "echo \"$(case x in a) sealctl secret get k;; esac)\"",
+            "echo \"$(case x in a) echo '\"';; esac)\"; sealctl secret get k",
+            "echo \"$(case x in (a) y;; b) z;; esac) w\"; sealctl recover",
+            "echo \"$(date)\" \"$(case x in a) y;; esac)\"; sealctl unseal --all",
             "x=`sealctl secret get k`; echo $x",
             "if sealctl secret get k >/dev/null; then echo y; fi",
             "true && (sealctl seal ssh ~/.ssh/id_ed25519)",
