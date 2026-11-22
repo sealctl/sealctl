@@ -108,6 +108,7 @@ impl Run {
             .context("journal")?;
         f.write_all(format!("{line}\n").as_bytes())?;
         f.sync_all()?;
+        test_kill(step, state);
         Ok(())
     }
 
@@ -165,6 +166,21 @@ impl Run {
     /// Marks the run finished.
     pub fn finish(&self) -> Result<()> {
         self.write("done", b"")
+    }
+}
+
+/// Tests only (`test-hooks`): with `SEALCTL_TEST_KILL=<state>:<step>` (a step id such as
+/// `secrets:2 secrets`, or just its kind, `secrets`; for example `done:secrets`) the process
+/// kills itself with SIGKILL right after that journal line is on disk: a power cut at a known
+/// point of the run, for the resume tests.
+#[allow(unused_variables)]
+fn test_kill(step: &str, state: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(v) = std::env::var("SEALCTL_TEST_KILL") {
+        let kind = step.split(':').next().unwrap_or(step);
+        if v == format!("{state}:{step}") || v == format!("{state}:{kind}") {
+            let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGKILL);
+        }
     }
 }
 

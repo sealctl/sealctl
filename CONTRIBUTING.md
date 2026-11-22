@@ -35,6 +35,9 @@ throwaway HOME: `SEALCTL_RELAY=https://<relay> scripts/pair-test.sh`.
 
 Backup tests need `restic`; on Linux, volume tests need `cryptsetup`.
 
+Tests that kill a run at a set point and resume it need the test hooks:
+`cargo test -p sealctl --features test-hooks --test unseal resume_after_a_kill`.
+
 ## Pull requests
 
 - Keep PRs focused; describe what you tested (OS, and the phone's OS and app version if the
