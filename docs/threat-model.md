@@ -1,7 +1,7 @@
 # Threat model
 
-sealctl 0.7: keys derived from 24 words held by the phone app, handed to a paired machine
-when the phone approves. Wire formats and keys: [protocol.md](protocol.md).
+In sealctl, keys are derived from 24 words held by the phone app and handed to a paired
+machine when the phone approves. Wire formats and keys: [protocol.md](protocol.md).
 
 ## Protected against
 

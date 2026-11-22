@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         **Security issue?** Don't file it here — see SECURITY.md.
-        Never paste PINs, passphrases, seeds or decrypted secrets.
+        Never paste your 24 words, secret values, `.sealed` files or logs with keys in them.
   - type: textarea
     id: what
     attributes:
@@ -21,26 +21,39 @@ body:
       placeholder: output of `sealctl --version`
     validations:
       required: true
-  - type: dropdown
-    id: transport
-    attributes:
-      label: Transport
-      options: [USB, Bluetooth, both]
-    validations:
-      required: true
-  - type: input
-    id: device
-    attributes:
-      label: Device and OpenPGP app
-      placeholder: "Ledger Flex, OpenPGP 3.2.0 (official / Bluetooth build)"
   - type: input
     id: os
     attributes:
       label: OS
       placeholder: "macOS 26.1 / Ubuntu 26.04"
+    validations:
+      required: true
+  - type: input
+    id: phone
+    attributes:
+      label: Phone and app version
+      placeholder: "iOS 26.1 or Android 16, and the sealctl app version"
+  - type: input
+    id: agent
+    attributes:
+      label: AI agent, if one was involved
+      placeholder: "Claude Code, Codex, Gemini CLI, … with its version, or none"
+  - type: textarea
+    id: status
+    attributes:
+      label: sealctl status
+      description: Output of `sealctl status` (remove names if you prefer).
+      render: text
   - type: textarea
     id: logs
     attributes:
       label: Logs
-      description: Output with `-v`. `-vv` prints raw APDUs — review before pasting.
+      description: Output with `-v`. It never contains values, but review it before pasting.
       render: text
+  - type: checkboxes
+    id: no-secrets
+    attributes:
+      label: Before you submit
+      options:
+        - label: This contains no secret values, words or keys.
+          required: true

@@ -51,7 +51,7 @@ program gets the key while the agent sees only `****`.
 | Qwen Code | `~/.agents/skills` | `~/.qwen/settings.json` | `permissions.deny` | |
 | GitHub Copilot CLI | `~/.agents/skills` | `~/.copilot/hooks/sealctl.json` | — | prompt blocking depends on version; a crashing hook blocks tools (fail closed) |
 | Cursor | `~/.agents/skills` | `~/.cursor/hooks.json` | — | the CLI doesn't fire every hook yet |
-| OpenCode, Amp, Goose | `~/.agents/skills` | — | — | hooks need JS plugins; planned |
+| OpenCode, Amp, Goose | `~/.agents/skills` | — | — | skill only (their hooks are JS plugins) |
 | Antigravity CLI | `~/.gemini/config/skills` | — | — | |
 | Kiro | `~/.kiro/skills` | — | — | |
 

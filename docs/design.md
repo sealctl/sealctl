@@ -1,6 +1,6 @@
 # Design
 
-How sealctl 0.7 is put together. The rules for every byte on the wire, every key and every
+How sealctl is put together. The rules for every byte on the wire, every key and every
 file format are in [protocol.md](protocol.md); the command-line behaviour is in
 [../SPEC.md](../SPEC.md). This page is the map.
 

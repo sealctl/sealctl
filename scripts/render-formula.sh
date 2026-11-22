@@ -7,8 +7,8 @@ VERSION="$1"; BASE="$2"; DIST="$3"
 sha() { cut -d' ' -f1 "$DIST/sealctl-$VERSION-$1.tar.gz.sha256"; }
 cat <<EOF
 class Sealctl < Formula
-  desc "Hardware-wallet backed encryption: volumes, backups, secrets, SSH (Ledger OpenPGP)"
-  homepage "https://github.com/sealctl/sealctl"
+  desc "Secrets for AI coding agents, approved on your phone"
+  homepage "https://sealctl.com"
   version "$VERSION"
   license "MIT"
 
@@ -45,15 +45,15 @@ class Sealctl < Formula
 
   def caveats
     <<~EOS
-      sealctl needs the OpenPGP app on your Ledger (Ledger Live → developer mode).
-      For Bluetooth, see https://github.com/sealctl/sealctl/blob/main/docs/bluetooth-app.md
-      Get started: sealctl setup --uid "Your Name <you@example.org>"
+      Get the sealctl app on your phone (https://sealctl.com/docs#install), then run:
+        sealctl pair
+      For AI coding agents: sealctl ai install
     EOS
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/sealctl --version")
-    assert_match "volume", shell_output("#{bin}/sealctl --help")
+    assert_match "pair", shell_output("#{bin}/sealctl --help")
   end
 end
 EOF
