@@ -206,10 +206,19 @@ impl Backend for Luks {
             )?;
         }
         if mapper_open(v) {
-            check(
-                sudo().args(["cryptsetup", "close", &mapper_name(v)]).output()?,
-                "cryptsetup close",
-            )?;
+            let mapper = mapper_name(v);
+            let out = sudo().args(["cryptsetup", "close", &mapper]).output()?;
+            if force && !out.status.success() {
+                // after a lazy unmount, processes with files open still hold the device: have the
+                // kernel remove it as soon as they let go, and say that it is still open now
+                let _ = sudo()
+                    .args(["cryptsetup", "close", "--deferred", &mapper])
+                    .output();
+                bail!(
+                    "unmounted, but processes with files open still use the decrypted device; it closes when they exit"
+                );
+            }
+            check(out, "cryptsetup close")?;
         }
         Ok(())
     }
