@@ -11,7 +11,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sealctl_fakerelay::{FakeRelay, Machine, Options, Phone};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use sealctl_core::RequestKind;
+use sealctl_fakerelay::{Answer, FakeRelay, Machine, Options, Phone};
 
 /// A test environment.
 pub struct Env {
@@ -48,6 +51,11 @@ impl Env {
     /// Always the fake relay (for tests that need its switches).
     pub fn fake(opts: Options) -> Env {
         Self::with(opts, false)
+    }
+
+    /// The live relay when set (its own settings apply), else a fake one with `opts`.
+    pub fn with_options(opts: Options) -> Env {
+        Self::with(opts, true)
     }
 
     fn with(opts: Options, allow_live: bool) -> Env {
@@ -345,4 +353,92 @@ pub fn have(bin: &str) -> bool {
 /// A path for display in assertions.
 pub fn p(p: &Path) -> PathBuf {
     p.to_path_buf()
+}
+
+#[derive(Clone, Copy)]
+pub enum Pick {
+    /// The number shown.
+    Right,
+    /// Another offered number.
+    Wrong,
+}
+
+/// A phone that answers everything: `unseal` with the number read from the terminal (or a
+/// wrong one) and `delay`; reports acknowledged; anything else approved for the session.
+pub struct PhoneThread {
+    stop: Arc<AtomicBool>,
+    h: Option<std::thread::JoinHandle<()>>,
+    kinds: Arc<Mutex<Vec<String>>>,
+}
+
+impl PhoneThread {
+    pub fn start(
+        phone: Arc<Phone>,
+        screen: Arc<Mutex<String>>,
+        pick: Pick,
+        delay: Option<u64>,
+    ) -> PhoneThread {
+        let stop = Arc::new(AtomicBool::new(false));
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+        let (s2, k2) = (stop.clone(), kinds.clone());
+        let h = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut seen = Vec::new();
+                while !s2.load(Ordering::SeqCst) {
+                    let Ok(r) = phone.next(&mut seen, Duration::from_millis(300)).await else {
+                        continue;
+                    };
+                    let req = phone.open(&r).unwrap();
+                    k2.lock().unwrap().push(format!("{:?}", req.kind()));
+                    match req.kind() {
+                        RequestKind::Unseal => {
+                            let p = if req.has_match() {
+                                let shown = loop {
+                                    if let Some(n) = number_on(&screen.lock().unwrap()) {
+                                        break n;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                };
+                                let choices = req.match_choices();
+                                assert!(choices.contains(&shown), "the shown number is offered");
+                                Some(match pick {
+                                    Pick::Right => shown,
+                                    Pick::Wrong => *choices.iter().find(|c| **c != shown).unwrap(),
+                                })
+                            } else {
+                                None
+                            };
+                            phone.answer_unseal(&r, &req, p, delay).await.unwrap();
+                        }
+                        RequestKind::Report => phone.answer_report(&r, &req).await.unwrap(),
+                        _ => {
+                            phone.auto(&r, &Answer::Session).await.unwrap();
+                        }
+                    }
+                }
+            });
+        });
+        PhoneThread {
+            stop,
+            h: Some(h),
+            kinds,
+        }
+    }
+
+    pub fn kinds(&self) -> Vec<String> {
+        self.kinds.lock().unwrap().clone()
+    }
+}
+
+impl Drop for PhoneThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.h.take() {
+            let _ = h.join();
+        }
+    }
 }

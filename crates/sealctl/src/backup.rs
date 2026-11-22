@@ -496,7 +496,23 @@ pub fn run_one(
     let repo = Repo::new(&b.repo, key, env);
     let mut st = b.state();
     let src = b.source.to_string_lossy().into_owned();
-    let mut args = vec!["backup", src.as_str(), "--exclude", ".sealctl"];
+    // volume roots hold OS folders nobody can read or needs back
+    let mut args = vec![
+        "backup",
+        src.as_str(),
+        "--exclude",
+        ".sealctl",
+        "--exclude",
+        ".fseventsd",
+        "--exclude",
+        ".Spotlight-V100",
+        "--exclude",
+        ".Trashes",
+        "--exclude",
+        ".TemporaryItems",
+        "--exclude",
+        "lost+found",
+    ];
     if quiet {
         args.push("--quiet");
     }
