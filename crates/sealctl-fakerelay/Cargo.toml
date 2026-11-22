@@ -1,0 +1,23 @@
+[package]
+name = "sealctl-fakerelay"
+description = "Test only: an in-process sealctl relay and a scripted phone built on sealctl-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+sealctl-core = { path = "../sealctl-core" }
+anyhow.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "query"] }
+base64 = "0.22"
+sha2 = "0.10"
