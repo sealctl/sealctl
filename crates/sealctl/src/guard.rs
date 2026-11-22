@@ -119,6 +119,25 @@ fn preview(s: &str) -> String {
     format!("{head}…({} chars)", chars.len())
 }
 
+/// The secret-looking values in `text` with their kind (for `scan`, which masks them in
+/// shell histories). Same rules as [`mask_command`].
+pub fn find_secret_values(text: &str) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for (kind, re) in patterns() {
+        for cap in re.captures_iter(text) {
+            let m = cap.get(1).unwrap_or_else(|| cap.get(0).expect("match"));
+            if *kind == "credential" && entropy(m.as_str()) < 3.5 {
+                continue;
+            }
+            if *kind == "private key" {
+                continue;
+            }
+            out.push((*kind, m.as_str().to_string()));
+        }
+    }
+    out
+}
+
 /// `text` with every secret-looking substring replaced by `****` (commands shown on the phone).
 pub fn mask_command(text: &str) -> String {
     let mut out = text.to_string();

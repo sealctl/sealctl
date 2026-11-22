@@ -122,6 +122,22 @@ enum Cmd {
     /// Encrypted, versioned backups (restic).
     #[command(subcommand)]
     Backup(BackupCmd),
+    /// Find keys in .env files, shell files, histories and ~/.aws, and seal them.
+    Scan {
+        /// Folders or files (default: the repository root or this folder).
+        paths: Vec<PathBuf>,
+        /// Also the home folder: .env files, shell rc files, histories, ~/.aws/credentials.
+        #[arg(long)]
+        home: bool,
+        /// List only.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Objects this machine knows.
     Inventory {
         #[arg(long)]
@@ -734,6 +750,13 @@ fn run(cli: Cli) -> Result<i32> {
             BackupCmd::Schedule(ScheduleCmd::Uninstall) => sealctl::backup::schedule_uninstall(),
         }
         .map(|_| 0),
+        Cmd::Scan {
+            paths,
+            home,
+            dry_run,
+            yes,
+            json,
+        } => sealctl::scan::run(paths, home, dry_run, yes, json).map(|_| 0),
         Cmd::Inventory { json } => status::inventory(json).map(|_| 0),
         Cmd::Seal(SealArgs {
             from: Some(f),

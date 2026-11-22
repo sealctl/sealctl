@@ -23,6 +23,7 @@ pub mod paths;
 pub mod project;
 pub mod recover;
 pub mod relay;
+pub mod scan;
 pub mod seal;
 pub mod service;
 pub mod ssh;
