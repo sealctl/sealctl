@@ -205,7 +205,20 @@ fn seal_body(
     body: &ReplyBody,
     rng: &mut impl CryptoRng,
 ) -> Result<String> {
-    request.ensure_unanswered()?;
+    request.claim_answer()?;
+    let sealed = seal_claimed(keys, request, body, rng);
+    if sealed.is_err() {
+        request.release_answer();
+    }
+    sealed
+}
+
+fn seal_claimed(
+    keys: &PhoneKeys,
+    request: &Request,
+    body: &ReplyBody,
+    rng: &mut impl CryptoRng,
+) -> Result<String> {
     let bytes = Zeroizing::new(serde_json::to_vec(body).map_err(|_| CoreError::Internal)?);
     if bytes.len() > MAX_BODY {
         return Err(CoreError::TooLarge);
@@ -226,7 +239,6 @@ fn seal_body(
     if sealed.len() > MAX_SEALED {
         return Err(CoreError::TooLarge);
     }
-    request.mark_answered();
     Ok(sealed)
 }
 
@@ -423,7 +435,8 @@ pub(crate) fn plan_keys_body(
     Ok(body)
 }
 
-/// Answers `rewrap`: the new key and the old key of every item.
+/// Answers `rewrap`: the new key and the old key of every item. A level 3 request without a
+/// right number pick is answered `no_match`, as in [`seal_reply`].
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn seal_rewrap_reply(
     old_root: &Root,
@@ -439,7 +452,7 @@ pub fn seal_rewrap_reply(
 }
 
 /// Answers `old_words`: derives only the listed objects' keys under the retired words
-/// (`old`) and the current ones (`k`).
+/// (`old`) and the current ones (`k`). Level 3 needs the number pick, as for `rewrap`.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn seal_old_words_reply(
     old_root: &Root,
@@ -455,6 +468,9 @@ pub fn seal_old_words_reply(
 }
 
 fn old_new_body(old_root: &Root, new_root: &Root, request: &Request, only_old: bool) -> Result<ReplyBody> {
+    if request.level() >= 3 && !request.match_passed() {
+        return Ok(refusal(request, Some(new_root), RefuseReason::NoMatch.as_str()));
+    }
     let (fp_old, fp_new) = (old_root.fingerprint(), new_root.fingerprint());
     if only_old && request.body.old.as_deref().is_some_and(|o| o != fp_old) {
         return Ok(refusal(request, Some(new_root), RefuseReason::WrongKey.as_str()));
