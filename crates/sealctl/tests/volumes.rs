@@ -374,12 +374,14 @@ fn unseal_backup_resumed_after_the_key_change_keeps_the_new_password() {
 
 /// The passphrase shown by `unseal volume --to show` on the terminal (no controlling terminal
 /// for the run, so the `show` store writes to the pseudo-terminal it reads from).
+#[cfg(feature = "test-hooks")]
 fn shown_passphrase(screen: &str, name: &str) -> String {
     let head = format!("New passphrase for volume {name}: ");
     let at = screen.rfind(&head).expect("a shown passphrase") + head.len();
     screen[at..].split(['\r', '\n']).next().unwrap().to_string()
 }
 
+#[cfg(feature = "test-hooks")]
 fn last4(s: &str) -> String {
     let c: Vec<char> = s.chars().collect();
     c[c.len() - 4..].iter().collect()
@@ -468,12 +470,14 @@ fn unseal_volume_to_show_resumed_before_the_change_shows_a_new_passphrase() {
     assert!(!hdiutil_opens(&bundle, &first), "the first one does not");
 }
 
-/// A sparse bundle's id is on disk before its passphrase changes. A seal that stopped before
-/// the change leaves that marker on a bundle the user's passphrase still opens: sealing it
-/// again uses the same id instead of refusing it as sealed.
-#[cfg(target_os = "macos")]
+/// A sparse bundle's id is on disk before its passphrase changes. `seal volume` killed
+/// (SIGKILL) right after writing that marker leaves it on a bundle the user's passphrase still
+/// opens: sealing it again uses the same id instead of refusing it as sealed.
+#[cfg(all(target_os = "macos", feature = "test-hooks"))]
 #[test]
-fn sealing_a_bundle_with_a_leftover_marker_uses_its_id() {
+fn sealing_a_bundle_resumed_after_a_kill_at_its_marker_uses_its_id() {
+    use std::os::unix::process::ExitStatusExt;
+
     let mut env = Env::new();
     env.pair();
     let own = canary();
@@ -500,16 +504,38 @@ fn sealing_a_bundle_with_a_leftover_marker_uses_its_id() {
         .unwrap();
     c.stdin.take().unwrap().write_all(own.as_bytes()).unwrap();
     assert!(c.wait().unwrap().success());
-    let id = "6f1c2a4e-0b7d-4c3a-9e5f-1a2b3c4d5e6f";
-    std::fs::write(
-        bundle.join("sealctl.id"),
-        serde_json::json!({
-            "sealctl": 1, "kind": "volume", "id": id, "words": env.phone.fingerprint(),
-            "check": "x", "created": "2026-11-22T00:00:00Z", "volume": "sparsebundle"
-        })
-        .to_string(),
-    )
-    .unwrap();
+
+    let mut c = env.cmd();
+    c.env("SEALCTL_TEST_KILL", "marked:seal-volume").args([
+        "seal",
+        "volume",
+        "left",
+        bundle.to_str().unwrap(),
+        "--mountpoint",
+        env.h().join("mnt/left").to_str().unwrap(),
+    ]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Passphrase of", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line(&own);
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st;
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = pty.child.kill();
+            panic!("not killed; screen:\n{}", pty.screen.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.signal(), Some(9), "killed at the hook");
+    drop(phone);
+    let marker: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(bundle.join("sealctl.id")).unwrap()).unwrap();
+    let id = marker["id"].as_str().unwrap().to_string();
+    assert!(hdiutil_opens(&bundle, &own), "the passphrase has not changed yet");
+    assert!(!env.h().join(".config/sealctl/volumes/left.toml").exists());
 
     let mut c = env.cmd();
     c.args([

@@ -172,8 +172,9 @@ pub fn seal_volume_given(
             return Err(fail(
                 exit::WRONG_KEY,
                 format!(
-                    "That passphrase does not open {target}, which has sealctl's marker (words {}). \
-                     If those words sealed it, sealctl volume import registers it and sealctl recover opens it.",
+                    "That passphrase does not open {target}. Check it and try again. The bundle has \
+                     the marker of a seal that did not finish (words {}): if your passphrase is right, \
+                     that seal changed it already, and sealctl recover opens it with those words.",
                     f.words
                 ),
             ));
@@ -235,6 +236,7 @@ pub fn seal_volume_given(
     };
     if kind == Kind::Sparsebundle {
         volume::write_marker(&vol)?;
+        journal::test_kill("seal-volume", "marked");
     }
     match kind {
         Kind::Sparsebundle => volume::sparsebundle::change_passphrase(
