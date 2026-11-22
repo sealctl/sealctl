@@ -338,8 +338,11 @@ fn secrets_to_the_keychain_with_readable_labels() {
             .unwrap();
         let text = String::from_utf8_lossy(&o.stdout);
         let name = account.strip_prefix("secret/").unwrap();
+        // the label attribute: printed as "labl" or by its number, 0x00000007
+        let label = format!("<blob>=\"sealctl: secret {name}\"");
         assert!(
-            text.contains(&format!("\"labl\"<blob>=\"sealctl: secret {name}\"")),
+            text.lines()
+                .any(|l| (l.contains("\"labl\"") || l.contains("0x00000007")) && l.contains(&label)),
             "{text}"
         );
     }

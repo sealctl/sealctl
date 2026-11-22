@@ -38,15 +38,17 @@ fn words_phone(
                 };
                 let req = phone.open(&r).unwrap();
                 kinds.push(format!("{:?}", req.kind()));
-                match req.kind() {
-                    RequestKind::Rewrap => phone.answer_rewrap(&r, &req, &old).await.unwrap(),
-                    RequestKind::OldWords => phone
-                        .answer_old_words(&r, &req, retired.as_ref().unwrap())
-                        .await
-                        .unwrap(),
-                    _ => {
-                        phone.auto(&r, &Answer::Session).await.unwrap();
+                // a request can be gone by the time it is answered (its command ended, or the
+                // daemon stopped after a rewrap): note it, go on
+                let r2 = match req.kind() {
+                    RequestKind::Rewrap => phone.answer_rewrap(&r, &req, &old).await,
+                    RequestKind::OldWords => {
+                        phone.answer_old_words(&r, &req, retired.as_ref().unwrap()).await
                     }
+                    _ => phone.auto(&r, &Answer::Session).await.map(|_| ()),
+                };
+                if let Err(e) = r2 {
+                    kinds.push(format!("error: {e:#}"));
                 }
             }
             kinds
