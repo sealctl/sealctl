@@ -6,9 +6,7 @@ commits, opens encrypted volumes and runs encrypted backups with restic. Every k
 from **24 words** held by the sealctl phone app; the phone hands keys to a paired machine when
 you approve, and **the 24 words alone open every object**, with no phone, relay or company.
 
-> **0.7 is in development** (this branch). It needs the sealctl phone app. sealctl 0.5 users
-> (Ledger): hand everything back first with release 0.6 (`brew install sealctl/tap/sealctl@0.6`,
-> then `sealctl unseal --all`), then install 0.7 and `sealctl seal` each object.
+> **0.7 is in development** and not released yet. It needs the sealctl phone app.
 
 ## How it works
 
@@ -145,8 +143,7 @@ and backups stay encrypted under new random passwords; SSH keys become plain key
 Delete the folder once the new passwords work. `--to keychain|op|bw|show` and
 `--secrets-to keychain|op|bw|env` send them to the macOS Keychain (labels like
 `sealctl: volume safe`), 1Password, Bitwarden, the terminal once, or a `.env` file instead.
-`sealctl seal --from ~/sealctl-unsealed-<date>/handback.json` takes everything back, also a
-list written by sealctl 0.6.
+`sealctl seal --from ~/sealctl-unsealed-<date>/handback.json` takes everything back.
 
 ### Recovery
 
