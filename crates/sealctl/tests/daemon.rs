@@ -141,6 +141,38 @@ fn answers_in_parts_replace_the_list_once_all_arrived() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert_eq!(names, ["a", "b", "c"]);
+
+    // a list that never finished is dropped when the session locks, not merged into the next
+    env.block(env.phone.send_message(
+        &m,
+        MessageKind::Answers {
+            answers: part(&["x"]),
+            more: true,
+        },
+    ))
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    let (code, _, err) = env.run(&["lock"]);
+    assert_eq!(code, 0, "{err}");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["open"]));
+    assert_eq!(code, 0, "{err}");
+    std::thread::sleep(Duration::from_secs(1));
+    env.block(env.phone.send_message(
+        &m,
+        MessageKind::Answers {
+            answers: part(&["y"]),
+            more: false,
+        },
+    ))
+    .unwrap();
+    for _ in 0..50 {
+        names = read();
+        if names != ["a", "b", "c"] {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(names, ["y"]);
 }
 
 #[test]

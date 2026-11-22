@@ -206,20 +206,32 @@ const GIT_OPTS_WITH_VALUE: &[&str] = &[
     "--exec-path",
     "--list-cmds",
     "--attr-source",
+    "--shallow-file",
 ];
 
 /// A git process asked for a credential on someone else's behalf: `git credential fill` (also
-/// through an alias given with `-c alias.x=…credential…`), whose answer goes to whoever ran it.
-/// Other arguments that mention credentials (a repository URL, a `credential.*` setting) do
-/// not make one.
+/// through an alias such as `-c alias.x=…credential…`), whose answer goes to whoever ran it.
+/// The check fails closed: any argument that is exactly `credential`, an `alias.` setting that
+/// mentions credentials, or an alias taken from the environment (`--config-env alias.…`) makes
+/// one, whatever option parsing says. Other arguments that only mention credentials (a
+/// repository URL, a `credential.*` setting) do not.
 fn is_git_front_end(p: &Proc) -> bool {
-    let mut args = p.argv.iter().skip(1);
-    while let Some(a) = args.next() {
-        if GIT_OPTS_WITH_VALUE.contains(&a.as_str()) {
-            let v = args.next().map(String::as_str).unwrap_or("");
-            if a == "-c" && v.starts_with("alias.") && v.contains("credential") {
-                return true;
-            }
+    let args = || p.argv.iter().skip(1).map(String::as_str);
+    let mut prev = "";
+    for a in args() {
+        let alias = a.contains("alias.");
+        if a == "credential"
+            || (alias && a.contains("credential"))
+            || (alias && (prev == "--config-env" || a.starts_with("--config-env=")))
+        {
+            return true;
+        }
+        prev = a;
+    }
+    let mut it = args();
+    while let Some(a) = it.next() {
+        if GIT_OPTS_WITH_VALUE.contains(&a) {
+            it.next();
             continue;
         }
         if a.starts_with('-') {
@@ -443,6 +455,36 @@ mod tests {
                 p(
                     "/usr/bin/git",
                     &["git", "-C", "/tmp", "-c", "a.b=c", "credential", "fill"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
+            // an option whose value comes as the next argument
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "--shallow-file", "/dev/null", "credential", "fill"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
+            // an option git may add later, not in the list
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "--some-new-option", "v", "credential", "fill"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
+            // an alias given through the environment
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "--config-env=alias.x=CREDENTIAL_CMD", "x"],
                 ),
                 agent_shell(),
                 agent(),

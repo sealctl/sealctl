@@ -108,6 +108,7 @@ pub async fn run(d: Arc<Daemon>) {
                 continue;
             }
         };
+        d.reset_answer_parts();
         let opened = tokio::time::Instant::now();
         let mut heard = opened;
         let mut ping = tokio::time::interval(Duration::from_secs(30));
@@ -169,6 +170,7 @@ pub async fn run(d: Arc<Daemon>) {
 /// status fields; the phone's reply carries `ack` and the messages waiting for this machine.
 /// Returns `false` when the machine was unpaired (the session is then locked).
 pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
+    d.reset_answer_parts();
     let until = tokio::time::Instant::now() + for_how_long;
     while tokio::time::Instant::now() < until {
         let started = tokio::time::Instant::now();

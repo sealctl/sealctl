@@ -253,6 +253,18 @@ impl Daemon {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The turn to open the session (SPEC 6.3): a caller that finds an open pending waits for it
+    /// and is told it is waiting for the phone, like the caller that asked.
+    async fn join_open(&self, ev: &Events) -> tokio::sync::MutexGuard<'_, ()> {
+        match self.opening.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                ev(json!({"event": "waiting"}));
+                self.opening.lock().await
+            }
+        }
+    }
+
     /// Asks the phone; one request at a time.
     async fn ask(
         &self,
@@ -455,7 +467,7 @@ impl Daemon {
 
     /// `open`.
     pub async fn op_open(self: &Arc<Self>, ctx: RequestContext, ev: &Events, notify: bool) -> Result<Value> {
-        let _opening = self.opening.lock().await;
+        let _opening = self.join_open(ev).await;
         if !self.st().open {
             let (session, _) = self.open_session(vec![], vec![], ctx, ev, notify).await?;
             if !session {
@@ -492,6 +504,9 @@ impl Daemon {
             .await;
         let mut ctx_n = ctx.clone();
         ctx_n.names = req.names.iter().take(10).cloned().collect();
+        // what is not covered yet is judged after any pending open: a caller that joined it may
+        // find its uses granted for the session already
+        let opening = self.join_open(ev).await;
         let remembered = load_answers();
         let uncovered: Vec<String> = match &req.agent {
             Some(a) => req
@@ -521,7 +536,6 @@ impl Daemon {
         // Agent uses are kept for the session only when the phone granted `session`; a `once`
         // answer covers this call and nothing after it.
         let mut session_uses = false;
-        let opening = self.opening.lock().await;
         let was_open = self.st().open;
         if !was_open {
             let (session, set) = self
@@ -646,7 +660,7 @@ impl Daemon {
             return Ok(h);
         }
         let ctx = self.context(None, "", "", subject).await;
-        let opening = self.opening.lock().await;
+        let opening = self.join_open(ev).await;
         if !self.st().open {
             let (_, set) = self.open_session(items.clone(), vec![], ctx, ev, notify).await?;
             let keys = items
@@ -683,7 +697,7 @@ impl Daemon {
         crate::store::check_name(&name)?;
         // a `once` key serves this write only; it never goes into the session's state
         let mut once_key: Option<ObjectKey> = None;
-        let opening = self.opening.lock().await;
+        let opening = self.join_open(ev).await;
         if !self.st().open {
             let ctx = self
                 .context(None, "", "", Some(("secret".into(), name.clone())))
@@ -797,6 +811,7 @@ impl Daemon {
         let (was_open, store_key, keys, channel) = {
             let mut st = self.st();
             st.allowed.clear();
+            st.answers_parts.clear();
             let was_open = std::mem::replace(&mut st.open, false);
             st.saved.lock_reason = match reason {
                 "phone" => Some("Locked from your phone".into()),
@@ -1082,6 +1097,12 @@ impl Daemon {
             MessageKind::Ack { ack } => self.ack(ack),
             MessageKind::Notice { notice } => self.on_notice(&notice),
         }
+    }
+
+    /// Drops `answers` parts of a list that never finished (its last part lost or expired);
+    /// called when a new machine socket or report session starts.
+    pub fn reset_answer_parts(&self) {
+        self.st().answers_parts.clear();
     }
 
     fn on_notice(&self, n: &sealctl_core::wire::Notice) {
@@ -1390,10 +1411,11 @@ pub fn run(spawned: bool) -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let d = Daemon::new(false)?;
         let sock = paths::daemon_socket()?;
         paths::ensure_private_dir(sock.parent().context("state dir")?)?;
+        // the state is read only once a daemon locking on its way out has written it
         let _instance = instance_lock(&sock).await?;
+        let d = Daemon::new(false)?;
         let _ = std::fs::remove_file(&sock);
         let listener = tokio::net::UnixListener::bind(&sock).context("binding the daemon socket")?;
         use std::os::unix::fs::PermissionsExt;
