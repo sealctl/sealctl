@@ -4,6 +4,8 @@
 
 mod common;
 
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{canary, number_on, Env, PhoneThread, Pick, Pty};
@@ -236,21 +238,74 @@ fn unseal_is_refused_inside_an_agent_and_without_a_terminal() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("Not inside an AI agent"));
 }
 
+/// Journal lines of a run, as JSON.
+#[cfg(feature = "test-hooks")]
+fn journal(run: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(run.join("journal.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// A run killed (SIGKILL) right after its first step is journalled done, while steps that need
+/// keys of the plan are still to come, resumes under the same phone approval: no new number,
+/// the keys left come without asking, and the first step is not repeated. The kill point is the
+/// `test-hooks` hook `SEALCTL_TEST_KILL`, not a timed kill from here, which raced the run to its
+/// end on slow machines.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn resume_after_a_kill_uses_the_same_approval() {
+    use std::os::unix::process::ExitStatusExt;
+
     let (env, value) = setup();
     let mut c = env.cmd();
-    c.args(["unseal", "--all"]);
+    // the first step is the secrets store
+    c.env("SEALCTL_TEST_KILL", "done:secrets")
+        .args(["unseal", "--all"]);
     let mut pty = Pty::spawn(c);
     pty.expect("Type unseal to start:", Duration::from_secs(30));
     let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
     pty.line("unseal");
-    pty.expect("[1/", Duration::from_secs(60));
-    // power cut after the first step
-    pty.child.kill().unwrap();
-    let _ = pty.child.wait();
+    // power cut after the first step: the run kills itself there
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st;
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = pty.child.kill();
+            panic!("not killed; screen:\n{}", pty.screen.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let screen = pty.screen.lock().unwrap().clone();
+    assert_eq!(status.signal(), Some(9), "killed at the hook: {screen}");
+    assert_eq!(phone.numbers.load(Ordering::SeqCst), 1, "{screen}");
+    let unseal_requests = |p: &PhoneThread| p.kinds().iter().filter(|k| *k == "Unseal").count();
+    let before = unseal_requests(&phone);
+
     let run = unseal_run_dir(&env);
     assert!(!run.join("done").exists());
+    let lines = journal(&run);
+    let last = lines.last().expect("journal");
+    let first = last["step"].as_str().unwrap().to_owned();
+    assert!(
+        first.starts_with("secrets:") && last["state"] == "done",
+        "nothing ran after the first step: {lines:?}"
+    );
+    // steps left that need a key of the plan: the resume has to get it from the phone
+    let plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run.join("plan.json")).unwrap()).unwrap();
+    let keyed_left: Vec<&str> = plan["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["id"] != first.as_str() && !s["purpose"].is_null())
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(!keyed_left.is_empty(), "a keyed step is left: {plan}");
+
     let mut c = env.cmd();
     c.args(["unseal", "--resume"]);
     let pty = Pty::spawn(c);
@@ -268,7 +323,17 @@ fn resume_after_a_kill_uses_the_same_approval() {
         1,
         "the secret step was not repeated"
     );
-    // keys for the steps left (if any) came with the same approval: one number in all
-    assert!(phone.kinds().iter().filter(|k| *k == "Unseal").count() >= 1);
+    let starts = journal(&run)
+        .iter()
+        .filter(|l| l["step"] == first.as_str() && l["state"] == "start")
+        .count();
+    assert_eq!(starts, 1, "the secrets step ran once");
+    // the keys left came with the same approval: asked for again, one number in all
+    assert!(
+        unseal_requests(&phone) > before,
+        "the resume asked for the keys left ({keyed_left:?}): {:?}",
+        phone.kinds()
+    );
+    assert_eq!(phone.numbers.load(Ordering::SeqCst), 1, "one number in all");
     assert!(!env.h().join(".config/sealctl").exists());
 }

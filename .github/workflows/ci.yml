@@ -68,6 +68,8 @@ jobs:
       # Integration tests run the real binary in temporary HOMEs against the in-process fake
       # relay and a scripted phone, with the real OS tools (hdiutil on macOS, restic).
       - run: cargo test --locked
+      # tests that kill a run at a set point of its journal (SEALCTL_TEST_KILL, test-hooks only)
+      - run: cargo test --locked -p sealctl --features test-hooks --test unseal resume_after_a_kill
       # the keychain store, in the keychain file made above (macOS runner only)
       - if: runner.os == 'macOS'
         run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture
