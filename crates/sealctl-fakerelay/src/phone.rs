@@ -48,6 +48,8 @@ pub struct Phone {
     assembler: PlanAssembler,
     approvals: std::sync::Mutex<Vec<PlanApproval>>,
     seq: std::sync::atomic::AtomicU64,
+    /// Failed polls in a row; each one doubles the pause before the next poll.
+    failures: std::sync::atomic::AtomicU32,
     /// Machines paired by this phone.
     pub machines: std::sync::Mutex<Vec<Machine>>,
     words: Vec<String>,
@@ -82,6 +84,7 @@ impl Phone {
             assembler: PlanAssembler::new(),
             approvals: std::sync::Mutex::new(Vec::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
+            failures: std::sync::atomic::AtomicU32::new(0),
             machines: std::sync::Mutex::new(Vec::new()),
             words: words.list(),
         }
@@ -217,20 +220,45 @@ impl Phone {
         }
     }
 
+    /// The pause after `failures` failed polls in a row: the poll interval doubled per
+    /// failure, at most 30 s.
+    pub fn failure_pause(&self, failures: u32) -> Duration {
+        (self.poll_interval() * 2u32.pow(failures.min(8))).min(Duration::from_secs(30))
+    }
+
     /// Waits for the next pending request not in `seen`.
+    ///
+    /// Every poll is followed by a pause, including one that failed (a `429`, a `5xx`, a
+    /// dropped connection) and the last one before the timeout, so a caller that loops on
+    /// this never lists requests faster than [`Phone::poll_interval`]; failures in a row
+    /// back off up to 30 s (staging incident 2026-11-22: a loop that retried at once after
+    /// `429` sent ~86,000 calls in 35 minutes).
     pub async fn next(&self, seen: &mut Vec<String>, timeout: Duration) -> Result<Incoming> {
+        use std::sync::atomic::Ordering;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            for r in self.requests().await? {
-                if !seen.contains(&r.id) {
-                    seen.push(r.id.clone());
-                    return Ok(r);
+            match self.requests().await {
+                Ok(list) => {
+                    self.failures.store(0, Ordering::SeqCst);
+                    for r in list {
+                        if !seen.contains(&r.id) {
+                            seen.push(r.id.clone());
+                            return Ok(r);
+                        }
+                    }
+                    tokio::time::sleep(self.poll_interval()).await;
+                }
+                Err(e) => {
+                    let n = self.failures.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(self.failure_pause(n)).await;
+                    if tokio::time::Instant::now() > deadline {
+                        return Err(e);
+                    }
                 }
             }
             if tokio::time::Instant::now() > deadline {
                 bail!("no request within {timeout:?}");
             }
-            tokio::time::sleep(self.poll_interval()).await;
         }
     }
 
