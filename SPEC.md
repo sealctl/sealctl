@@ -1163,3 +1163,124 @@ into its section.
 | 18.4 | Ctrl-C or TERM during the steps lets the current step finish, records it, and stops with exit 13 |
 | 21 | `fuzz/` (its own workspace) has 12 targets; `bindings/` holds the Swift and Kotlin smoke tests run by `bindings.yml` |
 | 22 | `crates/sealctl-fakerelay` holds the fake relay and the scripted phone; the integration tests run against a live relay when `SEALCTL_TEST_RELAY` is set. `scripts/pair-test.sh` pairs a real phone with a throwaway HOME |
+
+## 28. 0.8.0: credential helpers
+
+0.8.0 covers the credentials developers keep for their command line tools: Kubernetes, Terraform, container registries, Google Cloud, package registries and the parts of AWS that 0.7.0 leaves on disk. Each tool already has a hook that asks another program for its credentials; sealctl implements that hook, so the tool is used as before (`kubectl get pods`, `terraform plan`, `docker push`) and the phone approves. No `sealctl run` prefix is needed.
+
+### 28.1 Rules every helper follows
+
+- **Stored as secrets.** Each credential is a store secret under the tool's prefix (`kube/`, `tf/`, `docker/`, `gcloud/`, `cargo/`), its value a small JSON object. `secret ls`, inventory, backup of the store, `recover`, `migrate` and change of words treat them like any secret.
+- **Given only to the calling program.** A helper is a hidden subcommand. It prints the credential on stdout, in the tool's own format, to the program that ran it. It refuses when stdout is a terminal (exit 8) and inside an agent (section 11): the agent hooks deny calling it directly, as for `sealctl aws credentials`. An agent that runs `kubectl` or `terraform` gets the tool to use the credential, under the agent rules of section 9, and the use is logged.
+- **Approved as a secret use.** A helper call is a use of that secret: inside an Open session it needs nothing more; when Locked it opens the session; an own-approval secret (`--own-approval`, mode 2) asks every time. `sealctl <tool> protect <target> --every-use` and `--session` switch a credential between the two.
+- **The phone sees the tool and the target.** The request item's `object` carries `kind` (`kube`, `terraform`, `docker`, `gcloud`, `cargo`) and `target`: the cluster server and context, the Terraform host, the registry host, the project. The approval card shows "kubectl · prod-eu (api.prod.example.com)". The relay is unchanged; the apps need the new kinds (app 0.2).
+- **Nothing written back to disk.** Helpers keep no cache. Where the tool's protocol has an expiry, the helper sets a short one, so the tool asks again rather than keeping a credential for long.
+- **`scan` finds them, `import` seals them, `unseal` hands them back.** `sealctl scan` reports each plain-text credential below and offers to import it. Import seals the value, then rewrites the tool's config to call the helper, keeping the original file as `<file>.sealctl-before` (0600) until the next `scan` confirms the helper works, then deleting it. `sealctl unseal` writes the plain values back into the tool's config, so the tool works without sealctl, and lists the file in the hand-back report (section 18). `seal --from` takes them back.
+- **Undo.** `sealctl <tool> setup --undo` removes the helper from the tool's config only after `unseal` of its secrets, never leaving the tool with neither.
+
+### 28.2 Kubernetes
+
+kubectl, helm, k9s, Lens and every client-go program support exec credential plugins (`client.authentication.k8s.io/v1`).
+
+| Command | Does |
+| --- | --- |
+| `sealctl kube import [--kubeconfig <path>]... [--context <c>]... [--remove-files]` | For each user entry with `client-certificate-data` and `client-key-data`, `token`, or `username` and `password`, seals it as `kube/<user>` and replaces the entry with an exec entry. Paths (`client-key: /path`) are read and sealed; `--remove-files` deletes the key files afterwards. Default: every user entry of every file in `KUBECONFIG` (or `~/.kube/config`) |
+| `sealctl kube credentials --user <name>` (hidden) | Prints an `ExecCredential` (v1) with `status.token` or `status.clientCertificateData` and `status.clientKeyData`, and `status.expirationTimestamp` 10 minutes ahead |
+| `sealctl kube protect <context> --every-use \| --session` | Approval per kubectl command for that context's user, or once per session (default) |
+| `sealctl kube ls` | Contexts, their user, how each is covered (sealctl, AWS, other plugin, plain text) |
+
+The exec entry written by import:
+
+```yaml
+users:
+- name: prod-admin
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: /opt/homebrew/bin/sealctl
+      args: [kube, credentials, --user, prod-admin]
+      interactiveMode: Never
+      provideClusterInfo: true
+```
+
+- `provideClusterInfo` gives the helper the cluster server in `KUBERNETES_EXEC_INFO`; the phone card names it.
+- client-go keeps the credential in memory for the life of the process and asks again after `expirationTimestamp`. With `--every-use`, each `kubectl` command asks the phone; a long-running program (k9s, an operator in development) asks again every 10 minutes.
+- The plugin cannot see the kubectl verb, so approval is per context, not per action. Read-only and admin access are separate users in the kubeconfig; protect them separately.
+- Users that already run a plugin are left alone and `kube ls` says how they are covered: `aws eks get-token` uses AWS credentials (sealctl's `credential_process` in 0.7.0); `gke-gcloud-auth-plugin` uses gcloud (28.5); `kubelogin` (AKS) and `kubectl oidc-login` cache tokens in `~/.kube/cache`, which `scan` reports.
+- Tests: a `kind` cluster in CI; kubectl and helm against it through the helper; certificate and token users; `--every-use` asks per command; expiry makes a long-running client ask again; unseal restores a kubeconfig that works without sealctl.
+
+### 28.3 Terraform Cloud and Terraform Enterprise
+
+Terraform asks a credentials helper for the API token of each host.
+
+| Command | Does |
+| --- | --- |
+| `sealctl terraform setup [--undo]` | Writes `credentials_helper "sealctl" {}` into `~/.terraformrc` and installs `terraform-credentials-sealctl` in `~/.terraform.d/plugins` (a link to sealctl) |
+| `sealctl terraform import` | Seals every token in `~/.terraform.d/credentials.tfrc.json` as `tf/<host>` and removes it from the file |
+| `terraform-credentials-sealctl get <host>` | Prints `{"token": "…"}` from `tf/<host>`, or `{}` when there is none, so Terraform falls back to its own behaviour |
+| `terraform-credentials-sealctl store <host>` | Reads `{"token": "…"}` from stdin and seals it: `terraform login` stores into sealctl directly |
+| `terraform-credentials-sealctl forget <host>` | Removes `tf/<host>` |
+
+`scan` also finds `TF_TOKEN_<host>` variables in shell files, as it finds other keys. Terraform providers keep their own credentials: the AWS provider uses `credential_process`; others go through `sealctl run -e`.
+
+Tests: a fake Terraform host (the remote service discovery and token check) in CI; `terraform login`, `plan` with the `remote` backend, `logout`.
+
+### 28.4 Container registries
+
+Docker, Podman, buildx, Skopeo and Helm's OCI support read `~/.docker/config.json` and its credential helpers.
+
+| Command | Does |
+| --- | --- |
+| `sealctl docker setup [--registry <host>]... [--undo]` | Installs `docker-credential-sealctl` (a link) and sets `credHelpers` for the given registries, or `credsStore` for all |
+| `sealctl docker import` | Seals each `auths` entry that holds `auth` (base64 user:password) or `identitytoken` as `docker/<host>` and removes it |
+| `docker-credential-sealctl get \| store \| erase \| list` | The docker-credential-helpers protocol. `list` prints hosts and user names only and needs no approval |
+
+An existing `credsStore` (`osxkeychain`, `desktop`, `pass`) is left in place unless `setup` is told otherwise; `scan` reports only the plain-text `auths`.
+
+Tests: `registry:2` with basic auth in CI; `docker login`, `push` and `pull`, Podman and Skopeo on Linux.
+
+### 28.5 Google Cloud
+
+gcloud keeps refresh tokens in `~/.config/gcloud` (`credentials.db`, `legacy_credentials/`) and Application Default Credentials in `application_default_credentials.json`; service account keys are JSON files anywhere.
+
+- `sealctl gcloud import` seals Application Default Credentials and service account key files as `gcloud/<name>`, and removes the files after a test token exchange works.
+- `sealctl gcloud token [--name <n>] [--scopes …]` (hidden) exchanges the sealed refresh token or service account key for an access token (OAuth 2.0 token endpoint, or a signed JWT for a service account), and prints it. It holds only the access token, for its lifetime (at most one hour), in the daemon.
+- gcloud uses it through `auth/access_token_file` and `CLOUDSDK_AUTH_ACCESS_TOKEN_FILE`, which point at a file in the daemon's runtime folder (a named pipe on Linux, a 0600 file removed after the read on macOS). Client libraries use it through an `external_account` credential with an `executable` source (`GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1`).
+- `gke-gcloud-auth-plugin` then works through gcloud.
+- Open question: whether gcloud's own login state (`credentials.db`) can be replaced without breaking `gcloud auth` commands, or only reported. Decided by a prototype before the milestone starts.
+
+### 28.6 Package registries and GitHub CLI
+
+| Tool | Today | 0.8.0 |
+| --- | --- | --- |
+| cargo | `~/.cargo/credentials.toml` | A credential provider: `credential-provider = ["sealctl", "cargo", "credential"]` in `~/.cargo/config.toml` (cargo's JSON-lines protocol); `cargo login` stores into sealctl |
+| npm, pnpm, yarn | `_authToken` in `~/.npmrc` | `import` seals the token as `npm/<registry>` and writes `${NPM_TOKEN_<registry>}` into `.npmrc`; `sealctl run` provides it. npm has no helper protocol |
+| twine, pip | `~/.pypirc`, keyring | `import` seals `~/.pypirc` passwords; `sealctl run -e TWINE_PASSWORD=pypi/<repo>` |
+| GitHub CLI | `~/.config/gh/hosts.yml` when not in the keychain | git operations already use sealctl's git credential helper; `gh` reads `GH_TOKEN` through `sealctl run`; `scan` reports a plain-text `hosts.yml` |
+
+### 28.7 AWS beyond 0.7.0
+
+- **Assumed roles.** A profile with `role_arn` and `source_profile` makes the AWS CLI cache the role's temporary credentials in `~/.aws/cli/cache`. `sealctl aws credentials --profile <p> --role-arn <arn> [--external-id …] [--mfa-serial …]` calls STS `AssumeRole` itself with the sealed base key and returns the temporary credentials with their `Expiration`; `aws import` rewrites such profiles to it, so nothing is cached on disk.
+- **IAM Identity Center (SSO).** `~/.aws/sso/cache` holds tokens. `scan` reports it; `sealctl aws sso` (a later decision) would keep the SSO token in the daemon instead.
+
+### 28.8 Scan, agents and unseal
+
+- `scan` adds: `~/.kube/config` and every file in `KUBECONFIG`, `~/.terraform.d/credentials.tfrc.json`, `~/.docker/config.json`, `~/.config/gcloud`, service account key files found by their JSON shape, `~/.cargo/credentials.toml`, `~/.npmrc`, `~/.pypirc`, `~/.config/gh/hosts.yml`, `~/.aws/sso/cache`, `~/.aws/cli/cache`, `~/.kube/cache`.
+- `sealctl ai install` adds every new helper to the commands agents may not call (section 11).
+- `unseal` (section 18) hands back each kind into the tool's own config file and lists it in the report; `--to folder` also keeps a copy in the unsealed folder. `seal --from` takes it back.
+- Inventory and `status` show the counts per kind.
+
+### 28.9 Milestones
+
+| # | Milestone | Acceptance criteria |
+| --- | --- | --- |
+| M9 | Helper framework, Kubernetes | Common rules of 28.1 with tests; 28.2 complete against `kind` in CI; app 0.2 shows `kind` and `target` |
+| M10 | Terraform, registries | 28.3 and 28.4 complete with their CI fixtures |
+| M11 | AWS roles, cargo, npm, PyPI, gh | 28.6 and 28.7 (assumed roles); scan reports for SSO and gh |
+| M12 | Google Cloud | 28.5 after the prototype; GKE through `gke-gcloud-auth-plugin` |
+
+### 28.10 Not in 0.8.0
+
+- Approval per Kubernetes verb or Terraform action: the helpers do not see them. A later release could add a `kubectl`/`terraform` wrapper that shows the command on the card.
+- Azure CLI and AKS (`~/.azure`, MSAL token cache): investigated in 0.8, built later.
+- Browser sign-in flows (SSO, OIDC device flows) that sealctl would drive itself.
