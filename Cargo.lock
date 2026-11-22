@@ -2640,7 +2640,7 @@ name = "sealctl"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "clap_complete",
  "command-fds",
@@ -2680,7 +2680,7 @@ dependencies = [
 name = "sealctl-core"
 version = "0.7.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bip39",
  "chacha20poly1305",
  "ed25519-dalek 3.0.0",
@@ -2706,7 +2706,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures-util",
  "reqwest",
  "rustls",
