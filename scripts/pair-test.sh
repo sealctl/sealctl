@@ -9,8 +9,10 @@
 # Press Enter in this terminal to stop the daemon and delete the temporary HOME.
 #
 # Nothing here touches your own HOME, keychain, login services, ~/.ssh or git config:
-# HOME, XDG folders and SSH are all inside the temporary folder, and SEALCTL_NO_SERVICE=1
-# keeps launchd/systemd out of it.
+# HOME is the temporary folder, every XDG_* variable, SEALCTL_SSH_DIR and SSH_AUTH_SOCK are
+# unset (for the pairing, the cleanup and the env file alike), and SEALCTL_NO_SERVICE=1 keeps
+# launchd/systemd out of it. The cleanup stops a daemon only if its socket is inside the
+# temporary folder.
 set -eu
 
 : "${SEALCTL_RELAY:?Set SEALCTL_RELAY to the relay origin to test against (for example the staging relay).}"
@@ -33,7 +35,8 @@ envfile="$tmp/env.sh"
 cat >"$envfile" <<EOF
 # sealctl pair test: source this in another terminal (sh, bash, zsh)
 export HOME='$home'
-unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME SEALCTL_SSH_DIR SSH_AUTH_SOCK
+for v in \$(env | sed -n 's/^\\(XDG_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset "\$v"; done
+unset SEALCTL_SSH_DIR SSH_AUTH_SOCK CLAUDE_CONFIG_DIR GEMINI_CLI_HOME
 export SEALCTL_RELAY='$SEALCTL_RELAY'
 export SEALCTL_NO_SERVICE=1
 export SEALCTL_AGENT=0
@@ -41,8 +44,30 @@ export PATH='$(dirname "$bin")':"\$PATH"
 cd '$home'
 EOF
 
+# Runs a command as the throwaway machine: HOME in the temporary folder and none of the
+# caller's XDG folders, SSH agent or sealctl paths, so nothing can reach the real ones. The
+# pairing and the cleanup both go through here.
+isolated() (
+    for v in $(env | sed -n 's/^\(XDG_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+    unset SEALCTL_SSH_DIR SSH_AUTH_SOCK CLAUDE_CONFIG_DIR GEMINI_CLI_HOME
+    HOME="$home" SEALCTL_NO_SERVICE=1 SEALCTL_AGENT=0
+    export HOME SEALCTL_NO_SERVICE SEALCTL_AGENT
+    exec "$@"
+)
+
 cleanup() {
-    HOME="$home" SEALCTL_NO_SERVICE=1 "$bin" daemon --stop >/dev/null 2>&1 || true
+    # stop only the throwaway daemon: its socket, as sealctl resolves it in the isolated
+    # environment, must be inside the temporary folder
+    # shellcheck disable=SC2016 # expanded by the isolated shell, not this one
+    sock=$(isolated sh -c 'echo "${XDG_STATE_HOME:-$HOME/.local/state}/sealctl/daemon.sock"')
+    case "$sock" in
+    "$tmp"/*)
+        if [ -S "$sock" ]; then
+            isolated "$bin" daemon --stop >/dev/null 2>&1 || true
+        fi
+        ;;
+    *) echo "not stopping a daemon at $sock: it is outside $tmp" >&2 ;;
+    esac
     # sparse bundles made while testing may still be attached
     if command -v hdiutil >/dev/null 2>&1; then
         for m in "$home"/mnt/*; do [ -d "$m" ] && hdiutil detach -quiet "$m" 2>/dev/null || true; done
@@ -54,9 +79,7 @@ trap 'exit 130' INT TERM
 
 echo "Temporary HOME: $home"
 echo
-env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME -u SEALCTL_SSH_DIR \
-    HOME="$home" SEALCTL_NO_SERVICE=1 SEALCTL_AGENT=0 \
-    "$bin" pair --name "pairtest@$(hostname -s 2>/dev/null || echo box)"
+isolated "$bin" pair --name "pairtest@$(hostname -s 2>/dev/null || echo box)"
 
 cat <<EOF
 
