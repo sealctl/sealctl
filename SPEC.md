@@ -1161,6 +1161,7 @@ into its section.
 | 10.4, 16 | `scan` as specified. `migrate`: the daemon starts `sealctl migrate --depth rewrap --auto` itself after a move; re-encryption covers sparse bundles and restic repositories (APFS and LUKS volumes keep their data key); the job runs detached (`--foreground` hidden for tests), with no battery pause yet |
 | 13 | `seal volume` of a LUKS file adds sealctl's key, then removes the user's slot with `luksRemoveKey` once the new key opens it |
 | 14 | Backups of a volume exclude `.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.TemporaryItems` and `lost+found` |
+| 17 | `recover` takes a store folder, a `.sealed` file, a sparse bundle and a restic repository. LUKS files and APFS volume UUIDs are not taken yet: until they are, the words alone do not open such a volume, and `unseal` (with the phone) hands it back under a passphrase of the user's |
 | 18.2 | A paired machine whose store was handed back gets a new store when a secret is next stored |
 | 18.9 | The delayed wait reads the relay every 60 seconds and at `releaseAt`; a cancelled approval names `your phone`, this machine's name, or `another paired machine` |
 | 20 | Hidden input (words, passphrases, values) is read from stdin with echo off through termios, so it works on any terminal stdin and never from a pipe for the words |
