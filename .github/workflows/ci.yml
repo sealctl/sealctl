@@ -29,6 +29,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # the kill and power-cut tests take about an hour on macOS; a hang fails instead of
+    # holding the runner for 6 hours
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - name: Linux dependencies (build, restic, LUKS)
@@ -39,6 +42,18 @@ jobs:
       - name: macOS dependencies (restic)
         if: runner.os == 'macOS'
         run: brew install restic
+      # The runner's login keychain can be locked, and then the first keychain write waits
+      # for an unlock dialog nobody sees. Use a fresh, unlocked default keychain instead.
+      - name: macOS test keychain
+        if: runner.os == 'macOS'
+        run: |
+          kc="$RUNNER_TEMP/sealctl-test.keychain-db"
+          pw="$(uuidgen)"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security list-keychains -d user -s "$kc"
+          security default-keychain -d user -s "$kc"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
