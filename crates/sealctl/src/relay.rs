@@ -2,8 +2,9 @@
 //!
 //! Every call is signed with the pairing key (protocol.md, Relay API, Signing). TLS through
 //! rustls with the platform verifier. Network errors and `5xx` are retried at 1, 2 and 4 s,
-//! then the command fails with exit 6; `429` is not retried (exit 7); `401 clock_skew` is
-//! exit 12. Only method, path, status and duration are logged, never headers or bodies.
+//! then the command fails with exit 6; a `429` with scope `network` or `key` is waited out
+//! (its `retryAfter`, up to 60 s, at most three times), the daily limit (scope `phone`) is not
+//! retried (exit 7); `401 clock_skew` is exit 12. Only method, path, status and duration are logged, never headers or bodies.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
