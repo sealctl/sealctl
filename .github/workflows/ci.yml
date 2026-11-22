@@ -66,24 +66,6 @@ jobs:
       - if: runner.os == 'macOS'
         run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture
 
-  # TEMPORARY: only the store tests with test-hooks on macOS, to iterate on the keychain test
-  keychain-fast:
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: macOS test keychain
-        run: |
-          kc="$RUNNER_TEMP/sealctl-test.keychain-db"
-          pw="$(uuidgen)"
-          security create-keychain -p "$pw" "$kc"
-          security set-keychain-settings "$kc"
-          security unlock-keychain -p "$pw" "$kc"
-          echo "SEALCTL_TEST_KEYCHAIN_PATH=$kc" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p sealctl --features test-hooks --test stores -- --nocapture
-
   msrv:
     runs-on: ubuntu-latest
     steps:
