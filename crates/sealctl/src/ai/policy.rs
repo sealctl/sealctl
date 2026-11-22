@@ -177,6 +177,9 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
     let mut word = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
+    // open subshells and command substitutions: `'('` or `` '`' ``, and whether the text after
+    // the matching `)` or backquote is inside double quotes again (`"a $(b) c"`)
+    let mut open: Vec<(char, bool)> = Vec::new();
     let cs: Vec<char> = text.chars().collect();
     let mut i = 0;
     let end_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
@@ -206,14 +209,17 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
                     i += 1;
                     word.push(cs[i]);
                 }
-                // a command substitution inside double quotes runs a command too
+                // a command substitution inside double quotes runs a command too; the quotes
+                // resume after it
                 '`' => {
                     quote = None;
+                    open.push(('`', true));
                     end_word(&mut word, &mut in_word, &mut words);
                     end_cmd(&mut words, &mut cmds);
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     quote = None;
+                    open.push(('(', true));
                     i += 1;
                     end_word(&mut word, &mut in_word, &mut words);
                     end_cmd(&mut words, &mut cmds);
@@ -236,14 +242,37 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
                 // `2>&1`, `>&2`, `&>file`: redirections, not separators
                 '&' if i > 0 && matches!(cs[i - 1], '>' | '<') => word.push(c),
                 '&' if cs.get(i + 1) == Some(&'>') => word.push(c),
-                '|' | ';' | '&' | '\n' | '(' | ')' | '`' | '{' | '}' => {
+                '|' | ';' | '&' | '\n' | '{' | '}' => {
                     end_word(&mut word, &mut in_word, &mut words);
                     end_cmd(&mut words, &mut cmds);
+                }
+                '(' => {
+                    end_word(&mut word, &mut in_word, &mut words);
+                    end_cmd(&mut words, &mut cmds);
+                    open.push(('(', false));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     i += 1;
                     end_word(&mut word, &mut in_word, &mut words);
                     end_cmd(&mut words, &mut cmds);
+                    open.push(('(', false));
+                }
+                ')' | '`' => {
+                    end_word(&mut word, &mut in_word, &mut words);
+                    end_cmd(&mut words, &mut cmds);
+                    let opener = if c == ')' { '(' } else { '`' };
+                    match open.last() {
+                        Some(&(o, dq)) if o == opener => {
+                            open.pop();
+                            if dq {
+                                quote = Some('"');
+                                in_word = true;
+                            }
+                        }
+                        // a `case` pattern's `)`, or a stray one
+                        _ if c == ')' => {}
+                        _ => open.push(('`', false)),
+                    }
                 }
                 c => {
                     word.push(c);
@@ -646,6 +675,10 @@ mod tests {
             "sh -lc \"sealctl unpair --yes\"",
             "eval sealctl secret get k",
             "echo \"$(sealctl secret get k)\"",
+            "echo \"$(date)\"; sealctl secret get k",
+            "echo \"`id`\" && sealctl recover",
+            "echo \"a $(echo \"b\") c\" | sealctl unseal --all",
+            "x=\"$(echo \")\")\"; sealctl buy",
             "x=`sealctl secret get k`; echo $x",
             "if sealctl secret get k >/dev/null; then echo y; fi",
             "true && (sealctl seal ssh ~/.ssh/id_ed25519)",
