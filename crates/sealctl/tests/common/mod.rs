@@ -21,6 +21,7 @@ pub struct Env {
     pub phone: Arc<Phone>,
     pub rt: tokio::runtime::Runtime,
     pub machine: Option<Machine>,
+    owner: bool,
 }
 
 /// The live relay to test against, if any.
@@ -71,6 +72,26 @@ impl Env {
             phone,
             rt,
             machine: None,
+            owner: true,
+        }
+    }
+
+    /// A second machine (another HOME) on the same relay and phone.
+    pub fn second(&self) -> Env {
+        let home = tempfile::Builder::new().prefix("sc").tempdir_in("/tmp").unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        Env {
+            home,
+            origin: self.origin.clone(),
+            fake: None,
+            phone: self.phone.clone(),
+            rt,
+            machine: None,
+            owner: false,
         }
     }
 
@@ -132,7 +153,15 @@ impl Env {
     pub fn pair(&mut self) -> Machine {
         let mut child = self
             .cmd()
-            .args(["pair", "--name", "tester@box.test"])
+            .args([
+                "pair",
+                "--name",
+                if self.owner {
+                    "tester@box.test"
+                } else {
+                    "second@box.test"
+                },
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -155,7 +184,12 @@ impl Env {
         let mut err = String::new();
         child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
         assert!(st.success(), "pair failed: {err}");
-        assert!(rest.contains("Paired: tester@box.test #"), "{rest}");
+        let name = if self.owner {
+            "tester@box.test"
+        } else {
+            "second@box.test"
+        };
+        assert!(rest.contains(&format!("Paired: {name} #")), "{rest}");
         self.machine = Some(m.clone());
         m
     }
@@ -192,7 +226,7 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         self.stop_daemon();
-        if self.fake.is_none() {
+        if self.fake.is_none() && self.owner {
             // live relay: remove what this test made there
             let _ = self.rt.block_on(self.phone.delete());
         }
@@ -267,9 +301,10 @@ impl Pty {
     /// Types a line.
     pub fn line(&self, text: &str) {
         let mut m = self.master.lock().unwrap();
-        m.write_all(text.as_bytes()).unwrap();
-        m.write_all(b"\r").unwrap();
-        m.flush().unwrap();
+        // the program may have exited already; `wait` shows why
+        let _ = m.write_all(text.as_bytes());
+        let _ = m.write_all(b"\r");
+        let _ = m.flush();
     }
 
     /// Waits for the exit code.

@@ -183,9 +183,31 @@ pub fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
-/// Read a value from the terminal without echo (for API keys typed by the user).
+/// Reads one line from the terminal on stdin without echo (prompt on stderr).
 pub fn read_hidden(prompt: &str) -> Result<Zeroizing<String>> {
-    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
+    use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
+    use std::io::BufRead;
+    use std::os::fd::AsFd;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let stdin = std::io::stdin();
+    let orig = tcgetattr(stdin.as_fd()).ok();
+    if let Some(o) = &orig {
+        let mut t = o.clone();
+        t.local_flags.remove(LocalFlags::ECHO);
+        t.local_flags.insert(LocalFlags::ECHONL);
+        let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &t);
+    }
+    let mut line = Zeroizing::new(String::new());
+    let r = stdin.lock().read_line(&mut line);
+    if let Some(o) = &orig {
+        let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, o);
+    }
+    r?;
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
 }
 
 /// A desktop notification (SPEC 5.2: when nobody watches a terminal): `osascript` on macOS,

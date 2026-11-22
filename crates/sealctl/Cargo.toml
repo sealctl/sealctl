@@ -35,7 +35,6 @@ sha2 = "0.10"
 signature = "2"
 hex = "0.4"
 base64 = "0.22"
-rpassword = "7"
 regex = "1"
 qrcode = { version = "0.15", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -46,6 +45,7 @@ nix = { version = "0.31", default-features = false, features = ["fs", "user", "r
 tempfile = "3"
 sealctl-fakerelay = { path = "../sealctl-fakerelay" }
 nix = { version = "0.31", default-features = false, features = ["term", "fs"] }
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519"] }
 
 # ---- Linux packages (built on CI: cargo deb / cargo generate-rpm) ----
 # Shell completions are generated into crates/sealctl/completions/ before packaging.

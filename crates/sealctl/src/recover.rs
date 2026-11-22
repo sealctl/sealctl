@@ -13,10 +13,8 @@ use crate::exit::{self, fail};
 use crate::{paths, term};
 
 fn read_word(i: usize) -> Result<Zeroizing<String>> {
-    use std::io::Write;
-    eprint!("Word {i} of 24: ");
-    std::io::stderr().flush()?;
-    Ok(Zeroizing::new(rpassword::read_password()?.trim().to_lowercase()))
+    let w = crate::util::read_hidden(&format!("Word {i} of 24: "))?;
+    Ok(Zeroizing::new(w.trim().to_lowercase()))
 }
 
 /// Asks for the 24 words (three tries) and returns the root.

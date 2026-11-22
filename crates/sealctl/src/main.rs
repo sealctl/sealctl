@@ -479,27 +479,27 @@ struct UnsealArgs {
     #[command(subcommand)]
     what: Option<UnsealWhat>,
     /// Everything on this machine, then sealctl's settings, services, hooks and pairing.
-    #[arg(long)]
+    #[arg(long, global = true)]
     all: bool,
     /// Continue the newest unfinished run.
-    #[arg(long)]
+    #[arg(long, global = true)]
     resume: bool,
     /// Keys from the 24 words instead of the phone.
-    #[arg(long)]
+    #[arg(long, global = true)]
     words: bool,
     /// Show the plan only.
-    #[arg(long)]
+    #[arg(long, global = true)]
     dry_run: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
     /// Leave the store folder in place.
-    #[arg(long)]
+    #[arg(long, global = true)]
     keep_store: bool,
     /// Leave one object out: <kind>/<name>.
-    #[arg(long)]
+    #[arg(long, global = true)]
     skip: Vec<String>,
     /// Where new passwords go (this build: folder).
-    #[arg(long)]
+    #[arg(long, global = true)]
     to: Option<String>,
 }
 

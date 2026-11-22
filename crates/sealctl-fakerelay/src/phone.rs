@@ -50,6 +50,7 @@ pub struct Phone {
     seq: std::sync::atomic::AtomicU64,
     /// Machines paired by this phone.
     pub machines: std::sync::Mutex<Vec<Machine>>,
+    words: Vec<String>,
 }
 
 fn unix() -> u64 {
@@ -81,7 +82,13 @@ impl Phone {
             approvals: std::sync::Mutex::new(Vec::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
             machines: std::sync::Mutex::new(Vec::new()),
+            words: words.list(),
         }
+    }
+
+    /// The 24 words (for tests that type them into `--words` or `recover`).
+    pub fn words(&self) -> Vec<String> {
+        self.words.clone()
     }
 
     /// The phone id.
