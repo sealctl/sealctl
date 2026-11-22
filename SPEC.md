@@ -1300,3 +1300,24 @@ Kept and reworked: `ai` (hooks, adapters, policy, skill), `guard` (detection, ma
 16. **Homebrew users who upgrade before unsealing.** `brew upgrade` takes a 0.5.0 user straight to 0.7. The tap keeps `sealctl@0.6` and 0.7 prints how to use it (6.1). Should 0.7.0 be held back on the tap for some weeks after 0.6.0, so that most users unseal first?
 17. **Remote machines and proximity.** Level 2 counts the number match as proximity, so `unseal <object>` works on a dev box over SSH. Rewrap from the daemon has no terminal and needs `near`; a dev box or CI runner is never near, so its rewrap waits for `sealctl migrate --depth rewrap` run there by hand. Acceptable, or exempt rewrap during a change of words the user just started on the phone?
 18. **Pending notices on Locked machines.** A Locked machine has no machine socket and hears of a delayed action only at its next relay call or `sealctl status`. Keeping the machine socket open while Locked would announce at once, at the cost of pings from every machine all day (relay spec).
+
+## 28. Implementation notes (branch `phone`)
+
+What the 0.7 build on this branch does where it differs from the sections above, or adds to
+them. Each line is to be folded into its section when the branch is reviewed.
+
+| Section | Note |
+| --- | --- |
+| 3, 18.3, 18.4 | `unseal` writes into `~/sealctl-unsealed-<date>` with the `folder` store (`passwords.txt`, `secrets.env`, `backup-<name>.env`, `README.txt`, `handback.json`), as decided for 0.6 on the `unseal` branch. `--to keychain\|op\|bw\|show` is refused with exit 2 for now |
+| 4 | `SEALCTL_NO_SERVICE=1` skips login services; they are also skipped when `$HOME` is not the user's home folder from the password database, so a temporary HOME never loads a unit into the real login session |
+| 6.2 | Socket answers carry `code` (the exit code) and `message`; requests that wait on the phone first send `{"event": "waiting"}`. The hidden `sealctl daemon --stop` locks and stops a running daemon |
+| 6.6 | The `report` fallback for relays without the machine channel is not built; a `404` on the machine socket is retried after 6 hours |
+| 7 | Retries and error texts as specified; the relay origin is validated (`https://`, or `http://` to loopback) before any call |
+| 10.1 | `status --json` also has `backups`; `daemon` is `running` or `stopped` |
+| 10.4, 16 | `scan` and `migrate` (rewrap, re-encryption, `old_words`) are not built yet |
+| 13 | `seal volume` of a LUKS file adds sealctl's key, then removes the user's slot with `luksRemoveKey` once the new key opens it |
+| 14 | Backups of a volume exclude `.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.TemporaryItems` and `lost+found` |
+| 18.2 | `seal --from <hand-back list>` is not built yet |
+| 18.9 | The delayed wait reads the relay every 60 seconds and at `releaseAt`; a cancelled approval names `your phone`, this machine's name, or `another paired machine` |
+| 20 | Hidden input (words, passphrases, values) is read from stdin with echo off through termios, so it works on any terminal stdin and never from a pipe for the words |
+| 22 | `crates/sealctl-fakerelay` holds the fake relay and the scripted phone; the integration tests run against a live relay when `SEALCTL_TEST_RELAY` is set. `scripts/pair-test.sh` pairs a real phone with a throwaway HOME |
