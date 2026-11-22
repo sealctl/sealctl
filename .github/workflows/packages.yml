@@ -183,8 +183,9 @@ jobs:
           sealctl --version
           sealctl --help | grep -q volume
           test -f /usr/share/bash-completion/completions/sealctl
-          # the package ships the notices (container images install with tsflags=nodocs)
-          rpm -qlp ./sealctl-*.rpm | grep -Fx /usr/share/licenses/sealctl/THIRD-PARTY-NOTICES.md
+          # licence files are installed even with tsflags=nodocs (they are not %doc)
+          test -s /usr/share/licenses/sealctl/LICENSE
+          test -s /usr/share/licenses/sealctl/THIRD-PARTY-NOTICES.md
           rpm -qi sealctl | head -5
 
   arch:
