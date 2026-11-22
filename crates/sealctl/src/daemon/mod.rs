@@ -847,8 +847,12 @@ impl Daemon {
     }
 
     /// The machine status for the phone (protocol.md, Machine status).
-    async fn send_status(&self, busy: &[sealctl_core::wire::BusyVolume]) -> Result<()> {
-        let (state, log) = {
+    /// The session state and the unacknowledged usage log, as status and reports carry them.
+    fn status_parts(
+        &self,
+        busy: &[sealctl_core::wire::BusyVolume],
+    ) -> (sealctl_core::wire::SessionState, Vec<LogEntry>) {
+        {
             let st = self.st();
             let n = now();
             let s = sealctl_core::wire::SessionState {
@@ -865,7 +869,29 @@ impl Daemon {
                 busy: busy.to_vec(),
             };
             (s, st.log.iter().rev().take(50).rev().cloned().collect::<Vec<_>>())
-        };
+        }
+    }
+
+    /// The next status `seq`.
+    async fn next_seq(&self) -> u64 {
+        let mut paired = self.paired.lock().await;
+        paired.file.status_seq += 1;
+        let _ = paired.file.save();
+        paired.file.status_seq
+    }
+
+    /// A `report` request body with the status fields (the fallback without a machine channel).
+    async fn report_body(&self) -> sealctl_core::wire::RequestBody {
+        let (state, log) = self.status_parts(&[]);
+        let mut b = approve::body("report");
+        b.seq = Some(self.next_seq().await);
+        b.state = Some(state);
+        b.log = log;
+        b
+    }
+
+    async fn send_status(&self, busy: &[sealctl_core::wire::BusyVolume]) -> Result<()> {
+        let (state, log) = self.status_parts(busy);
         let mut paired = self.paired.lock().await;
         paired.file.status_seq += 1;
         let seq = paired.file.status_seq;
@@ -920,6 +946,11 @@ impl Daemon {
             let _ = paired.file.save();
             m
         };
+        self.apply_message(msg).await;
+    }
+
+    /// Applies a machine message whose `seq` is new (from the socket, or a report reply).
+    pub async fn apply_message(self: &Arc<Self>, msg: sealctl_core::wire::MachineMessage) {
         use sealctl_core::wire::MessageKind;
         match msg.kind {
             MessageKind::Lock { reason } => {

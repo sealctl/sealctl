@@ -333,6 +333,28 @@ impl Phone {
         self.post_reply(&r.id, sealed, None).await.map(|_| ())
     }
 
+    /// Answers a `report` request with messages for the machine (the fallback without a
+    /// machine channel).
+    pub async fn answer_report_with(
+        &self,
+        r: &Incoming,
+        req: &Request,
+        kinds: Vec<MessageKind>,
+    ) -> Result<()> {
+        let msgs = kinds
+            .into_iter()
+            .map(|kind| MachineMessage {
+                version: 1,
+                time: now_ms(),
+                seq: self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+                kind,
+            })
+            .collect();
+        let sealed = seal_report_reply(&self.keys, req, req.status().map(|s| s.seq), msgs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.post_reply(&r.id, sealed, None).await.map(|_| ())
+    }
+
     /// Sends a machine message (`lock`, `answers`, `notice`).
     pub async fn send_message(&self, m: &Machine, kind: MessageKind) -> Result<bool> {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;

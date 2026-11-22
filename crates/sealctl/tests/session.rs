@@ -310,3 +310,65 @@ fn the_cli_waits_out_the_relays_short_term_limit() {
     );
     assert_eq!(log, vec!["Open"]);
 }
+
+#[test]
+fn without_a_machine_channel_reports_carry_status_and_the_lock() {
+    let mut env = Env::fake(Options {
+        machine_channel: false,
+        ..Options::default()
+    });
+    env.pair();
+    let phone = env.phone.clone();
+    let h = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut seen = Vec::new();
+            let r = phone.next(&mut seen, Duration::from_secs(30)).await.unwrap();
+            let req = phone.open(&r).unwrap();
+            assert_eq!(req.kind(), sealctl_core::RequestKind::Open);
+            phone
+                .answer(
+                    &r,
+                    &req,
+                    sealctl_core::Decision::Session {
+                        place: sealctl_core::Place::Trusted,
+                    },
+                )
+                .await
+                .unwrap();
+            // the daemon falls back to a report request carrying its status
+            let r = phone.next(&mut seen, Duration::from_secs(30)).await.unwrap();
+            let req = phone.open(&r).unwrap();
+            assert_eq!(req.kind(), sealctl_core::RequestKind::Report);
+            let st = req.status().expect("status fields in the report");
+            assert_eq!(st.state.unwrap().session, "open");
+            phone
+                .answer_report_with(
+                    &r,
+                    &req,
+                    vec![MessageKind::Lock {
+                        reason: "place".into(),
+                    }],
+                )
+                .await
+                .unwrap();
+        });
+    });
+    let (code, _, err) = env.run(&["open"]);
+    assert_eq!(code, 0, "{err}");
+    h.join().unwrap();
+    let mut locked = false;
+    for _ in 0..50 {
+        let v = status(&env);
+        if v["state"] == "locked" {
+            assert_eq!(v["lockReason"], "Locked: your phone left the place");
+            locked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(locked, "locked through the report reply");
+}

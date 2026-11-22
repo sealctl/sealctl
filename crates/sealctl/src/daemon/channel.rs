@@ -10,7 +10,8 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::Daemon;
-use crate::relay;
+use crate::approve;
+use crate::relay::{self, WaitEnd};
 
 /// Runs until the session locks (the task is aborted) or the relay says it has no channel.
 pub async fn run(d: Arc<Daemon>) {
@@ -34,8 +35,10 @@ pub async fn run(d: Arc<Daemon>) {
             Err(e) => {
                 if let Some(a) = relay::refused(&e) {
                     if a.status == 404 {
-                        log::info!("this relay has no machine channel; trying again in 6 hours");
-                        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+                        log::info!("this relay has no machine channel: report requests for 6 hours");
+                        if !report_loop(&d, Duration::from_secs(6 * 3600)).await {
+                            return;
+                        }
                         continue;
                     }
                     if a.status == 403 {
@@ -102,4 +105,91 @@ pub async fn run(d: Arc<Daemon>) {
         }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
     }
+}
+
+/// The fallback without a machine channel (protocol.md, Machine status and messages): one
+/// `report` request waiting on the relay at a time, at most one every 60 seconds, carrying the
+/// status fields; the phone's reply carries `ack` and the messages waiting for this machine.
+/// Returns `false` when the machine was unpaired (the session is then locked).
+pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
+    let until = tokio::time::Instant::now() + for_how_long;
+    while tokio::time::Instant::now() < until {
+        let started = tokio::time::Instant::now();
+        let body = d.report_body().await;
+        // seal under the lock, wait without it: other requests go on meanwhile
+        let sealed = {
+            let paired = d.paired.lock().await;
+            let id = match sealctl_core::request::new_request_id() {
+                Ok(i) => i,
+                Err(_) => return true,
+            };
+            let keys = sealctl_core::MachineKeys::from_bytes(&paired.keys.to_bytes()).expect("64 bytes");
+            sealctl_core::request::seal_request(&paired.keys, &paired.phone, &id, body)
+                .ok()
+                .map(|r| {
+                    (
+                        r,
+                        keys,
+                        paired.phone_id().to_string(),
+                        *paired.keys.public(),
+                        paired.phone.identity,
+                    )
+                })
+        };
+        let Some((request, keys, phone_id, m, p)) = sealed else {
+            return true;
+        };
+        let deadline = tokio::time::Instant::now() + approve::WAIT;
+        let end = d
+            .relay
+            .wait(
+                &keys,
+                &phone_id,
+                &request.id,
+                &request.sealed,
+                approve::WAIT.as_secs(),
+                deadline,
+            )
+            .await;
+        match end {
+            Ok(WaitEnd::Reply(s)) => {
+                if let Ok(reply) = request.open_reply(&m, &p, &s) {
+                    if reply.ok {
+                        if reply.ack.is_some() {
+                            d.st().log.clear();
+                        }
+                        for msg in reply.msgs {
+                            let new = {
+                                let mut paired = d.paired.lock().await;
+                                let new = msg.seq > paired.file.msg_seq;
+                                if new {
+                                    paired.file.msg_seq = msg.seq;
+                                    let _ = paired.file.save();
+                                }
+                                new
+                            };
+                            if new {
+                                d.apply_message(msg).await;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(WaitEnd::Error(code)) if code == "unpaired" || code == "moved" => {
+                let mut paired = d.paired.lock().await;
+                if !matches!(approve::look_up(&d.relay, &mut paired).await, Ok(true)) {
+                    drop(paired);
+                    d.lock("unpaired", true, false).await;
+                    return false;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => log::info!("report: {e:#}"),
+        }
+        if !d.st().open {
+            return true;
+        }
+        tokio::time::sleep_until(started + Duration::from_secs(60)).await;
+    }
+    true
 }
