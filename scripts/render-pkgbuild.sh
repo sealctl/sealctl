@@ -35,6 +35,7 @@ package() {
   cd "\$srcdir"/sealctl-"\$pkgver"-*/
   install -Dm755 sealctl "\$pkgdir/usr/bin/sealctl"
   install -Dm644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+  install -Dm644 THIRD-PARTY-NOTICES.md "\$pkgdir/usr/share/licenses/\$pkgname/THIRD-PARTY-NOTICES.md"
   install -Dm644 README.md "\$pkgdir/usr/share/doc/\$pkgname/README.md"
   install -Dm644 completions/sealctl.bash "\$pkgdir/usr/share/bash-completion/completions/sealctl"
   install -Dm644 completions/_sealctl "\$pkgdir/usr/share/zsh/site-functions/_sealctl"

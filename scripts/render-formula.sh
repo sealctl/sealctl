@@ -38,6 +38,7 @@ class Sealctl < Formula
 
   def install
     bin.install "sealctl"
+    doc.install "THIRD-PARTY-NOTICES.md"
     bash_completion.install "completions/sealctl.bash" => "sealctl"
     zsh_completion.install "completions/_sealctl"
     fish_completion.install "completions/sealctl.fish"
