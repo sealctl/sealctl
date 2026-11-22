@@ -924,6 +924,8 @@ fn run(cli: Cli) -> Result<i32> {
 }
 
 fn main() -> ExitCode {
+    // one TLS provider for reqwest and the WebSocket client (ring: no C build tools needed)
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     let level = match (cli.verbose, std::env::var("SEALCTL_LOG").ok().as_deref()) {
         (0, Some("info")) | (1, _) => "info",

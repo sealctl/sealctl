@@ -9,6 +9,7 @@ pub mod ai;
 pub mod approve;
 pub mod backup;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod daemon;
 pub mod dotenv;

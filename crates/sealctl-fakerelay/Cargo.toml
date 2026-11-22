@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 sealctl-core = { path = "../sealctl-core" }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 anyhow.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

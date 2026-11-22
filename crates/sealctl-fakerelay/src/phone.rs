@@ -68,6 +68,7 @@ impl Phone {
 
     /// A phone from given words.
     pub fn from_words(relay: &str, words: &Words) -> Phone {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let root = Root::from_words(words);
         let keys = PhoneKeys::from_root(&root);
         Phone {

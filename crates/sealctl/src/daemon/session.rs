@@ -1,7 +1,7 @@
 //! Timers and credit (SPEC 6.4): idle allowance, hard stop, minutes worked. Pure functions of
 //! the clock so tests can drive them with any time.
 
-use chrono::{DateTime, Local, NaiveTime, TimeZone};
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 
 /// What `session.json` keeps (no keys): survives locks and restarts until the hard stop.
@@ -37,40 +37,39 @@ pub fn idle_allowance(cap: u64, base: u64, rate: u64, worked: u64) -> u64 {
 /// hours after the first open, whichever comes first.
 pub fn hard_stop(first_open: u64) -> u64 {
     let fourteen = first_open + 14 * 3600 * 1000;
-    let Some(start) = Local.timestamp_millis_opt(first_open as i64).single() else {
+    let Some(start) = crate::clock::from_ms(first_open) else {
         return fourteen;
     };
-    let two = NaiveTime::from_hms_opt(2, 0, 0).expect("02:00");
-    let mut day = start.date_naive();
-    loop {
-        if let Some(t) = Local.from_local_datetime(&day.and_time(two)).earliest() {
-            let ms = t.timestamp_millis() as u64;
-            if ms > first_open {
-                return ms.min(fourteen);
+    let tz = TimeZone::system();
+    let first_day = start.to_zoned(tz.clone()).date();
+    let mut day = first_day;
+    for _ in 0..3 {
+        // 02:00 that day; in a DST gap, jiff takes the time just after it
+        if let Ok(t) = day.at(2, 0, 0, 0).to_zoned(tz.clone()) {
+            let ms = t.timestamp().as_millisecond();
+            if ms > first_open as i64 {
+                return (ms as u64).min(fourteen);
             }
         }
-        day = day.succ_opt().unwrap_or(day);
-        if day > start.date_naive() + chrono::Days::new(2) {
-            return fourteen;
+        match day.tomorrow() {
+            Ok(d) => day = d,
+            Err(_) => break,
         }
     }
+    fourteen
 }
 
 /// `HH:MM` of a Unix ms time, local.
 pub fn hhmm(ms: u64) -> String {
-    Local
-        .timestamp_millis_opt(ms as i64)
-        .single()
-        .map(|t| t.format("%H:%M").to_string())
+    crate::clock::from_ms(ms)
+        .map(|t| t.to_zoned(TimeZone::system()).strftime("%H:%M").to_string())
         .unwrap_or_default()
 }
 
 /// RFC 3339 with offset.
 pub fn rfc3339(ms: u64) -> String {
-    Local
-        .timestamp_millis_opt(ms as i64)
-        .single()
-        .map(|t: DateTime<Local>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+    crate::clock::from_ms(ms)
+        .map(crate::clock::local_rfc3339)
         .unwrap_or_default()
 }
 
@@ -170,9 +169,32 @@ mod tests {
         let h = hard_stop(t0);
         assert!(h > t0);
         assert!(h <= t0 + 14 * 3600 * 1000);
-        let at = Local.timestamp_millis_opt(h as i64).single().unwrap();
         let fourteen = h == t0 + 14 * 3600 * 1000;
-        assert!(fourteen || at.format("%H:%M").to_string() == "02:00");
+        assert!(fourteen || hhmm(h) == "02:00");
+        // in other zones too: 02:00 local, or fourteen hours
+        for tz in [
+            "Europe/Warsaw",
+            "America/Los_Angeles",
+            "Asia/Kolkata",
+            "Pacific/Chatham",
+        ] {
+            let zone = jiff::tz::TimeZone::get(tz).unwrap();
+            let start = crate::clock::from_ms(t0).unwrap().to_zoned(zone.clone());
+            let two = start.date().at(2, 0, 0, 0).to_zoned(zone.clone()).unwrap();
+            let two = if two.timestamp() > start.timestamp() {
+                two
+            } else {
+                start
+                    .date()
+                    .tomorrow()
+                    .unwrap()
+                    .at(2, 0, 0, 0)
+                    .to_zoned(zone)
+                    .unwrap()
+            };
+            let want = (two.timestamp().as_millisecond() as u64).min(t0 + 14 * 3600 * 1000);
+            assert!(want > t0 && want <= t0 + 14 * 3600 * 1000, "{tz}");
+        }
     }
 
     #[test]

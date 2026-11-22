@@ -182,12 +182,12 @@ pub fn refusal(reply: &ReplyBody, number: Option<u8>, words_hint: Option<&str>) 
             },
         ),
         "held" => {
-            let at = chrono::Local::now() + chrono::Duration::hours(1);
+            let at = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
             fail(
                 exit::DECLINED,
                 format!(
                     "Your phone holds sensitive requests from this machine for an hour after a wrong number. Try again after {}.",
-                    at.format("%H:%M")
+                    at.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M")
                 ),
             )
         }

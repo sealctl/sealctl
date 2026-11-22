@@ -46,7 +46,7 @@ impl Run {
     /// A new folder `~/sealctl-unsealed-<date>` (`-2`, `-3`, … when taken), 0700.
     pub fn create() -> Result<Run> {
         let home = paths::home()?;
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let date = crate::clock::now_local("%Y-%m-%d");
         let mut dir = home.join(format!("sealctl-unsealed-{date}"));
         let mut i = 2;
         while dir.exists() {
@@ -95,7 +95,7 @@ impl Run {
         self.n += 1;
         let line = json!({
             "v": 1,
-            "t": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            "t": crate::clock::local_rfc3339(jiff::Timestamp::now()),
             "n": self.n,
             "step": step,
             "state": state,

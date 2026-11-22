@@ -1,6 +1,7 @@
 //! Volumes and backups on derived keys with the real OS tools (SPEC 13, 14, 18): sparse bundles
 //! with `hdiutil` on macOS, restic folder repositories. Disk images live in temporary folders.
 //! Against the fake relay or the live one (`SEALCTL_TEST_RELAY`).
+#![cfg(target_os = "macos")]
 
 mod common;
 

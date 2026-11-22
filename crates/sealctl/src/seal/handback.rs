@@ -50,7 +50,7 @@ impl Handback {
         Handback {
             sealctl: 1,
             kind: "handback".into(),
-            created: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            created: crate::clock::local_rfc3339(jiff::Timestamp::now()),
             machine: machine.to_string(),
             from: env!("CARGO_PKG_VERSION").to_string(),
             objects: vec![],

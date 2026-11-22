@@ -806,8 +806,19 @@ fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
     attach(&old_path, &old_mp, &old_key, true)?;
     let r = (|| -> Result<()> {
         attach(&new_path, &new_mp, &key, false)?;
-        let out = util::system_cmd("ditto").arg(&old_mp).arg(&new_mp).output()?;
-        util::check(out, "ditto")?;
+        // item by item, leaving out the folders macOS keeps on every volume (root-owned
+        // `.fseventsd` can't be read by the user, and the new volume makes its own)
+        for e in std::fs::read_dir(&old_mp)? {
+            let e = e?;
+            if is_system_entry(&e.file_name().to_string_lossy()) {
+                continue;
+            }
+            let out = util::system_cmd("ditto")
+                .arg(e.path())
+                .arg(new_mp.join(e.file_name()))
+                .output()?;
+            util::check(out, "ditto")?;
+        }
         let count = |d: &Path| walk_count(d);
         if count(&old_mp) != count(&new_mp) {
             anyhow::bail!("the copy differs from the original (file count)");
@@ -836,16 +847,21 @@ fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
     Ok("copied to a new bundle under a new key".into())
 }
 
+/// Folders macOS keeps at the top of every volume; not user data.
+fn is_system_entry(name: &str) -> bool {
+    matches!(
+        name,
+        ".fseventsd" | ".Spotlight-V100" | ".Trashes" | ".TemporaryItems" | ".DocumentRevisions-V100"
+    )
+}
+
 fn walk_count(d: &Path) -> (u64, u64) {
     let mut n = 0;
     let mut size = 0;
     if let Ok(rd) = std::fs::read_dir(d) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if matches!(
-                name.as_str(),
-                ".fseventsd" | ".Spotlight-V100" | ".Trashes" | ".TemporaryItems"
-            ) {
+            if is_system_entry(&name) {
                 continue;
             }
             let p = e.path();

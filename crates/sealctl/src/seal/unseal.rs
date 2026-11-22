@@ -1716,7 +1716,7 @@ fn show_plan(plan: &PlanFile) {
     eprintln!();
     eprintln!(
         "Everything goes into one new folder: ~/sealctl-unsealed-{}",
-        chrono::Local::now().format("%Y-%m-%d")
+        crate::clock::now_local("%Y-%m-%d")
     );
     eprintln!("  Only you can read the folder. Delete it yourself once the new passwords and keys work.");
     eprintln!();

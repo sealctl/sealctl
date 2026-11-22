@@ -49,7 +49,7 @@ pub fn check_name(name: &str) -> Result<()> {
 }
 
 fn rfc3339(t: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Local>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    crate::clock::local_rfc3339(crate::clock::from_system(t))
 }
 
 impl Store {
@@ -132,7 +132,7 @@ impl Store {
             id: self.id.clone(),
             words: words.into(),
             check: key.check(),
-            created: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            created: crate::clock::utc_rfc3339(jiff::Timestamp::now()),
             format: Some("sealed-v1".into()),
             own: None,
             volume: None,

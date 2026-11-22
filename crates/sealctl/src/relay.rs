@@ -83,7 +83,7 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
         return Ok(c.clone());
     }
     use rustls_platform_verifier::BuilderVerifierExt;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("TLS setup")?

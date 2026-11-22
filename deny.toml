@@ -12,6 +12,12 @@ ignore = [
     # crypto-bigint 0.5 (via rPGP NIST/X448 curves): non-constant-time arithmetic.
     # sealctl performs no private-key operations on these curves on the host.
     { id = "RUSTSEC-2026-0387", reason = "no host-side private-key ops on NIST/X448 curves" },
+    # zvariant, zbus_names, zvariant_derive (via keyring 3 → zbus 4, the Linux Secret
+    # Service): "unmaintained" because they were merged into zbus 6, not a vulnerability.
+    # No keyring release uses zbus 6 yet; move when one does.
+    { id = "RUSTSEC-2026-0370", reason = "merged into zbus 6; keyring still on zbus 4" },
+    { id = "RUSTSEC-2026-0371", reason = "merged into zbus 6; keyring still on zbus 4" },
+    { id = "RUSTSEC-2026-0372", reason = "merged into zbus 6; keyring still on zbus 4" },
 ]
 
 [licenses]

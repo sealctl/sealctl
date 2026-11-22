@@ -244,7 +244,7 @@ impl Daemon {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or(json!({}));
-            let month = chrono::Local::now().format("%Y-%m").to_string();
+            let month = crate::clock::now_local("%Y-%m");
             if v["month"] != month {
                 v = json!({"month": month, "keysUsed": 0, "declined": 0});
             }
@@ -259,7 +259,7 @@ impl Daemon {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or(json!({}));
-            let month = chrono::Local::now().format("%Y-%m").to_string();
+            let month = crate::clock::now_local("%Y-%m");
             if v["month"] != month {
                 v = json!({"month": month, "keysUsed": 0, "declined": 0});
             }

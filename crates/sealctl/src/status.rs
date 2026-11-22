@@ -21,7 +21,7 @@ fn month() -> Value {
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(json!({}));
-    let m = chrono::Local::now().format("%Y-%m").to_string();
+    let m = crate::clock::now_local("%Y-%m");
     if v["month"] != m {
         return json!({"keysUsed": 0, "declined": 0, "valuesGivenOut": 0});
     }
@@ -39,7 +39,7 @@ pub fn count_given_out() {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(json!({}));
-        let m = chrono::Local::now().format("%Y-%m").to_string();
+        let m = crate::clock::now_local("%Y-%m");
         if v["month"] != m {
             v = json!({"month": m, "keysUsed": 0, "declined": 0});
         }

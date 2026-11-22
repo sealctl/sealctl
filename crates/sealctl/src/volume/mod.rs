@@ -231,7 +231,7 @@ impl Volume {
             id: self.id.clone(),
             words: self.words.clone(),
             check: self.check.clone(),
-            created: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            created: crate::clock::utc_rfc3339(jiff::Timestamp::now()),
             format: None,
             own: None,
             volume: Some(self.kind.as_str().into()),
