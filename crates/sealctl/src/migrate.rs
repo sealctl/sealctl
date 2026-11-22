@@ -1413,7 +1413,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         assert!(!is_mount_point(d.path()));
         assert!(!is_mount_point(&d.path().join("gone")));
-        // devfs on macOS, devtmpfs on Linux
+        assert!(is_mount_point(Path::new("/")));
+        // a file system of its own everywhere tests run, also in the Nix build sandbox (whose
+        // /dev is a plain folder on the sandbox root): devfs on macOS, procfs on Linux
+        #[cfg(target_os = "macos")]
         assert!(is_mount_point(Path::new("/dev")));
+        #[cfg(target_os = "linux")]
+        assert!(is_mount_point(Path::new("/proc")));
     }
 }
