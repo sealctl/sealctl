@@ -175,7 +175,10 @@ fn cancel_from_another_machine() {
     let (code, out, err) = second.run(&["cancel", "--yes"]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("Cancelled."));
-    assert!(out.contains("Google Find My Device") && out.contains("Apple Find My"), "{out}");
+    assert!(
+        out.contains("Google Find My Device") && out.contains("Apple Find My"),
+        "{out}"
+    );
     let (code, _, screen) = pty.wait(Duration::from_secs(120));
     assert_eq!(code, 4, "{screen}");
     assert!(
