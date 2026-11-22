@@ -25,35 +25,81 @@ pub fn id_path(v: &Volume) -> Option<std::path::PathBuf> {
     v.path.as_ref().map(|p| p.join(ID_FILE))
 }
 
-/// Mount points of attached images whose image-path equals `path` (from `hdiutil info`).
-pub fn attached_mounts(path: &std::path::Path) -> Result<Vec<String>> {
+/// One attachment of an image: its whole-disk device (`/dev/disk4`) and the mount points of its
+/// volumes (none when attached without mounting).
+#[derive(Debug, PartialEq, Eq)]
+struct Attachment {
+    disk: String,
+    mounts: Vec<String>,
+}
+
+/// The attachments of the image at `path`, from `hdiutil info`.
+fn attachments(path: &std::path::Path) -> Result<Vec<Attachment>> {
     let out = check(
         crate::util::system_cmd("hdiutil").arg("info").output()?,
         "hdiutil info",
     )?;
-    let text = String::from_utf8_lossy(&out.stdout);
     let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut mounts = Vec::new();
+    Ok(parse_info(&String::from_utf8_lossy(&out.stdout), |image| {
+        std::fs::canonicalize(image).unwrap_or_else(|_| image.into()) == want
+    }))
+}
+
+/// The attachments in `hdiutil info` text whose image-path passes `is_ours`.
+fn parse_info(text: &str, is_ours: impl Fn(&str) -> bool) -> Vec<Attachment> {
+    let mut found = Vec::new();
     for block in text.split("================================================") {
         let image = block.lines().find_map(|l| {
             l.strip_prefix("image-path")
                 .map(|r| r.trim_start_matches([' ', ':', '\t']).trim())
         });
         let Some(image) = image else { continue };
-        let image = std::fs::canonicalize(image).unwrap_or_else(|_| image.into());
-        if image != want {
+        if !is_ours(image) {
             continue;
         }
-        for l in block.lines().filter(|l| l.starts_with("/dev/")) {
-            if let Some(mp) = l.split('\t').map(str::trim).filter(|s| s.starts_with('/')).nth(1) {
-                mounts.push(mp.to_string());
-            }
-        }
-        if mounts.is_empty() {
+        let devs: Vec<&str> = block.lines().filter(|l| l.starts_with("/dev/")).collect();
+        // the first entity is the whole image
+        let Some(disk) = devs.first().and_then(|l| l.split('\t').next()) else {
+            continue;
+        };
+        let mounts = devs
+            .iter()
+            .filter_map(|l| l.split('\t').map(str::trim).filter(|s| s.starts_with('/')).nth(1))
+            .map(str::to_string)
+            .collect();
+        found.push(Attachment {
+            disk: disk.trim().to_string(),
+            mounts,
+        });
+    }
+    found
+}
+
+/// Mount points of attached images whose image-path equals `path` (from `hdiutil info`); an
+/// empty string for an image attached but not mounted.
+pub fn attached_mounts(path: &std::path::Path) -> Result<Vec<String>> {
+    let mut mounts = Vec::new();
+    for a in attachments(path)? {
+        if a.mounts.is_empty() {
             mounts.push(String::new()); // attached but not mounted
         }
+        mounts.extend(a.mounts);
     }
     Ok(mounts)
+}
+
+/// Detaches every attachment of the image at `path`, wherever it is mounted.
+fn detach_all(path: &std::path::Path, force: bool) -> Result<()> {
+    for a in attachments(path)? {
+        let mut cmd = crate::util::system_cmd("hdiutil");
+        cmd.args(["detach", "-quiet"]);
+        if force {
+            cmd.arg("-force");
+        }
+        cmd.arg(&a.disk);
+        check(cmd.output()?, "hdiutil detach (files still open? use --force)")?;
+    }
+    Ok(())
 }
 
 impl Backend for Sparsebundle {
@@ -111,28 +157,28 @@ impl Backend for Sparsebundle {
             run_with_stdin(&mut cmd, passphrase)?,
             "hdiutil attach (wrong key?)",
         )?;
-        if !self.is_unlocked(v)? {
+        let mounted_here = attached_mounts(path)?
+            .iter()
+            .any(|m| super::same_path(std::path::Path::new(m), &v.mountpoint));
+        if !mounted_here {
+            // macOS mounted it elsewhere (`/Volumes/<name> 1` when the name is taken), or not at
+            // all: don't leave it attached and decrypted
+            let _ = detach_all(path, true);
             bail!("image attached but not mounted at {}", v.mountpoint.display());
         }
         Ok(())
     }
 
+    /// Detaches the image wherever it is attached, not only at its mount point.
     fn lock(&self, v: &Volume, force: bool) -> Result<()> {
-        let mut cmd = crate::util::system_cmd("hdiutil");
-        cmd.args(["detach", "-quiet"]);
-        if force {
-            cmd.arg("-force");
-        }
-        cmd.arg(&v.mountpoint);
-        check(cmd.output()?, "hdiutil detach (files still open? use --force)")?;
-        Ok(())
+        let path = v.path.as_ref().context("sparsebundle needs a path")?;
+        detach_all(path, force)
     }
 
+    /// Attached anywhere (decrypted), mounted at its mount point or not.
     fn is_unlocked(&self, v: &Volume) -> Result<bool> {
         let path = v.path.as_ref().context("sparsebundle needs a path")?;
-        Ok(attached_mounts(path)?
-            .iter()
-            .any(|m| super::same_path(std::path::Path::new(m), &v.mountpoint)))
+        Ok(!attachments(path)?.is_empty())
     }
 
     fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()> {
@@ -163,8 +209,13 @@ impl Backend for Sparsebundle {
     }
 }
 
-/// Does `passphrase` open the bundle? Attaches without mounting, then detaches.
+/// Does `passphrase` open the bundle? Attaches without mounting, then detaches. An image that
+/// is attached already is refused: attaching it again only reports the existing attachment
+/// (which says nothing about the passphrase), and detaching that would close the user's volume.
 pub fn verify(path: &std::path::Path, passphrase: &[u8]) -> Result<bool> {
+    if !attachments(path)?.is_empty() {
+        bail!("{} is attached: close it first", path.display());
+    }
     let out = run_with_stdin(
         crate::util::system_cmd("hdiutil")
             .args(["attach", "-nomount", "-plist", "-stdinpass"])
@@ -211,4 +262,51 @@ pub fn change_passphrase(path: &std::path::Path, old: &[u8], new: &[u8]) -> Resu
         "hdiutil chpass",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INFO: &str = "framework       : 671.100.2
+driver          : 671.100.2
+================================================
+image-path      : /Users/u/Vaults/v.sparsebundle
+image-alias     : /Users/u/Vaults/v.sparsebundle
+shadow-path     : <none>
+image-type      : sparse bundle disk image
+image-encrypted : true
+/dev/disk4\tGUID_partition_scheme\t
+/dev/disk4s1\tApple_APFS\t
+/dev/disk5\tEF57347C-0000-11AA-AA11-0030654\t
+/dev/disk5s1\t41504653-0000-11AA-AA11-0030654\t/Volumes/v 1
+================================================
+image-path      : /Users/u/Downloads/other.dmg
+/dev/disk6\tGUID_partition_scheme\t
+/dev/disk6s1\tApple_HFS\t/Volumes/other
+================================================
+image-path      : /Users/u/Vaults/v.sparsebundle
+/dev/disk7\tGUID_partition_scheme\t
+/dev/disk7s1\tApple_APFS\t
+";
+
+    /// Every attachment of the image is found, with its whole disk, wherever it is mounted.
+    #[test]
+    fn attachments_of_an_image_wherever_mounted() {
+        let got = parse_info(INFO, |p| p == "/Users/u/Vaults/v.sparsebundle");
+        assert_eq!(
+            got,
+            vec![
+                Attachment {
+                    disk: "/dev/disk4".into(),
+                    mounts: vec!["/Volumes/v 1".into()],
+                },
+                Attachment {
+                    disk: "/dev/disk7".into(),
+                    mounts: vec![],
+                },
+            ]
+        );
+        assert!(parse_info(INFO, |p| p == "/nowhere").is_empty());
+    }
 }
