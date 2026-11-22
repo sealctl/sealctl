@@ -1,4 +1,8 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.toml]]
+who = "oleksiyp"
+criteria = "safe-to-deploy"
+delta = "0.9.12+spec-1.1.0 -> 1.1.8+spec-1.1.0"
+notes = "Delta reviewed with AI assistance (Claude Code) for the sealctl maintainer; the 0.9.12 base is an exemption, not an audit. Still #![forbid(unsafe_code)], no build script, no proc macros, no file, network, process or env access. Dependencies are the same crates at newer versions (toml_datetime/serde_spanned/toml_parser/toml_writer 1.1, winnow 1.0), plus optional anstream/anstyle only behind the off-by-default debug feature. Changes are parser/serializer fixes: dotted-key vs table-header mixing rules, keys encoded with toml_writer when serializing (quoted when needed), duplicate-key errors in Value/Table deserialization, borrowed-str visiting, Datetime via deserialize_struct, core::error::Error (edition 2024, MSRV 1.85)."
