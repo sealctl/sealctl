@@ -20,17 +20,28 @@ jobs:
       fail-fast: false
       matrix:
         target: [pairing_link, sealed_file, id_file, request, bodies, channel, dotenv, project_toml, git_credential, relay_json, socket_line, handback]
+    env:
+      # cargo-fuzz needs nightly (sanitizers); overrides rust-toolchain.toml
+      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # cargo fuzz has no --locked: fail here if fuzz/Cargo.lock is out of date instead of
+      # resolving fresh versions on the runner
+      - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
       - name: Run
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 3600 || 120 }}
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_EACH: ${{ github.event_name == 'schedule' && 3600 || 120 }}
+        run: cargo fuzz run "$TARGET" -- -max_total_time="$SECONDS_EACH"
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}

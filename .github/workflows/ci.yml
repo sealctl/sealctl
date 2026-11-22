@@ -12,14 +12,19 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Supply chain (SPEC.md section 21): actions are pinned to full commit SHAs (Dependabot updates
+# them after a cooldown); the compiler comes from rust-toolchain.toml; downloaded tools are
+# checked against pinned SHA-256 digests or built from crates.io with --locked and a version.
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          components: rustfmt
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - run: cargo fmt --all --check
 
   test:
@@ -33,7 +38,9 @@ jobs:
     # holding the runner for 6 hours
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Linux dependencies (restic, LUKS)
         if: runner.os == 'Linux'
         run: |
@@ -54,10 +61,9 @@ jobs:
           security set-keychain-settings "$kc"
           security unlock-keychain -p "$pw" "$kc"
           echo "SEALCTL_TEST_KEYCHAIN_PATH=$kc" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       # Integration tests run the real binary in temporary HOMEs against the in-process fake
       # relay and a scripted phone, with the real OS tools (hdiutil on macOS, restic).
@@ -68,14 +74,52 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    env:
+      # overrides rust-toolchain.toml: the declared rust-version must keep building
+      RUSTUP_TOOLCHAIN: "1.89"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.89 --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --locked
 
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      # The release binary, checked against its digest (the cargo-deny-action image downloads
+      # it without one). Update: version and digest of the x86_64-unknown-linux-musl asset.
+      - name: Install cargo-deny 0.21.0
+        run: |
+          f=cargo-deny-0.21.0-x86_64-unknown-linux-musl
+          curl -fsSLo "$RUNNER_TEMP/$f.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/$f.tar.gz"
+          echo "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903  $RUNNER_TEMP/$f.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f.tar.gz" -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/$f/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+      - name: cargo deny (workspace)
+        run: cargo deny --locked check
+      - name: cargo deny (fuzz workspace)
+        run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config deny.toml check
+
+  # cargo-vet (SPEC.md section 21): every crate is audited by us, covered by an imported audit
+  # set (Mozilla, Google, Bytecode Alliance, ISRG, Zcash, Embark), or listed as an exemption in
+  # supply-chain/config.toml. A new or updated crate fails here until `cargo vet` is run
+  # locally and its audit or exemption is reviewed in the pull request.
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      # from crates.io (checksummed by the registry index), with its own Cargo.lock
+      - name: Install cargo-vet 0.10.3
+        run: cargo install cargo-vet --version 0.10.3 --locked
+      - run: cargo vet --locked

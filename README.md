@@ -35,7 +35,11 @@ you approve, and **the 24 words alone open every object**, with no phone, relay 
 | Fedora / RHEL 9 / Rocky | `sudo dnf install ./sealctl-<version>.<arch>.rpm` |
 | Arch Linux | `PKGBUILD` in each release (AUR: `sealctl-bin`) |
 | Nix | `nix profile install github:sealctl/sealctl` |
-| From source | `cargo install --git https://github.com/sealctl/sealctl sealctl` |
+| From source | `cargo install --locked --git https://github.com/sealctl/sealctl sealctl` |
+
+From 0.7.0 each release has `SHA256SUMS` and a build provenance attestation for every file: check a
+download with `sha256sum -c SHA256SUMS --ignore-missing` or
+`gh attestation verify <file> --repo sealctl/sealctl`.
 
 Backups need [restic](https://restic.net); Linux volumes need `cryptsetup`.
 
