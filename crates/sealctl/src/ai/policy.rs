@@ -541,18 +541,74 @@ pub fn read(path: &str) -> Option<String> {
     }
 }
 
-/// A search with the agent's file tool in `path`, limited to the files `glob` names (Claude's
-/// `glob`, Gemini's `include`): denied when the glob itself picks files that `read` keeps out
-/// (`.env*`, `**/.env.local`, `{.env,.env.prod}`, `*.pem`).
+/// A search with the agent's file tool in `path`, limited to the files `glob` names (several
+/// globs separated by spaces or commas, braces allowed): denied when the glob itself picks files
+/// that `read` keeps out (`.env*`, `**/.env.local`, `*.rs .env`, `{.env,.env.prod}`, `*.pem`).
 pub fn search(path: &str, glob: &str) -> Option<String> {
     read(path).or_else(|| {
-        let last = glob.rsplit('/').next().unwrap_or("");
-        last.trim_matches(|c| c == '{' || c == '}')
-            .split(',')
-            .map(|alt| alt.trim().trim_end_matches('*'))
+        glob_parts(glob)
+            .iter()
+            .flat_map(|part| expand_braces(part, 0))
+            .map(|alt| alt.trim_end_matches('*').to_string())
             .filter(|alt| !alt.is_empty())
-            .find_map(read)
+            .find_map(|alt| read(&alt))
     })
+}
+
+/// The globs of a glob list: split at spaces and commas outside braces.
+fn glob_parts(glob: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut depth = 0usize;
+    for c in glob.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && (c == ',' || c.is_whitespace()) {
+            parts.push(std::mem::take(&mut part));
+        } else {
+            part.push(c);
+        }
+    }
+    parts.push(part);
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+/// The globs a brace pattern stands for: `a{b,c{d,e}}` → `ab`, `acd`, `ace`.
+fn expand_braces(glob: &str, depth: usize) -> Vec<String> {
+    let Some(open) = glob.find('{').filter(|_| depth < 16) else {
+        return vec![glob.to_string()];
+    };
+    let mut level = 0usize;
+    let mut alts = Vec::new();
+    let mut start = open + 1;
+    for (i, c) in glob[open..].char_indices().map(|(i, c)| (open + i, c)) {
+        match c {
+            '{' => level += 1,
+            '}' => {
+                level -= 1;
+                if level == 0 {
+                    alts.push(&glob[start..i]);
+                    let (head, tail) = (&glob[..open], &glob[i + 1..]);
+                    return alts
+                        .iter()
+                        .flat_map(|alt| expand_braces(&format!("{head}{alt}{tail}"), depth + 1))
+                        .take(256)
+                        .collect();
+                }
+            }
+            ',' if level == 1 => {
+                alts.push(&glob[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    // no closing brace: a literal `{`
+    vec![glob.to_string()]
 }
 
 /// One line of context for a new session: that sealctl exists, and which secrets (names only).
@@ -768,10 +824,31 @@ mod tests {
         assert!(read("/home/u/.aws/credentials").is_some());
         assert!(read("/home/u/.npmrc").is_some());
         assert!(read("/p/app/credentials").is_none());
-        for g in [".env*", "**/.env", ".env.*", "{.env,.env.local}", "*.pem"] {
+        for g in [
+            ".env*",
+            "**/.env",
+            ".env.*",
+            "{.env,.env.local}",
+            "*.pem",
+            ".env *.rs",
+            "*.rs .env",
+            "*.rs,.env.local",
+            "*.{rs,pem}",
+            "**/{src,.}/.env",
+            "{*.rs,{.env,x}}",
+        ] {
             assert!(search("/p", g).is_some(), "should deny: {g}");
         }
-        for g in ["", "*.rs", "**/*.{ts,tsx}", ".env.example", "src/**"] {
+        for g in [
+            "",
+            "*.rs",
+            "**/*.{ts,tsx}",
+            ".env.example",
+            "src/**",
+            "*.rs *.toml",
+            "{.env.example,.env.sample}",
+            "{unclosed",
+        ] {
             assert!(search("/p", g).is_none(), "should allow: {g}");
         }
         assert!(write(

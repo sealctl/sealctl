@@ -81,7 +81,7 @@ fn tool_verdict(tool: &str, input: &Value, cwd: Option<&str>) -> Option<String> 
             policy::bash_in(&command_of(input), cwd)
         }
         "read" | "read_file" | "view" | "glob" | "notebookread" => policy::read(path),
-        "grep" => policy::search(path, first_str(input, &["glob", "include"])),
+        "grep" => policy::search(path, first_str(input, &["glob"])),
         "write"
         | "edit"
         | "create"
