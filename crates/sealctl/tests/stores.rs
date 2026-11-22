@@ -271,15 +271,20 @@ fn plan_rows_name_the_chosen_store() {
     };
     let s = rows(&[]);
     assert!(s.contains("→ secrets.env in the folder, plain"), "{s}");
-    let s = rows(&["--secrets-to", "keychain"]);
-    let row = s
-        .lines()
-        .find(|l| l.contains(" secrets ") && l.contains('→'))
-        .unwrap();
-    assert!(
-        row.contains("Keychain") && row.contains("sealctl: secret <name>") && !row.contains("secrets.env"),
-        "{row}"
-    );
+    // the keychain is offered on macOS (on Linux only with a running Secret Service)
+    if cfg!(target_os = "macos") {
+        let s = rows(&["--secrets-to", "keychain"]);
+        let row = s
+            .lines()
+            .find(|l| l.contains(" secrets ") && l.contains('→'))
+            .unwrap();
+        assert!(
+            row.contains("Keychain")
+                && row.contains("sealctl: secret <name>")
+                && !row.contains("secrets.env"),
+            "{row}"
+        );
+    }
     let s = rows(&["--secrets-to", "op", "--to", "bw"]);
     assert!(s.contains("→ 1Password"), "{s}");
     assert!(
