@@ -159,7 +159,10 @@ pub fn rewrap_one(
                             .arg(p),
                         o.as_bytes(),
                     )?;
-                    let _ = out;
+                    // exit 2: no slot opens with the old key any more (an earlier run removed it)
+                    if out.status.code() != Some(2) {
+                        util::check(out, "cryptsetup luksRemoveKey")?;
+                    }
                 }
             }
             let mut nv = v.clone();
@@ -354,7 +357,16 @@ pub fn rewrap_all(show: bool, old_words: bool) -> Result<Outcome> {
             if show {
                 eprintln!("Type the words {fp} on your phone.");
             }
-            let (reply, _) = send(&mut paired, b, show)?;
+            let (reply, _) = match send(&mut paired, b, show) {
+                Ok(r) => r,
+                Err(e) => {
+                    // objects of the first request may be on the new keys already
+                    if !out.rewrapped.is_empty() {
+                        crate::daemon::client::stop_running();
+                    }
+                    return Err(e);
+                }
+            };
             let mut o2 = Outcome::default();
             apply(&sub_objs, &sub_items, &reply, &mut o2);
             out.retired.remove(&fp);
@@ -416,6 +428,28 @@ fn save_job(j: &Job) -> Result<()> {
     let p = job_path()?;
     paths::ensure_private_dir(p.parent().context("state")?)?;
     paths::write_private(&p, &serde_json::to_vec_pretty(j)?)
+}
+
+/// The runner's save: the item states from `j`, and the `pause` or `cancel` on file (asked for
+/// by `sealctl migrate` while an item ran).
+fn save_progress(j: &Job) -> Result<()> {
+    let mut j = j.clone();
+    j.request = load_job().and_then(|d| d.request);
+    save_job(&j)
+}
+
+/// One runner at a time: an exclusive lock on `migrate.lock`, held until the process exits.
+fn lock_runner(state: &Path) -> Result<()> {
+    paths::ensure_private_dir(state)?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("migrate.lock"))?;
+    let held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|_| fail(exit::USAGE, "The re-encryption job is already running."))?;
+    std::mem::forget(held);
+    Ok(())
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -689,6 +723,7 @@ fn start_job(foreground: bool) -> Result<()> {
 }
 
 fn run_job() -> Result<()> {
+    lock_runner(&paths::state_dir()?)?;
     let mut job = load_job().ok_or_else(|| fail(exit::NOT_FOUND, "No re-encryption job."))?;
     for i in 0..job.items.len() {
         if let Some(r) = load_job().and_then(|j| j.request) {
@@ -696,14 +731,14 @@ fn run_job() -> Result<()> {
                 it.state = "stopped".into();
                 it.note = format!("{r} asked");
             }
-            save_job(&job)?;
+            save_progress(&job)?;
             return Ok(());
         }
         if job.items[i].state == "done" {
             continue;
         }
         job.items[i].state = "running".into();
-        save_job(&job)?;
+        save_progress(&job)?;
         let r = match job.items[i].kind.as_str() {
             "volume" => reencrypt_bundle(&mut job, i),
             _ => reencrypt_backup(&mut job, i),
@@ -718,7 +753,7 @@ fn run_job() -> Result<()> {
                 job.items[i].note = exit::message_of(&e);
             }
         }
-        save_job(&job)?;
+        save_progress(&job)?;
     }
     for it in &job.items {
         eprintln!("{} {}: {} {}", it.kind, it.name, it.state, it.note);
@@ -750,14 +785,37 @@ fn new_key(kind: &str, id: &str, path: String) -> Result<(ObjectKey, String)> {
 fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
     let v = Volume::load(&job.items[i].name)?;
     let old_path = v.path.clone().context("bundle path")?;
-    let (mut keys, _) = crate::daemon::client::keys(&[v.request_item()], Some(("volume", &v.name)))?;
-    let old_key = keys.remove(0);
     if job.items[i].new_id.is_empty() {
         job.items[i].new_id = util::new_uuid()?;
-        save_job(job)?;
+        save_progress(job)?;
     }
     let new_id = job.items[i].new_id.clone();
     let new_path = old_path.with_file_name(format!(".{}.migrating.sparsebundle", v.name));
+    let aside = old_path.with_file_name(format!(".{}.old.sparsebundle", v.name));
+    if v.id == new_id {
+        // an earlier run swapped the bundles and saved the definition
+        if aside.exists() {
+            std::fs::remove_dir_all(&aside)?;
+        }
+        return Ok(DONE_NOTE.into());
+    }
+    if aside.exists() {
+        // an earlier run stopped during the swap: the bundles go back to where they were
+        if old_path.exists() {
+            if new_path.exists() {
+                anyhow::bail!(
+                    "{}, {} and {} all exist; keep the bundle that opens with the current key",
+                    paths::tilde(&old_path),
+                    paths::tilde(&new_path),
+                    paths::tilde(&aside)
+                );
+            }
+            std::fs::rename(&old_path, &new_path)?;
+        }
+        std::fs::rename(&aside, &old_path)?;
+    }
+    let (mut keys, _) = crate::daemon::client::keys(&[v.request_item()], Some(("volume", &v.name)))?;
+    let old_key = keys.remove(0);
     let (key, fp) = new_key("volume", &new_id, paths::tilde(&old_path))?;
     if v.is_open() {
         volume::close(&v, false)?;
@@ -825,26 +883,78 @@ fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
         }
         Ok(())
     })();
-    let _ = util::system_cmd("hdiutil")
-        .args(["detach", "-quiet"])
-        .arg(&new_mp)
-        .output();
-    let _ = util::system_cmd("hdiutil")
-        .args(["detach", "-quiet"])
-        .arg(&old_mp)
-        .output();
-    let _ = std::fs::remove_dir_all(&tmp);
+    let new_off = detach(&new_mp);
+    let old_off = detach(&old_mp);
+    if new_off && old_off {
+        // empty folders by now: never anything that could still be a mounted volume
+        let _ = std::fs::remove_dir(&new_mp);
+        let _ = std::fs::remove_dir(&old_mp);
+        let _ = std::fs::remove_dir(&tmp);
+    }
     r?;
-    // the old bundle goes only now
-    std::fs::remove_dir_all(&old_path)?;
-    std::fs::rename(&new_path, &old_path)?;
-    let mut nv = v.clone();
-    nv.id = new_id;
-    nv.words = fp;
-    nv.check = key.check();
-    volume::write_marker(&nv)?;
-    nv.save()?;
-    Ok("copied to a new bundle under a new key".into())
+    if !(new_off && old_off) {
+        anyhow::bail!(
+            "a copy is still attached under {}; detach it (hdiutil detach), then: sealctl migrate --resume",
+            paths::tilde(&tmp)
+        );
+    }
+    // the swap: the old bundle is set aside, and deleted only once the definition names the new one
+    std::fs::rename(&old_path, &aside)?;
+    let swapped = std::fs::rename(&new_path, &old_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| {
+            let mut nv = v.clone();
+            nv.id = new_id;
+            nv.words = fp;
+            nv.check = key.check();
+            volume::write_marker(&nv)?;
+            nv.save()
+        });
+    if let Err(e) = swapped {
+        if old_path.exists() && !new_path.exists() {
+            let _ = std::fs::rename(&old_path, &new_path);
+        }
+        if !old_path.exists() {
+            let _ = std::fs::rename(&aside, &old_path);
+        }
+        return Err(e);
+    }
+    std::fs::remove_dir_all(&aside)?;
+    Ok(DONE_NOTE.into())
+}
+
+const DONE_NOTE: &str = "copied to a new bundle under a new key";
+
+/// True when `p` is the root of a different file system from its parent's (a mount point).
+/// A path that cannot be read counts as mounted, unless it is gone.
+fn is_mount_point(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent = p.parent().map(std::fs::metadata);
+    match (std::fs::metadata(p), parent) {
+        (Err(e), _) if e.kind() == std::io::ErrorKind::NotFound => false,
+        (Ok(m), Some(Ok(pm))) => m.dev() != pm.dev(),
+        _ => true,
+    }
+}
+
+/// Detaches the image mounted at `mp`, with `-force` after two tries. True once nothing is
+/// mounted there.
+fn detach(mp: &Path) -> bool {
+    for attempt in 0..4 {
+        if !is_mount_point(mp) {
+            return true;
+        }
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        let mut c = util::system_cmd("hdiutil");
+        c.args(["detach", "-quiet"]);
+        if attempt >= 2 {
+            c.arg("-force");
+        }
+        let _ = c.arg(mp).output();
+    }
+    !is_mount_point(mp)
 }
 
 /// Folders macOS keeps at the top of every volume; not user data.
@@ -880,21 +990,23 @@ fn walk_count(d: &Path) -> (u64, u64) {
 
 fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
     let b = Backup::load(&job.items[i].name)?;
+    if job.items[i].new_id.is_empty() {
+        job.items[i].new_id = util::new_uuid()?;
+        save_progress(job)?;
+    }
+    let new_id = job.items[i].new_id.clone();
+    let new_url = sibling_repo(&b.repo, &new_id).ok_or_else(|| {
+        fail(
+            exit::USAGE,
+            format!(
+                "{} is at the top of its bucket or server, so there is no place beside it for the new repository; it stays on its rewrapped key",
+                b.repo
+            ),
+        )
+    })?;
     let (mut keys, _) = crate::daemon::client::keys(&[b.request_item()], Some(("backup", &b.name)))?;
     let old_key = keys.remove(0);
     let env = credentials(&b, &b.credential_names())?;
-    if job.items[i].new_id.is_empty() {
-        job.items[i].new_id = util::new_uuid()?;
-        save_job(job)?;
-    }
-    let new_id = job.items[i].new_id.clone();
-    let base = b
-        .repo
-        .trim_end_matches('/')
-        .rsplit_once('/')
-        .map(|(a, _)| a.to_string())
-        .context("repository URL")?;
-    let new_url = format!("{base}/{new_id}");
     let (key, fp) = new_key("backup", &new_id, new_url.clone())?;
     let newr = Repo::new(&new_url, &key, env.clone());
     let pw_old = old_key.hex();
@@ -939,6 +1051,68 @@ fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
     nb.check = key.check();
     nb.save()?;
     Ok(note)
+}
+
+/// Where the re-encrypted copy of the restic repository `repo` goes: beside it, its last path
+/// segment replaced by `id`, on the same server and in the same bucket or container. None when
+/// the repository has no path inside its bucket, container or server (a sibling there would be
+/// another bucket or host), or for a URL form not known here.
+fn sibling_repo(repo: &str, id: &str) -> Option<String> {
+    let repo = repo.trim_end_matches('/');
+    let (scheme, rest) = match repo.split_once(':') {
+        Some((sch, rest)) if !sch.is_empty() && !sch.contains('/') => (sch, rest),
+        _ => ("", repo), // a folder
+    };
+    // `host://` skipped: where the authority starts
+    let after_scheme = |s: &str| s.find("://").map(|i| i + 3);
+    // up to and including the first `:` (`bucket:`, `user@host:`)
+    let colon = |s: &str| s.find(':').map(|i| i + 1);
+    // the part of `rest` naming the server, bucket or container: it stays
+    let fixed = match scheme {
+        "" | "local" => 0,
+        "s3" => {
+            let a = after_scheme(rest).unwrap_or(0);
+            a + segments_end(&rest[a..], 2)? // host and bucket
+        }
+        "rest" => {
+            let a = after_scheme(rest)?;
+            a + segments_end(&rest[a..], 1)? // host
+        }
+        "sftp" if rest.starts_with("//") => 2 + segments_end(&rest[2..], 1)?,
+        "sftp" | "b2" | "gs" | "azure" | "swift" => colon(rest)?,
+        // the first segment of an rclone path can be a bucket
+        "rclone" => {
+            let c = colon(rest)?;
+            c + segments_end(&rest[c..], 1)?
+        }
+        _ => return None,
+    };
+    let (head, path) = rest.split_at(fixed);
+    if path.trim_start_matches('/').is_empty() || (scheme.is_empty() && !path.contains('/')) {
+        return None;
+    }
+    let cut = path.rfind('/').map_or(0, |i| i + 1);
+    let scheme = if scheme.is_empty() {
+        String::new()
+    } else {
+        format!("{scheme}:")
+    };
+    Some(format!("{scheme}{head}{}{id}", &path[..cut]))
+}
+
+/// The end of the first `n` non-empty `/`-separated segments of `s`.
+fn segments_end(s: &str, n: usize) -> Option<usize> {
+    let mut end = 0;
+    for k in 0..n {
+        let start = if k == 0 { 0 } else { end + 1 };
+        let tail = s.get(start..)?;
+        let len = tail.find('/').unwrap_or(tail.len());
+        if len == 0 {
+            return None;
+        }
+        end = start + len;
+    }
+    Some(end)
 }
 
 /// `--scan`: objects found by their markers under `roots` (default: home and /Volumes).
@@ -1022,6 +1196,11 @@ pub fn rewrap_in_background() {
     c.args(["migrate", "--depth", "rewrap", "--auto"])
         .stdin(std::process::Stdio::null())
         .process_group(0);
+    // the daemon may have been started from inside an agent's command; this run is the daemon's
+    // own, so the agent refusal of `sealctl migrate` does not apply to it
+    for var in crate::guard::agent_variables() {
+        c.env_remove(var);
+    }
     if let Some(f) = f {
         if let Ok(f2) = f.try_clone() {
             c.stdout(f2);
@@ -1029,4 +1208,88 @@ pub fn rewrap_in_background() {
         c.stderr(f);
     }
     let _ = c.spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sibling_repositories() {
+        let s = |r: &str| sibling_repo(r, "NEW");
+        // made by sealctl: `<base>/<id>`
+        assert_eq!(s("/Users/a/repos/abc").as_deref(), Some("/Users/a/repos/NEW"));
+        assert_eq!(s("/Users/a/repos/abc/").as_deref(), Some("/Users/a/repos/NEW"));
+        assert_eq!(s("local:/srv/abc").as_deref(), Some("local:/srv/NEW"));
+        assert_eq!(
+            s("s3:s3.amazonaws.com/bucket/abc").as_deref(),
+            Some("s3:s3.amazonaws.com/bucket/NEW")
+        );
+        assert_eq!(
+            s("s3:s3.amazonaws.com/bucket/p/abc").as_deref(),
+            Some("s3:s3.amazonaws.com/bucket/p/NEW")
+        );
+        assert_eq!(
+            s("s3:http://minio:9000/bucket/abc").as_deref(),
+            Some("s3:http://minio:9000/bucket/NEW")
+        );
+        assert_eq!(
+            s("rest:https://host:8000/abc").as_deref(),
+            Some("rest:https://host:8000/NEW")
+        );
+        assert_eq!(s("b2:bucket:/abc").as_deref(), Some("b2:bucket:/NEW"));
+        assert_eq!(s("b2:bucket:abc").as_deref(), Some("b2:bucket:NEW"));
+        assert_eq!(s("gs:bucket:/p/abc").as_deref(), Some("gs:bucket:/p/NEW"));
+        assert_eq!(
+            s("sftp:user@host:/srv/abc").as_deref(),
+            Some("sftp:user@host:/srv/NEW")
+        );
+        assert_eq!(
+            s("sftp://user@host:22//srv/abc").as_deref(),
+            Some("sftp://user@host:22//srv/NEW")
+        );
+        assert_eq!(
+            s("rclone:remote:bucket/abc").as_deref(),
+            Some("rclone:remote:bucket/NEW")
+        );
+        // at the top of a bucket, container or server: no place beside it
+        assert_eq!(s("s3:s3.amazonaws.com/bucket"), None);
+        assert_eq!(s("s3:https://minio:9000/bucket/"), None);
+        assert_eq!(s("rest:https://host:8000/"), None);
+        assert_eq!(s("rest:https://host:8000"), None);
+        assert_eq!(s("b2:bucket:"), None);
+        assert_eq!(s("azure:container:/"), None);
+        assert_eq!(s("rclone:remote:bucket"), None);
+        assert_eq!(s("sftp://user@host:22/"), None);
+        assert_eq!(s("repo"), None);
+        assert_eq!(s("/"), None);
+        assert_eq!(s("unknown:thing/abc"), None);
+    }
+
+    #[test]
+    fn one_runner_at_a_time() {
+        let d = tempfile::tempdir().unwrap();
+        let st = d.path().join("state");
+        // a second process: a separate open file description, as a second runner has
+        std::fs::create_dir_all(&st).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(st.join("migrate.lock"))
+            .unwrap();
+        let held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+        assert!(lock_runner(&st).is_err());
+        drop(held);
+        assert!(lock_runner(&st).is_ok());
+    }
+
+    #[test]
+    fn mount_points() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!is_mount_point(d.path()));
+        assert!(!is_mount_point(&d.path().join("gone")));
+        // devfs on macOS, devtmpfs on Linux
+        assert!(is_mount_point(Path::new("/dev")));
+    }
 }
