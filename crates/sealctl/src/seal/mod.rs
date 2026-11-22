@@ -45,9 +45,15 @@ pub fn ask_here(
 /// A key for an object being taken over: from the phone at level 2, or from the words.
 pub fn takeover_key(item: &RequestItem, words: bool) -> Result<(ObjectKey, String)> {
     if words {
-        let root = crate::recover::read_root()?;
+        // typed once per command, wiped when it exits
+        static ROOT: std::sync::Mutex<Option<sealctl_core::Root>> = std::sync::Mutex::new(None);
+        let mut cached = ROOT.lock().unwrap_or_else(|e| e.into_inner());
+        if cached.is_none() {
+            *cached = Some(crate::recover::read_root()?);
+        }
+        let root = cached.as_ref().expect("root");
         let p = Purpose::parse(&item.purpose).context("purpose")?;
-        let k = crate::recover::derive_checked(&root, p, &item.id, None)?;
+        let k = crate::recover::derive_checked(root, p, &item.id, None)?;
         return Ok((k, root.fingerprint()));
     }
     let mut paired = machine::load()?;
@@ -102,6 +108,18 @@ pub fn seal_volume(
     manual: bool,
     words: bool,
 ) -> Result<()> {
+    seal_volume_given(name, target, mountpoint, manual, words, None)
+}
+
+/// [`seal_volume`] with the current passphrase given (from a hand-back list).
+pub fn seal_volume_given(
+    name: &str,
+    target: &str,
+    mountpoint: Option<PathBuf>,
+    manual: bool,
+    words: bool,
+    given: Option<Zeroizing<String>>,
+) -> Result<()> {
     term::require_person("sealctl seal", None)?;
     volume::validate_name(name)?;
     if Volume::load(name).is_ok() {
@@ -126,7 +144,10 @@ pub fn seal_volume(
             ));
         }
     }
-    let old = old_passphrase(target)?;
+    let old = match given {
+        Some(p) => p,
+        None => old_passphrase(target)?,
+    };
     let opens = |pass: &[u8]| -> Result<bool> {
         match kind {
             Kind::Sparsebundle => volume::sparsebundle::verify(path.as_ref().expect("path"), pass),
@@ -271,6 +292,21 @@ pub fn seal_backup(
     keep_old: bool,
     words: bool,
 ) -> Result<()> {
+    seal_backup_given(name, repo, from, env_pairs, keep_old, words, None, None)
+}
+
+/// [`seal_backup`] with the password and credentials given (from a hand-back list).
+#[allow(clippy::too_many_arguments)]
+pub fn seal_backup_given(
+    name: &str,
+    repo: &str,
+    from: Option<&str>,
+    env_pairs: &[String],
+    keep_old: bool,
+    words: bool,
+    given_pw: Option<Zeroizing<String>>,
+    given_env: Option<BTreeMap<String, Zeroizing<String>>>,
+) -> Result<()> {
     term::require_person("sealctl seal", None)?;
     volume::validate_name(name)?;
     if Backup::load(name).is_ok() {
@@ -288,8 +324,14 @@ pub fn seal_backup(
         },
         None => (PathBuf::new(), None),
     };
-    let env = backup::collect_env(repo, env_pairs)?;
-    let pw = util::read_hidden("Password of the restic repository: ")?;
+    let env = match given_env {
+        Some(e) => e,
+        None => backup::collect_env(repo, env_pairs)?,
+    };
+    let pw = match given_pw {
+        Some(p) => p,
+        None => util::read_hidden("Password of the restic repository: ")?,
+    };
     let old = Repo::with_password(repo, pw.clone(), env.clone());
     if !old.opens()? {
         return Err(fail(
@@ -472,4 +514,189 @@ pub fn seal_env(file: &Path, prefix: &str, delete: bool, force: bool) -> Result<
         );
     }
     Ok(())
+}
+
+/// `sealctl seal --from <hand-back list>`: takes over every object of a `handback.json` written
+/// by `unseal` (0.6.0 on the Ledger, or 0.7), each with its password read from where `unseal`
+/// put it. Volumes go first, so a backup can follow the volume of the same name.
+pub fn seal_from(file: &Path, skip: &[String], words: bool) -> Result<()> {
+    term::require_person("sealctl seal --from", None)?;
+    let text = std::fs::read_to_string(file)
+        .map_err(|_| fail(exit::NOT_FOUND, format!("Cannot read {}.", file.display())))?;
+    let list: handback::Handback = serde_json::from_str(&text).map_err(|_| {
+        fail(
+            exit::USAGE,
+            format!("{} is not a hand-back list.", file.display()),
+        )
+    })?;
+    if list.sealctl != 1 || list.kind != "handback" {
+        return Err(fail(
+            exit::USAGE,
+            format!("{} is not a hand-back list.", file.display()),
+        ));
+    }
+    let mut objects: Vec<&handback::Object> = list
+        .objects
+        .iter()
+        .filter(|o| !skip.iter().any(|s| s == &format!("{}/{}", o.kind, o.name)))
+        .filter(|o| matches!(o.kind.as_str(), "volume" | "backup" | "ssh" | "secret"))
+        .collect();
+    let rank = |k: &str| match k {
+        "volume" => 0,
+        "backup" => 1,
+        "ssh" => 2,
+        _ => 3,
+    };
+    objects.sort_by_key(|o| rank(&o.kind));
+    if objects.is_empty() {
+        return Err(fail(exit::NOT_FOUND, "Nothing to take over in that list."));
+    }
+    eprintln!(
+        "This takes over {} objects handed back by sealctl {} on {}:",
+        objects.len(),
+        list.from,
+        list.machine
+    );
+    for (i, o) in objects.iter().enumerate() {
+        let from = o
+            .password
+            .as_ref()
+            .or(o.value.as_ref())
+            .map(|l| l.describe())
+            .unwrap_or_else(|| "no password".into());
+        eprintln!("{:>2}  {:<8} {:<28} password from {from}", i + 1, o.kind, o.name);
+    }
+    eprintln!("Each one asks your phone (or uses your words with --words).");
+    if term::ask_line("Type seal to start: ")? != "seal" {
+        return Err(fail(exit::USAGE, "Not started. Nothing was changed."));
+    }
+    let mut stores = store::Stores::new(store::Config {
+        to: store::StoreKind::Folder,
+        secrets_to: store::StoreKind::Folder,
+        env_file: None,
+        op_vault: None,
+        bw_folder: None,
+        type_passwords: false,
+    });
+    stores.folder = file.parent().map(Path::to_path_buf);
+    let mut failed = Vec::new();
+    let total = objects.len();
+    for (i, o) in objects.iter().enumerate() {
+        let r = seal_one(&mut stores, o, words);
+        match r {
+            Ok(note) => eprintln!("[{}/{total}] {} {}: {note}", i + 1, o.kind, o.name),
+            Err(e) => {
+                eprintln!(
+                    "[{}/{total}] {} {}: {}",
+                    i + 1,
+                    o.kind,
+                    o.name,
+                    exit::message_of(&e)
+                );
+                failed.push(format!("{}/{}", o.kind, o.name));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        return Err(fail(
+            exit::PARTWAY,
+            format!(
+                "Not taken over: {}. Fix them and run again with --skip for the ones done, or seal them one by one.",
+                failed.join(", ")
+            ),
+        ));
+    }
+    eprintln!("Done. sealctl holds these objects now; the passwords in the list no longer open them.");
+    Ok(())
+}
+
+fn text_of(v: Zeroizing<Vec<u8>>) -> Zeroizing<String> {
+    Zeroizing::new(String::from_utf8_lossy(&v).into_owned())
+}
+
+fn seal_one(stores: &mut store::Stores, o: &handback::Object, words: bool) -> Result<String> {
+    let password = |stores: &mut store::Stores| -> Result<Zeroizing<String>> {
+        let loc = o
+            .password
+            .as_ref()
+            .ok_or_else(|| fail(exit::NOT_FOUND, "The list says nothing about its password."))?;
+        Ok(text_of(stores.read(loc)?))
+    };
+    match o.kind.as_str() {
+        "volume" => {
+            let target = match o.volume.as_deref() {
+                Some("apfs") | Some("apfs-volume") => o.uuid.clone(),
+                _ => o
+                    .path
+                    .as_deref()
+                    .map(|p| paths::expand(p).map(|x| x.display().to_string()))
+                    .transpose()?,
+            }
+            .ok_or_else(|| fail(exit::NOT_FOUND, "The list has no path or UUID for it."))?;
+            let pw = password(stores)?;
+            seal_volume_given(&o.name, &target, None, false, words, Some(pw))?;
+            Ok("sealed.".into())
+        }
+        "backup" => {
+            let url = o
+                .url
+                .clone()
+                .ok_or_else(|| fail(exit::NOT_FOUND, "The list has no repository URL."))?;
+            let pw = password(stores)?;
+            let mut env = BTreeMap::new();
+            for c in &o.credentials {
+                env.insert(c.var.clone(), text_of(stores.read(&c.location)?));
+            }
+            // a backup of a volume (0.6.0 names it by its volume) backs up that volume again
+            let from = Volume::load(&o.name).ok().map(|v| v.name);
+            let name = if Backup::load(&o.name).is_ok() {
+                format!("{}-backup", o.name)
+            } else {
+                o.name.clone()
+            };
+            seal_backup_given(
+                &name,
+                &url,
+                from.as_deref(),
+                &[],
+                false,
+                words,
+                Some(pw),
+                Some(env),
+            )?;
+            Ok(format!("sealed as backup {name}."))
+        }
+        "ssh" => {
+            let path = paths::expand(
+                o.path
+                    .as_deref()
+                    .ok_or_else(|| fail(exit::NOT_FOUND, "The list has no key file."))?,
+            )?;
+            let pass = match &o.password {
+                Some(l) => Some(stores.read(l)?),
+                None => None,
+            };
+            crate::ssh::import_given(&path, &o.name, pass.as_deref().map(|v| v.as_slice()))?;
+            Ok(format!(
+                "stored as ssh/{}. Once logins work, delete the original: rm {}",
+                o.name,
+                path.display()
+            ))
+        }
+        "secret" => {
+            let loc = o
+                .value
+                .as_ref()
+                .ok_or_else(|| fail(exit::NOT_FOUND, "The list says nothing about its value."))?;
+            let v = stores.read(loc)?;
+            crate::store::check_name(&o.name)?;
+            client::store_set(&o.name, &v, false, true)?;
+            let back = client::values(std::slice::from_ref(&o.name), Some(("secret", &o.name)))?;
+            if util::sha256_hex(&back[0].1) != util::sha256_hex(&v) {
+                return Err(fail(exit::ERROR, "It did not read back the same."));
+            }
+            Ok("stored, read back.".into())
+        }
+        other => Err(fail(exit::USAGE, format!("Unknown kind {other}."))),
+    }
 }

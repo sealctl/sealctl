@@ -55,10 +55,23 @@ fn rfc3339(t: std::time::SystemTime) -> String {
 impl Store {
     /// The store this machine uses (`config.toml` `store`).
     pub fn configured() -> Result<Store> {
-        let cfg = Config::load()?;
-        let dir = cfg
-            .store_path()?
-            .ok_or_else(|| fail(exit::NOT_FOUND, "No secret store yet. Run: sealctl pair"))?;
+        let mut cfg = Config::load()?;
+        let dir = match cfg.store_path()? {
+            Some(d) => d,
+            // a paired machine without a store (handed back with `unseal secrets`): a new one,
+            // whose key the next `open` asks for
+            None if crate::machine::is_paired() => {
+                let id = crate::util::new_uuid()?;
+                let root = paths::store_root()?;
+                paths::ensure_private_dir(&root)?;
+                let d = root.join(id);
+                paths::ensure_private_dir(&d)?;
+                cfg.store = Some(paths::tilde(&d));
+                cfg.save()?;
+                d
+            }
+            None => return Err(fail(exit::NOT_FOUND, "No secret store yet. Run: sealctl pair")),
+        };
         Store::at(&dir)
     }
 

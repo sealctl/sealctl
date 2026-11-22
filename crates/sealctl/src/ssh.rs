@@ -89,6 +89,11 @@ pub fn keygen(name: &str, comment: &str) -> Result<String> {
 
 /// `sealctl seal ssh <file>`: stores an existing OpenSSH private key as `ssh/<name>`.
 pub fn import(src: &Path, name: &str) -> Result<String> {
+    import_given(src, name, None)
+}
+
+/// [`import`] with the key's passphrase given (from a hand-back list).
+pub fn import_given(src: &Path, name: &str, given: Option<&[u8]>) -> Result<String> {
     check_name(name)?;
     let text = Zeroizing::new(
         std::fs::read_to_string(src)
@@ -101,8 +106,13 @@ pub fn import(src: &Path, name: &str) -> Result<String> {
         )
     })?;
     if key.is_encrypted() {
-        crate::term::require_person("reading a key passphrase", None)?;
-        let pass = crate::util::read_hidden(&format!("Passphrase of {}: ", src.display()))?;
+        let pass = match given {
+            Some(g) => Zeroizing::new(String::from_utf8_lossy(g).into_owned()),
+            None => {
+                crate::term::require_person("reading a key passphrase", None)?;
+                crate::util::read_hidden(&format!("Passphrase of {}: ", src.display()))?
+            }
+        };
         key = key
             .decrypt(pass.as_bytes())
             .map_err(|_| fail(exit::WRONG_KEY, "Wrong passphrase."))?;

@@ -128,8 +128,7 @@ enum Cmd {
         json: bool,
     },
     /// Take over something you already have: a volume, backup, SSH key, secret or .env file.
-    #[command(subcommand)]
-    Seal(SealCmd),
+    Seal(SealArgs),
     /// Hand objects back in plain, standard form (into ~/sealctl-unsealed-<date>).
     Unseal(UnsealArgs),
     /// Open an object with the 24 words alone (no phone, no relay).
@@ -418,6 +417,21 @@ enum ScheduleCmd {
     },
     /// Remove.
     Uninstall,
+}
+
+#[derive(clap::Args)]
+struct SealArgs {
+    #[command(subcommand)]
+    what: Option<SealCmd>,
+    /// Take over every object of a hand-back list (handback.json from `unseal`, 0.6.0 or 0.7).
+    #[arg(long)]
+    from: Option<PathBuf>,
+    /// With --from: leave one object out, <kind>/<name>.
+    #[arg(long)]
+    skip: Vec<String>,
+    /// With --from: keys from the 24 words instead of the phone.
+    #[arg(long)]
+    words: bool,
 }
 
 #[derive(Subcommand)]
@@ -721,7 +735,17 @@ fn run(cli: Cli) -> Result<i32> {
         }
         .map(|_| 0),
         Cmd::Inventory { json } => status::inventory(json).map(|_| 0),
-        Cmd::Seal(c) => match c {
+        Cmd::Seal(SealArgs {
+            from: Some(f),
+            skip,
+            words,
+            ..
+        }) => seal::seal_from(&f, &skip, words).map(|_| 0),
+        Cmd::Seal(SealArgs { what: None, .. }) => Err(exit::fail(
+            exit::USAGE,
+            "Say what to take over (see sealctl seal --help), or --from <hand-back list>.",
+        )),
+        Cmd::Seal(SealArgs { what: Some(c), .. }) => match c {
             SealCmd::Volume {
                 name,
                 target,
