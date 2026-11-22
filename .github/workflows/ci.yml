@@ -140,3 +140,8 @@ jobs:
       - name: Install cargo-vet 0.10.3
         run: cargo install cargo-vet --version 0.10.3 --locked
       - run: cargo vet --locked
+      # A Dependabot bump fails here until its audit or exemption is added to the pull request
+      # (supply-chain/); this prints what is missing and the smallest audits that would cover it.
+      - name: What to audit
+        if: failure()
+        run: cargo vet suggest
