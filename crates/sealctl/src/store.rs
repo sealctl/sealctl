@@ -267,8 +267,13 @@ impl Store {
                 _ => sealctl_core::ids::new_uuid().map_err(|e| anyhow::anyhow!("{e}"))?,
             },
         };
-        let header = sealed::new_header(mode, words, &file_id).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let bytes = sealed::seal(&header, key, &self.id, name, value).map_err(|e| match e {
+        // `seal` draws a new nonce for every write; the file id (and so the file key) is kept
+        let label = sealed::Label {
+            mode,
+            words: words.to_owned(),
+            file_id,
+        };
+        let bytes = sealed::seal(&label, key, &self.id, name, value).map_err(|e| match e {
             sealctl_core::CoreError::TooLarge => fail(exit::USAGE, "A secret is 1 to 65,536 bytes."),
             e => anyhow::anyhow!("sealing {name}: {e}"),
         })?;

@@ -179,12 +179,11 @@ fn a_store_on_retired_words_goes_through_old_words() {
     std::fs::create_dir_all(&dir).unwrap();
     let key = sealctl_core::ObjectKey::derive(&x.root(), sealctl_core::Purpose::Secrets, &id).unwrap();
     let value = canary();
-    let header = sealctl_core::sealed::new_header(
-        sealctl_core::sealed::Mode::StoreKey,
-        &x.fingerprint(),
-        &sealctl_core::ids::new_uuid().unwrap(),
-    )
-    .unwrap();
+    let header = sealctl_core::sealed::Label {
+        mode: sealctl_core::sealed::Mode::StoreKey,
+        words: x.fingerprint(),
+        file_id: sealctl_core::ids::new_uuid().unwrap(),
+    };
     std::fs::create_dir_all(dir.join("shop")).unwrap();
     std::fs::write(
         dir.join("shop/old.sealed"),

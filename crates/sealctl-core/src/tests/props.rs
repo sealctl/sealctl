@@ -129,10 +129,17 @@ proptest! {
         } else {
             (Mode::StoreKey, ObjectKey::derive(&root_b(), Purpose::Secrets, STORE).unwrap())
         };
-        let header = sealed::new_header(mode, &root_b().fingerprint(), FILE).unwrap();
-        let file = sealed::seal(&header, &key, STORE, &name, &value).unwrap();
-        prop_assert_eq!(sealed::Header::parse(&file).unwrap(), header);
-        prop_assert_eq!(sealed::open(&file, &key, STORE, &name).unwrap().to_vec(), value);
+        let label = sealed::Label { mode, words: root_b().fingerprint(), file_id: FILE.into() };
+        let file = sealed::seal(&label, &key, STORE, &name, &value).unwrap();
+        prop_assert_eq!(sealed::Header::parse(&file).unwrap().label(), label.clone());
+        prop_assert_eq!(sealed::open(&file, &key, STORE, &name).unwrap().to_vec(), value.clone());
+        // the same label and value again: a new nonce, so a different file
+        let again = sealed::seal(&label, &key, STORE, &name, &value).unwrap();
+        prop_assert_ne!(
+            sealed::Header::parse(&again).unwrap().nonce,
+            sealed::Header::parse(&file).unwrap().nonce
+        );
+        prop_assert_eq!(sealed::open(&again, &key, STORE, &name).unwrap().to_vec(), value);
     }
 
     #[test]

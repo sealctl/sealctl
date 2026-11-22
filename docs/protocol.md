@@ -210,7 +210,7 @@ sealed   = header ‖ AEAD-Seal(file key, nonce, aad, value)
 
 Rules for writers:
 
-- A new secret gets a new random file id. Replacing a value keeps the file id and writes a new nonce.
+- A new secret gets a new random file id. Replacing a value keeps the file id, and so the file key, and writes a new random nonce: every write draws its own nonce, never one taken from an earlier file or header. In sealctl-core, `sealed::seal` takes the mode, fingerprint and file id (`sealed::Label`) and draws the nonce itself; there is no way to pass one in outside the test vectors.
 - Renaming a secret re-encrypts it under the new name.
 - Write `<name>.sealed.tmp-<random>` in the same folder, `fsync`, then rename it over the old file. Files 0600, folders 0700.
 - The store's `.id` file is written last when a store is made, and replaced atomically when the words change.

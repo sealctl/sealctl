@@ -784,7 +784,11 @@ fn status_and_messages_that_are_refused() {
 fn sealed_files_that_are_refused() {
     use crate::sealed::{self, Mode};
     let key = ObjectKey::derive(&root_b(), Purpose::Secrets, STORE).unwrap();
-    let header = sealed::new_header(Mode::StoreKey, "qHWf", FILE).unwrap();
+    let header = sealed::Label {
+        mode: Mode::StoreKey,
+        words: "qHWf".into(),
+        file_id: FILE.into(),
+    };
     let file = sealed::seal(&header, &key, STORE, "a/b", b"v").unwrap();
     assert!(sealed::open(&file, &key, STORE, "a/b").is_ok());
     assert_eq!(

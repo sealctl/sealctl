@@ -108,15 +108,16 @@ fn sealed_files(v: &V1) {
             hex::encode(sealed::file_key(&key, FILE).as_slice()),
             v.s(&format!("B.file_key_{tag}"))
         );
-        let header = Header {
+        let label = sealed::Label {
             mode,
             words: root.fingerprint(),
             file_id: FILE.into(),
-            nonce: unhex(nonce).try_into().unwrap(),
         };
-        let file = sealed::seal(&header, &key, STORE, name, value).unwrap();
+        let nonce: [u8; 12] = unhex(nonce).try_into().unwrap();
+        let file = sealed::seal_with_nonce(&label, &nonce, &key, STORE, name, value).unwrap();
         assert_eq!(hex::encode(&file), v.s(&format!("B.sealed_{tag}")));
-        assert_eq!(Header::parse(&file).unwrap(), header);
+        let header = Header::parse(&file).unwrap();
+        assert_eq!((header.label(), header.nonce), (label.clone(), nonce));
         assert_eq!(sealed::open(&file, &key, STORE, name).unwrap().as_slice(), value);
     }
 }
