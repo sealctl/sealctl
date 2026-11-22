@@ -68,6 +68,7 @@ pub async fn send_for(
     wait: Duration,
 ) -> Result<Asked> {
     let mut moved_once = false;
+    let mut slowed = 0;
     loop {
         let id = new_request_id().map_err(|e| anyhow::anyhow!("{e}"))?;
         let request = seal_request(&paired.keys, &paired.phone, &id, body.clone())
@@ -88,6 +89,11 @@ pub async fn send_for(
             Ok(e) => e,
             Err(e) => match relay::refused(&e).cloned() {
                 Some(a) if a.status == 403 => WaitEnd::Error("forbidden".into()),
+                Some(a) if slowed < 3 && relay::backoff(&a).is_some() => {
+                    slowed += 1;
+                    relay::slow_down(relay::backoff(&a).unwrap_or(10)).await;
+                    continue;
+                }
                 Some(a) => return Err(relay::error_for(&a)),
                 None => return Err(e),
             },

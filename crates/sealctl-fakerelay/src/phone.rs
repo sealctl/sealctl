@@ -106,8 +106,8 @@ impl Phone {
         self.root.clone()
     }
 
-    /// A signed call.
-    pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value)> {
+    /// One signed call.
+    pub async fn call_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value)> {
         let bytes = body
             .map(|b| serde_json::to_vec(&b).expect("json"))
             .unwrap_or_default();
@@ -128,6 +128,21 @@ impl Phone {
         let status = r.status().as_u16();
         let v: Value = r.json().await.unwrap_or(Value::Null);
         Ok((status, v))
+    }
+
+    /// A signed call that waits out the relay's short-term limits (`429` with `scope`
+    /// `network` or `key`).
+    pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value)> {
+        for _ in 0..5 {
+            let (s, v) = self.call_once(method, path, body.clone()).await?;
+            if s == 429 && v["scope"].as_str().is_some_and(|x| x != "phone") {
+                let wait = v["retryAfter"].as_u64().unwrap_or(10).clamp(1, 60);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+            return Ok((s, v));
+        }
+        self.call_once(method, path, body).await
     }
 
     /// Pairs from the link the CLI printed (or the part after `#`).
@@ -191,6 +206,16 @@ impl Phone {
             .collect())
     }
 
+    /// How often to list pending requests: often on a loopback relay; on a live one slowly
+    /// enough for its per-key limit (120 calls a minute) with several phones on one network.
+    pub fn poll_interval(&self) -> Duration {
+        if self.relay.starts_with("http://127.0.0.1") || self.relay.starts_with("http://localhost") {
+            Duration::from_millis(150)
+        } else {
+            Duration::from_millis(1500)
+        }
+    }
+
     /// Waits for the next pending request not in `seen`.
     pub async fn next(&self, seen: &mut Vec<String>, timeout: Duration) -> Result<Incoming> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -204,7 +229,7 @@ impl Phone {
             if tokio::time::Instant::now() > deadline {
                 bail!("no request within {timeout:?}");
             }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(self.poll_interval()).await;
         }
     }
 

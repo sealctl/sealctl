@@ -94,6 +94,8 @@ struct Inner {
 pub struct App {
     inner: Arc<Mutex<Inner>>,
     opts: Arc<Mutex<Options>>,
+    /// The next N signed calls from machines answer `429` (scope `network`, retry after 1 s).
+    limited: Arc<std::sync::atomic::AtomicU32>,
 }
 
 fn now_ms() -> u64 {
@@ -128,6 +130,7 @@ impl FakeRelay {
         let app = App {
             inner: Arc::new(Mutex::new(Inner::default())),
             opts: Arc::new(Mutex::new(opts)),
+            limited: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let a2 = app.clone();
@@ -176,6 +179,11 @@ impl FakeRelay {
             p.codes.push((c.clone(), seats, 1));
         }
         code
+    }
+
+    /// The next `n` signed calls from machines answer `429` with scope `network`.
+    pub fn rate_limit(&self, n: u32) {
+        self.app.limited.store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Sets days used for a phone (for the ask).
@@ -326,6 +334,19 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     let Some(role) = role else {
         return err(403, "forbidden");
     };
+    if matches!(role, Role::Machine) {
+        let left = app.limited.load(std::sync::atomic::Ordering::SeqCst);
+        if left > 0 {
+            app.limited.store(left - 1, std::sync::atomic::Ordering::SeqCst);
+            let mut r = ok(
+                429,
+                json!({"error": "rate_limited", "retryAfter": 1, "scope": "network"}),
+            );
+            r.headers_mut()
+                .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+            return r;
+        }
+    }
     let is_phone = matches!(role, Role::Phone);
 
     match (m.clone(), rest.as_slice()) {

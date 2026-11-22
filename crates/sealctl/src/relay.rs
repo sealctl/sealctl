@@ -212,18 +212,26 @@ impl Relay {
             None => Vec::new(),
         };
         let mut last_err = String::new();
-        for (attempt, delay) in [0u64, 1, 2, 4].into_iter().enumerate() {
+        let mut slowed = 0;
+        let mut attempt = 0;
+        while attempt < 4 {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(delay)).await;
+                tokio::time::sleep(Duration::from_secs([0u64, 1, 2, 4][attempt])).await;
             }
             match self.once(keys, method, path, &bytes).await {
                 Ok(a) if a.status >= 500 && attempt < 3 => {
                     last_err = format!("{}", a.status);
+                }
+                // the relay's short-term limits (per network, per key): wait as it says
+                Ok(a) if slowed < 3 && backoff(&a).is_some() => {
+                    slowed += 1;
+                    slow_down(backoff(&a).unwrap_or(10)).await;
                     continue;
                 }
                 Ok(a) => return Ok(a),
                 Err(e) => last_err = e,
             }
+            attempt += 1;
         }
         Err(self.unreachable(last_err))
     }
@@ -373,6 +381,22 @@ impl Relay {
     }
 }
 
+/// Seconds to wait for a `429` of the relay's short-term limits (`scope` `network` or `key`,
+/// at most a minute); `None` for the daily limit or anything else.
+pub fn backoff(a: &Answer) -> Option<u64> {
+    if a.status != 429 || a.body["scope"].as_str().unwrap_or("phone") == "phone" {
+        return None;
+    }
+    let s = a.body["retryAfter"].as_u64().unwrap_or(10);
+    (s <= 60).then_some(s.max(1))
+}
+
+/// Waits out a short-term limit, saying so once per wait on stderr.
+pub async fn slow_down(secs: u64) {
+    eprintln!("sealctl: The relay asks to slow down; trying again in {secs} s.");
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+}
+
 /// A WebSocket upgrade the relay refused with an HTTP answer.
 #[derive(Debug)]
 pub struct Refused(pub Answer);
@@ -396,4 +420,36 @@ pub fn runtime() -> Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .context("starting the async runtime")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_term_limits_are_waited_out_the_daily_one_is_not() {
+        let a = |status: u16, body: Value| Answer { status, body };
+        assert_eq!(
+            backoff(&a(429, json!({"retryAfter": 10, "scope": "network"}))),
+            Some(10)
+        );
+        assert_eq!(
+            backoff(&a(429, json!({"retryAfter": 60, "scope": "key"}))),
+            Some(60)
+        );
+        assert_eq!(
+            backoff(&a(429, json!({"retryAfter": 3600, "scope": "phone"}))),
+            None
+        );
+        assert_eq!(
+            backoff(&a(429, json!({"retryAfter": 3600}))),
+            None,
+            "no scope: the daily limit"
+        );
+        assert_eq!(backoff(&a(503, json!({}))), None);
+        assert_eq!(
+            exit::code_of(&error_for(&a(429, json!({"scope": "phone"})))),
+            exit::LIMIT
+        );
+    }
 }

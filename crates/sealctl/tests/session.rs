@@ -281,3 +281,32 @@ fn recover_a_store_with_the_words() {
         "{screen}"
     );
 }
+
+#[test]
+fn the_cli_waits_out_the_relays_short_term_limit() {
+    let mut env = Env::fake(Options::default());
+    env.pair();
+    // the wait socket upgrade and the licence call meet a 429 (scope network), then go through
+    env.fake.as_ref().unwrap().rate_limit(2);
+    // in-process, so that the note is on this command's stderr (a daemon logs it)
+    let ((code, out, err), log) = env.with_phone(Answer::Session, || {
+        let o = env
+            .cmd()
+            .env("SEALCTL_NO_DAEMON", "1")
+            .args(["open"])
+            .output()
+            .unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    });
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("Open · "), "{out}");
+    assert!(
+        err.contains("sealctl: The relay asks to slow down; trying again in 1 s."),
+        "{err}"
+    );
+    assert_eq!(log, vec!["Open"]);
+}
