@@ -6,7 +6,7 @@ commits, opens encrypted volumes and runs encrypted backups with restic. Every k
 from **24 words** held by the sealctl phone app; the phone hands keys to a paired machine when
 you approve, and **the 24 words alone open every object**, with no phone, relay or company.
 
-> **0.7 is in development** and not released yet. It needs the sealctl phone app.
+> **In development** and not released yet. It needs the sealctl phone app.
 
 ## How it works
 
