@@ -15,9 +15,15 @@ machine when the phone approves. Wire formats and keys: [protocol.md](protocol.m
   ids, sizes and timing, never a key or a secret name. A recorded reply cannot be opened later:
   the one-time key lives only in memory until the reply arrives.
 - **AI agents reading secrets by mistake.** Agents get values only inside the environment of a
-  program run with `sealctl run`, whose output is masked; `secret get`, the credential
-  helpers, `seal`, `unseal`, `recover` and `buy` refuse inside agents; hooks and deny rules
-  stop the common ways of printing secrets. See [ai-agents.md](ai-agents.md).
+  program run with `sealctl run`, whose output is masked, or through git and the AWS CLI using
+  the credential helpers. What the CLI enforces on its own, with no setup: `secret get`,
+  `seal`, `unseal`, `recover`, `buy` and `unpair` refuse inside an agent; the credential helpers
+  (`git credential`, `aws credentials`) answer inside an agent only when git or the AWS CLI
+  started them, judged by the executables of their parent processes, so an agent calling one
+  directly gets exit 8 whether its stdout is a pipe or a terminal. What needs the hooks and
+  deny rules (`sealctl ai install`): blocking `cat .env`, environment dumps, `echo $KEY`,
+  clipboard reads, `git credential fill`, and changes to the agent variables. See
+  [ai-agents.md](ai-agents.md).
 - **A reflexive tap on a sensitive request.** Handing objects back (`unseal`) and taking over
   existing ones (`seal`) are level 2 (biometrics on the phone, proximity or the number shown at
   the terminal); `unseal --all` is level 3: the number match, a signed plan the CLI cannot leave,
@@ -33,7 +39,13 @@ machine when the phone approves. Wire formats and keys: [protocol.md](protocol.m
   plain to anything running as you. Lock (`sealctl lock`, or from the phone) when you step
   away; the idle allowance does it for you.
 - **Malware that pretends to be you, not an agent.** Agent detection uses the environment
-  variables agents set; it guards against mistakes, not against code that hides them.
+  variables agents set and, for the credential helpers, the agent's program among the parent
+  processes; the helpers' check of who started them reads executable names. These guard
+  against mistakes and a curious agent, not against code running as you that sets out to get
+  around them: it can drop the variables, run a copy of a shell named `git`, or make git
+  itself print a token (its trace output with redaction turned off, a credential helper of its
+  own). Hooks deny the known ways when installed, and every value given out is a use the phone
+  logs.
 - **Programs run with `sealctl run`.** They get the values they are given, by design.
 - **A malicious relay holding back or delaying messages.** It cannot forge a reply or release a
   delayed one early (the machine checks the signed not-before time), but it can drop notes and

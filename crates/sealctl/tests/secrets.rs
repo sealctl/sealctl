@@ -297,3 +297,146 @@ fn seal_env_delete_never_drops_a_variable() {
     assert!(err.contains("is kept: EMPTY_KEY empty and not stored"), "{err}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
 }
+
+/// The credential helpers inside an agent (SPEC 10.6, 11): git and the AWS CLI get the
+/// credential; the agent calling the helper itself, from its shell or through `sh -c`, is refused
+/// with exit 8 and no value, whether stdout is a pipe or not.
+#[test]
+fn credential_helpers_answer_only_git_and_aws_inside_agents() {
+    let mut env = Env::new();
+    env.pair();
+    let token = canary();
+    let aws_secret = canary();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run_in(&["secret", "set", "git/example.test"], token.as_bytes())
+    });
+    assert_eq!(code, 0, "{err}");
+    let aws_json = format!(r#"{{"aws_access_key_id":"AKIDEXAMPLE","aws_secret_access_key":"{aws_secret}"}}"#);
+    let (code, _, err) = env.run_in(&["secret", "set", "aws/default"], aws_json.as_bytes());
+    assert_eq!(code, 0, "{err}");
+
+    let sealctl = env!("CARGO_BIN_EXE_sealctl");
+    // `prog args` with this HOME's environment (as `env.cmd()` sets it), inside an agent
+    let in_agent = |prog: &str, args: &[&str]| {
+        let mut c2 = std::process::Command::new(prog);
+        c2.env_clear();
+        for (k, v) in env.cmd().get_envs() {
+            if let Some(v) = v {
+                c2.env(k, v);
+            }
+        }
+        c2.env("SEALCTL_AGENT", "")
+            .env("CLAUDECODE", "1")
+            .env("SEALCTL_BIN", sealctl);
+        c2.current_dir(env.h()).args(args);
+        let mut ch = c2
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        let _ = ch
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=example.test\n\n");
+        let o = ch.wait_with_output().unwrap();
+        (
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    };
+
+    // directly, as an agent's tool call would (stdout a pipe)
+    for args in [
+        &[sealctl, "git", "credential", "get"][..],
+        &[sealctl, "aws", "credentials", "--profile", "default"][..],
+    ] {
+        let (code, out, err) = in_agent(args[0], &args[1..]);
+        assert_eq!(code, 8, "{args:?}: {out} {err}");
+        assert!(out.is_empty(), "{args:?}: {out}");
+        assert!(err.contains("Not inside an AI agent"), "{err}");
+    }
+    // through a shell
+    let (code, out, err) = in_agent("/bin/sh", &["-c", "\"$SEALCTL_BIN\" git credential get; echo"]);
+    assert!(!out.contains(&token), "{code} {out} {err}");
+    assert!(err.contains("Not inside an AI agent"), "{err}");
+
+    // git and the AWS CLI themselves: stand-ins whose executables are named git-remote-https
+    // and aws (copies of this test binary, see `stand_in_spawner`) start the helper from a
+    // script, as git does
+    let bin = env.h().join("toolbin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let me = std::env::current_exe().unwrap();
+    for name in ["git-remote-https", "aws"] {
+        std::fs::copy(&me, bin.join(name)).unwrap();
+    }
+    for (tool, line, want) in [
+        (
+            "git-remote-https",
+            "printf 'protocol=https\\nhost=example.test\\n\\n' | \"$SEALCTL_BIN\" git credential get",
+            format!("username=x-access-token\npassword={token}\n"),
+        ),
+        (
+            "aws",
+            "\"$SEALCTL_BIN\" aws credentials --profile default",
+            aws_secret.clone(),
+        ),
+    ] {
+        let script = env.h().join(format!("{tool}.sh"));
+        std::fs::write(&script, format!("{line}\nexit $?\n")).unwrap();
+        let out_file = env.h().join(format!("{tool}.out"));
+        let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+            let mut c = std::process::Command::new(bin.join(tool));
+            c.env_clear();
+            for (k, v) in env.cmd().get_envs() {
+                if let Some(v) = v {
+                    c.env(k, v);
+                }
+            }
+            let o = c
+                .env("SEALCTL_AGENT", "")
+                .env("CLAUDECODE", "1")
+                .env("SEALCTL_BIN", sealctl)
+                .env("SEALCTL_TEST_SPAWN", &script)
+                .env("SEALCTL_TEST_SPAWN_OUT", &out_file)
+                .args(["stand_in_spawner", "--exact", "--test-threads=1", "-q"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            (
+                o.status.code().unwrap_or(-1),
+                String::new(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        });
+        assert_eq!(code, 0, "{tool}: {err}");
+        let out = std::fs::read_to_string(&out_file).unwrap();
+        assert!(out.contains(&want), "{tool}: {out}");
+    }
+
+    // outside an agent nothing changes: a script gets the credential from a pipe
+    let (code, out, err) = env.run(&["aws", "credentials", "--profile", "default"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&aws_secret));
+}
+
+/// Not a test on its own: with `SEALCTL_TEST_SPAWN` set, this process (a copy of the test binary
+/// named like git or the AWS CLI) runs that script as its child, its stdout to
+/// `SEALCTL_TEST_SPAWN_OUT`, and exits with the child's code.
+#[test]
+fn stand_in_spawner() {
+    let Some(script) = std::env::var_os("SEALCTL_TEST_SPAWN") else {
+        return;
+    };
+    let out = std::fs::File::create(std::env::var_os("SEALCTL_TEST_SPAWN_OUT").unwrap()).unwrap();
+    let st = std::process::Command::new("/bin/sh")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .status()
+        .unwrap();
+    std::process::exit(st.code().unwrap_or(1));
+}

@@ -457,6 +457,8 @@ pub fn aws_credentials(profile: &str) -> Result<()> {
             "This prints keys for the AWS CLI, not for a terminal.",
         ));
     }
+    // inside an agent only the AWS CLI itself may ask (SPEC 10.6)
+    crate::caller::check_helper(crate::caller::Tool::Aws, "sealctl aws credentials")?;
     let name = format!("aws/{profile}");
     let vals = client::values(std::slice::from_ref(&name), Some(("secret", &name)))?;
     let v: serde_json::Value = serde_json::from_slice(&vals[0].1)

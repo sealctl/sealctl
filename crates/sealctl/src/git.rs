@@ -167,6 +167,9 @@ pub fn credential(action: &str) -> Result<()> {
     if action != "get" {
         return Ok(());
     }
+    // inside an agent only git itself may ask (SPEC 10.6): not the agent's shell, not
+    // `git credential fill` run by the agent
+    crate::caller::check_helper(crate::caller::Tool::Git, "sealctl git credential")?;
     if crate::guard::ai_agent().is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         return Err(exit::agent_refusal("sealctl git credential"));
     }

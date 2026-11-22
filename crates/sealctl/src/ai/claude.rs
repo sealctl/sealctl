@@ -26,6 +26,7 @@ pub const DENY: &[&str] = &[
     "Bash(sealctl recover *)",
     "Bash(sealctl aws credentials *)",
     "Bash(sealctl git credential *)",
+    "Bash(git credential fill *)",
     "Bash(sealctl buy *)",
     "Bash(sealctl unpair *)",
     "Bash(sealctl seal *)",

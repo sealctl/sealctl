@@ -26,6 +26,11 @@ const AGENT_ENV: &[(&str, &str)] = &[
     ("AI_AGENT", "an AI agent"),
 ];
 
+/// The variables that mark a command as run by an agent (`SEALCTL_AGENT` first).
+pub fn agent_variables() -> impl Iterator<Item = &'static str> {
+    std::iter::once("SEALCTL_AGENT").chain(AGENT_ENV.iter().map(|(v, _)| *v))
+}
+
 /// The AI agent running this process, if one is recognisable. `SEALCTL_AGENT=1` forces it
 /// (for agents we don't recognise yet); `SEALCTL_AGENT=0` disables detection.
 pub fn ai_agent() -> Option<&'static str> {

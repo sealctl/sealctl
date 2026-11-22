@@ -286,9 +286,29 @@ fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
     while i < words.len() && (is_assignment(&words[i]) || is_keyword(&words[i])) {
         i += 1;
     }
+    let names_switch = |w: &str| {
+        let name = w.split_once('=').map_or(w, |(k, _)| k);
+        crate::guard::agent_variables().any(|v| v == name)
+    };
+    // the agent variables are how sealctl knows an agent runs a command; changing them is the
+    // user's call, not the agent's (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`, `env -u …`)
+    const SWITCH: &str = "the agent variables (SEALCTL_AGENT, CLAUDECODE, …) tell sealctl an agent runs this; only the user changes them.";
+    if words[..i].iter().any(|w| names_switch(w)) {
+        return Some(SWITCH);
+    }
     let prog = words.get(i)?;
     let base = prog.rsplit('/').next().unwrap_or(prog);
     let rest = &words[i + 1..];
+    if matches!(
+        base,
+        "export" | "unset" | "env" | "declare" | "typeset" | "local" | "readonly" | "unsetenv" | "setenv"
+    ) && rest.iter().any(|w| names_switch(w))
+    {
+        return Some(SWITCH);
+    }
+    if base == "git" {
+        return git_credential(rest);
+    }
     // options of a wrapper that take a value
     let wrapper_value_opts: &[&str] = match base {
         "env" => &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
@@ -329,6 +349,34 @@ fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
         j += 1;
     }
     sealctl_argv(rest.get(j..)?, depth + 1)
+}
+
+/// `git credential fill` and `git credential-<helper> get` print the stored password or token.
+fn git_credential(args: &[String]) -> Option<&'static str> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() && positional.len() < 2 {
+        let w = args[i].as_str();
+        i += 1;
+        if positional.is_empty()
+            && matches!(
+                w,
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "--exec-path"
+            )
+        {
+            i += 1;
+        } else if !w.starts_with('-') {
+            positional.push(w);
+        }
+    }
+    let prints = match positional.as_slice() {
+        ["credential", "fill", ..] => true,
+        [helper, "get", ..] => helper.starts_with("credential-"),
+        _ => false,
+    };
+    prints.then_some(
+        "`git credential fill` prints the stored password or token. Run `git push` or `git fetch`, which use it without printing it.",
+    )
 }
 
 fn is_keyword(w: &str) -> bool {
@@ -609,6 +657,36 @@ mod tests {
             "sealctl ssh import ~/.ssh/id_ed25519",
         ] {
             assert!(bash(c).is_some(), "should deny: {c}");
+        }
+    }
+
+    #[test]
+    fn git_credential_fill_and_the_agent_switch() {
+        for c in [
+            "printf 'host=github.com\\n' | git credential fill",
+            "echo host=github.com | git -c credential.helper= credential fill",
+            "git -C /repo credential fill < req",
+            "git credential-osxkeychain get",
+            "git credential-store get",
+            "SEALCTL_AGENT=0 sealctl secret ls",
+            "CLAUDECODE= sealctl run -- env",
+            "env -u CLAUDECODE sealctl git credential get",
+            "unset CLAUDECODE; git push",
+            "export SEALCTL_AGENT=0",
+            "env SEALCTL_AGENT=0 aws s3 ls",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c}");
+        }
+        for c in [
+            "git push origin main",
+            "git credential approve < x",
+            "git log --grep credential",
+            "git config --get credential.helper",
+            "grep -rn SEALCTL_AGENT src/",
+            "echo $CLAUDECODE",
+            "export PATH=$PATH:/x",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c}: {:?}", bash(c));
         }
     }
 

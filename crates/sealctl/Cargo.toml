@@ -45,6 +45,8 @@ nix = { version = "0.31", default-features = false, features = ["fs", "user", "r
 keyring = { version = "3", features = ["apple-native", "async-secret-service", "tokio", "crypto-rust"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# proc_pidinfo, proc_pidpath and KERN_PROCARGS2: who started a credential helper
+libc = "0.2"
 # Keychain items with a readable label (keyring can't set one)
 security-framework = "3"
 core-foundation = "0.10"

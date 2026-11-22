@@ -8,6 +8,7 @@
 pub mod ai;
 pub mod approve;
 pub mod backup;
+pub mod caller;
 pub mod cli;
 pub mod clock;
 pub mod config;

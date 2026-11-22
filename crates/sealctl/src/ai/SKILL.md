@@ -69,6 +69,7 @@ sealctl status             # session, volumes, this machine — no secrets
 
 `sealctl secret get`, `sealctl recover`, `sealctl seal`, `sealctl unseal`, `sealctl unpair`,
 the credential helpers (`sealctl git credential`, `sealctl aws credentials`), `printenv`/`env`
-dumps, `echo $SOME_KEY`, `cat .env`, `pbpaste`. sealctl refuses these inside an AI agent; if
-the user needs a value themselves, they run `sealctl secret get <name> --clip` in their own
-terminal.
+dumps, `echo $SOME_KEY`, `cat .env`, `pbpaste`, `git credential fill`. sealctl itself refuses
+the sealctl ones inside an AI agent (the credential helpers answer only git and the AWS CLI
+themselves, so `git push` and `aws …` work); the installed hooks deny the others. If the user
+needs a value themselves, they run `sealctl secret get <name> --clip` in their own terminal.

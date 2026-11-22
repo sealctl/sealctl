@@ -553,10 +553,10 @@ Finds keys and moves them into the store, leaving references behind.
 | `sealctl ssh setup` | Prints the `~/.ssh/config` lines (`Host *` / `IdentityAgent <socket>`) and checks the daemon service |
 | `sealctl git setup [--local] [--key <n>] [--undo]` | Commit signing with `ssh/<n>` through the SSH agent (`gpg.format ssh`, wrapper as `gpg.ssh.program`) |
 | `sealctl git credentials <host> [--undo]` | Sets `credential.https://<host>.helper` to `<sealctl path> git credential`; the token is the secret `git/<host>` |
-| `sealctl git credential get` (hidden) | Git credential helper protocol: reads `host=` from stdin, prints `username=<stored user or x-access-token>` and `password=<token>`; ignores `store` and `erase` |
-| `sealctl aws credentials --profile <p>` (hidden) | `credential_process` output (`Version: 1` JSON) from `aws/<p>`; refuses when stdout is a terminal (exit 8) |
+| `sealctl git credential get` (hidden) | Git credential helper protocol: reads `host=` from stdin, prints `username=<stored user or x-access-token>` and `password=<token>`; ignores `store` and `erase`; inside an agent only when git started it (exit 8 otherwise) |
+| `sealctl aws credentials --profile <p>` (hidden) | `credential_process` output (`Version: 1` JSON) from `aws/<p>`; refuses when stdout is a terminal (exit 8), and inside an agent unless the AWS CLI started it (exit 8) |
 
-The helpers print values by design, to the program that called them. Agent hooks deny an agent calling them directly (section 11). An agent that runs `git push` or `aws` still gets the program to use the key, and that use is logged.
+The helpers print values by design, to the program that called them. Inside an agent (its variables, or a known agent program among the parent processes) a helper answers only when the tool itself started it, judged by the executables of its parent processes, never `argv[0]`: for git, a `git` or `git-*` program (`git-remote-https`), with at most one `sh -c` in between; a git that only relays the answer (`git credential fill`, or any git whose arguments mention `credential`) counts only if git started it in turn, as git-lfs does. For AWS, the `aws` executable, or a Python interpreter running a script named `aws` (CLI v1). Anything else — the agent's shell, `sh -c`, `git credential fill` run by the agent, a Python program using an SDK — exits 8 whatever stdout is. `SEALCTL_AGENT=0` turns this off with the rest of agent detection. Agent hooks also deny an agent calling the helpers or `git credential fill` directly (section 11). An agent that runs `git push` or `aws` still gets the program to use the key, and that use is logged. The check is on the process tree, not a boundary against code running as the user (threat model).
 
 ### 10.7 Volumes and backups
 
@@ -594,8 +594,11 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 - **Claude Code hooks** in `~/.claude/settings.json` (events `UserPromptSubmit`, `PreToolUse` for `Bash|Write|Edit|MultiEdit|Read|Grep|NotebookEdit`, `SessionStart`), command `<stable sealctl path> hook claude`, timeout 15 s.
 - **Denials** (all agents with hooks, and Claude Code `permissions.deny`):
   - reading anything under the store folder, `*.sealed`, `machine.json`, `~/.local/state/sealctl/`;
-  - `sealctl secret get`, `sealctl recover`, `sealctl aws credentials`, `sealctl git credential`, `sealctl ssh import` of a key file path inside the repository, `sealctl buy`, `sealctl unpair`, `sealctl seal`, `sealctl unseal`;
-  - environment dumps, `cat .env`, `printenv VAR`, clipboard reads, credential files.
+  - `sealctl secret get`, `sealctl recover`, `sealctl aws credentials`, `sealctl git credential`, the `seal` aliases (`sealctl secret import-env`, `sealctl volume import`, `sealctl ssh import`), `sealctl buy`, `sealctl unpair`, `sealctl seal`, `sealctl unseal`;
+  - `git credential fill` and `git credential-<helper> get`, which print a stored token;
+  - setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`, `env -u …`);
+  - environment dumps, `cat .env`, `printenv VAR`, clipboard reads, credential files;
+  - sealctl commands are matched by their subcommand (the first word after sealctl's global options, through `env`, `command`, `sudo`, `xargs`, `sh -c`, `eval`, `$(…)` and any path to the binary), never by words in their arguments: `sealctl run -e K=shop/buy -- …` is allowed.
 - **SessionStart context**: one line, `sealctl: secrets are available by name through sealctl run (names: …). Values are never shown.` No session state, no licence.
 - **What the agent sees**: names, `****`, `Waiting for your phone`, exit codes and the error texts of 5.5. Never values, never the ask.
 - **What the developer sees**: the phone card with agent, repository, command, `user@host` and key names; the usage log on the phone; `sealctl status`.
@@ -1171,7 +1174,7 @@ into its section.
 ### 28.1 Rules every helper follows
 
 - **Stored as secrets.** Each credential is a store secret under the tool's prefix (`kube/`, `tf/`, `docker/`, `gcloud/`, `cargo/`), its value a small JSON object. `secret ls`, inventory, backup of the store, `recover`, `migrate` and change of words treat them like any secret.
-- **Given only to the calling program.** A helper is a hidden subcommand. It prints the credential on stdout, in the tool's own format, to the program that ran it. It refuses when stdout is a terminal (exit 8) and inside an agent (section 11): the agent hooks deny calling it directly, as for `sealctl aws credentials`. An agent that runs `kubectl` or `terraform` gets the tool to use the credential, under the agent rules of section 9, and the use is logged.
+- **Given only to the calling program.** A helper is a hidden subcommand. It prints the credential on stdout, in the tool's own format, to the program that ran it. It refuses when stdout is a terminal (exit 8) and inside an agent unless the tool itself started it (exit 8, the parent-process check of 10.6); the agent hooks also deny calling it directly, as for `sealctl aws credentials`. An agent that runs `kubectl` or `terraform` gets the tool to use the credential, under the agent rules of section 9, and the use is logged.
 - **Approved as a secret use.** A helper call is a use of that secret: inside an Open session it needs nothing more; when Locked it opens the session; an own-approval secret (`--own-approval`, mode 2) asks every time. `sealctl <tool> protect <target> --every-use` and `--session` switch a credential between the two.
 - **The phone sees the tool and the target.** The request item's `object` carries `kind` (`kube`, `terraform`, `docker`, `gcloud`, `cargo`) and `target`: the cluster server and context, the Terraform host, the registry host, the project. The approval card shows "kubectl · prod-eu (api.prod.example.com)". The relay is unchanged; the apps need the new kinds (app 0.2).
 - **Nothing written back to disk.** Helpers keep no cache. Where the tool's protocol has an expiry, the helper sets a short one, so the tool asks again rather than keeping a credential for long.

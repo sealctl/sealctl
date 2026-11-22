@@ -2651,6 +2651,7 @@ dependencies = [
  "hex",
  "jiff",
  "keyring",
+ "libc",
  "log",
  "nix 0.31.4",
  "qrcode",
