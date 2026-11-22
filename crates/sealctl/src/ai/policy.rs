@@ -527,6 +527,20 @@ pub fn read(path: &str) -> Option<String> {
     }
 }
 
+/// A search with the agent's file tool in `path`, limited to the files `glob` names (Claude's
+/// `glob`, Gemini's `include`): denied when the glob itself picks files that `read` keeps out
+/// (`.env*`, `**/.env.local`, `{.env,.env.prod}`, `*.pem`).
+pub fn search(path: &str, glob: &str) -> Option<String> {
+    read(path).or_else(|| {
+        let last = glob.rsplit('/').next().unwrap_or("");
+        last.trim_matches(|c| c == '{' || c == '}')
+            .split(',')
+            .map(|alt| alt.trim().trim_end_matches('*'))
+            .filter(|alt| !alt.is_empty())
+            .find_map(read)
+    })
+}
+
 /// One line of context for a new session: that sealctl exists, and which secrets (names only).
 pub fn session_context() -> String {
     let names: Vec<String> = crate::store::Store::configured()
@@ -734,6 +748,12 @@ mod tests {
         assert!(read("/home/u/.aws/credentials").is_some());
         assert!(read("/home/u/.npmrc").is_some());
         assert!(read("/p/app/credentials").is_none());
+        for g in [".env*", "**/.env", ".env.*", "{.env,.env.local}", "*.pem"] {
+            assert!(search("/p", g).is_some(), "should deny: {g}");
+        }
+        for g in ["", "*.rs", "**/*.{ts,tsx}", ".env.example", "src/**"] {
+            assert!(search("/p", g).is_none(), "should allow: {g}");
+        }
         assert!(write(
             "/p/config.ts",
             "const key = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123'"

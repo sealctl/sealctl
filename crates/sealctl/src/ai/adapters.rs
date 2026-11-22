@@ -80,7 +80,8 @@ fn tool_verdict(tool: &str, input: &Value, cwd: Option<&str>) -> Option<String> 
         "bash" | "shell" | "exec_command" | "run_shell_command" | "powershell" | "run_command" => {
             policy::bash_in(&command_of(input), cwd)
         }
-        "read" | "read_file" | "view" | "grep" | "glob" | "notebookread" => policy::read(path),
+        "read" | "read_file" | "view" | "glob" | "notebookread" => policy::read(path),
+        "grep" => policy::search(path, first_str(input, &["glob", "include"])),
         "write"
         | "edit"
         | "create"
@@ -245,6 +246,12 @@ mod tests {
         let v = json!({"hook_event_name":"PreToolUse","tool_name":"Grep",
             "tool_input":{"pattern":"KEY","path":"/p/.env"}});
         assert!(handle("claude", &v).is_some(), "Grep on .env");
+        let v = json!({"hook_event_name":"PreToolUse","tool_name":"Grep",
+            "tool_input":{"pattern":"KEY","path":"/p","glob":".env*","output_mode":"content"}});
+        assert!(handle("claude", &v).is_some(), "Grep limited to .env files");
+        let v = json!({"hook_event_name":"PreToolUse","tool_name":"Grep",
+            "tool_input":{"pattern":"KEY","path":"/p","glob":"*.rs"}});
+        assert!(handle("claude", &v).is_none(), "Grep in source files");
     }
 
     #[test]
