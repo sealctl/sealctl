@@ -134,7 +134,10 @@ pub fn load() -> Result<Paired> {
 pub fn load_for(relay_flag: Option<&str>) -> Result<Paired> {
     let p = load()?;
     if let Some(r) = crate::config::requested_relay(relay_flag)? {
-        if r != p.file.relay {
+        // compared in normalized form: a pairing recorded before normalization may differ
+        // in case or in a default port only
+        let recorded = crate::config::validate_origin(&p.file.relay).unwrap_or_else(|_| p.file.relay.clone());
+        if r != recorded {
             return Err(fail(
                 exit::USAGE,
                 format!(

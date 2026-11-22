@@ -46,25 +46,44 @@ impl Config {
     }
 }
 
-/// Checks a relay origin: `https://` only, except `http://127.0.0.1:<port>` and
-/// `http://localhost:<port>` for tests. Returns it without a trailing slash.
+/// Checks a relay origin: `https://host[:port]` only, except `http://127.0.0.1:<port>`,
+/// `http://localhost:<port>` and `http://[::1]:<port>` for tests. No user name or password,
+/// no path other than one trailing `/`, no query and no fragment: API paths are appended to the
+/// origin, and any of these would change where signed requests go. Returns the origin as the
+/// URL parser normalizes it (lower-case host, default port left out), without a trailing slash.
 pub fn validate_origin(text: &str) -> Result<String> {
-    let t = text.trim().trim_end_matches('/');
-    let ok = if let Some(rest) = t.strip_prefix("https://") {
-        !rest.is_empty() && !rest.contains('/') && !rest.contains('@')
-    } else if let Some(rest) = t.strip_prefix("http://") {
-        let host = rest.rsplit_once(':').map_or(rest, |(h, _)| h);
-        matches!(host, "127.0.0.1" | "localhost" | "[::1]") && !rest.contains('/')
-    } else {
-        false
-    };
-    if !ok {
-        return Err(fail(
+    let t = text.trim();
+    let refuse = |why: &str| {
+        fail(
             exit::USAGE,
-            format!("{t} is not a relay origin: https:// only (http:// only to localhost)."),
-        ));
+            format!("{t} is not a relay origin: {why}. Use https://host (http:// only to localhost)."),
+        )
+    };
+    // the URL parser drops tabs and line breaks inside a URL; refuse them instead
+    if t.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(refuse("it contains spaces or control characters"));
     }
-    Ok(t.to_string())
+    let url = reqwest::Url::parse(t).map_err(|_| refuse("not a URL"))?;
+    let host = url.host_str().unwrap_or_default();
+    match url.scheme() {
+        "https" if !host.is_empty() => {}
+        "http" if matches!(host, "127.0.0.1" | "localhost" | "[::1]") => {}
+        "http" => return Err(refuse("http:// is only for localhost")),
+        _ => return Err(refuse("https:// only")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refuse("it has a user name or password"));
+    }
+    if url.path() != "/" || t.ends_with("//") {
+        return Err(refuse("it has a path"));
+    }
+    if url.query().is_some() {
+        return Err(refuse("it has a query string"));
+    }
+    if url.fragment().is_some() {
+        return Err(refuse("it has a fragment"));
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 /// The relay asked for on the command line or in the environment, if any.
@@ -110,6 +129,45 @@ mod tests {
         assert!(validate_origin("http://relay.example.com").is_err());
         assert!(validate_origin("https://relay.example.com/path").is_err());
         assert!(validate_origin("ftp://x").is_err());
+        // normalized: one trailing slash, case, default port
+        for (given, want) in [
+            ("https://relay.example.test", "https://relay.example.test"),
+            ("  https://relay.example.test/  ", "https://relay.example.test"),
+            ("https://Relay.Example.TEST:443/", "https://relay.example.test"),
+            (
+                "https://relay.example.test:8443",
+                "https://relay.example.test:8443",
+            ),
+            ("http://[::1]:8787/", "http://[::1]:8787"),
+            ("http://localhost:8787", "http://localhost:8787"),
+        ] {
+            assert_eq!(validate_origin(given).unwrap(), want, "{given}");
+        }
+        // not origins: a path, query, fragment, user info, or anything the parser would rewrite
+        for bad in [
+            "https://relay.example.test/v1",
+            "https://relay.example.test/v1/",
+            "https://relay.example.test//",
+            "https://relay.example.test?x=1",
+            "https://relay.example.test/?x=1",
+            "https://relay.example.test?",
+            "https://relay.example.test#fragment",
+            "https://relay.example.test/#",
+            "https://user@relay.example.test",
+            "https://user:pw@relay.example.test",
+            "https://:pw@relay.example.test",
+            "http://localhost:8787/api",
+            "http://127.0.0.1:8787?x",
+            "http://localhost.example.test:8787",
+            "https://relay.exa\tmple.test",
+            "https://relay.exa\nmple.test",
+            "https://relay.example.test\\path",
+            "https://",
+            "relay.example.test",
+            "",
+        ] {
+            assert!(validate_origin(bad).is_err(), "{bad:?}");
+        }
         assert_eq!(host_of("https://relay.sealctl.com"), "relay.sealctl.com");
     }
 }

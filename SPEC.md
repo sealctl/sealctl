@@ -189,7 +189,7 @@ store = "~/.local/share/sealctl/store/<store-id>"
 
 | Variable | Effect |
 | --- | --- |
-| `SEALCTL_RELAY` (or the global flag `--relay <origin>`) | Relay origin, e.g. `https://relay-staging.sealctl.com` or a fake relay. `https://` only, except `http://127.0.0.1:<port>` and `http://localhost:<port>` for tests. Pairing records the relay; a paired machine refuses a different `SEALCTL_RELAY` with exit 2 |
+| `SEALCTL_RELAY` (or the global flag `--relay <origin>`) | Relay origin, e.g. `https://relay-staging.sealctl.com` or a fake relay. `https://` only, except `http://127.0.0.1:<port>`, `http://localhost:<port>` and `http://[::1]:<port>` for tests. An origin only: a user name, password, path (other than one trailing `/`, which is dropped), query or fragment is refused with exit 2, and the host is lower-cased. Pairing records the relay; a paired machine refuses a different `SEALCTL_RELAY` with exit 2 |
 | `SEALCTL_AGENT=1` | Treat this process as inside an AI agent |
 | `SEALCTL_NO_MASK=1` | Turn masking off in `sealctl run`; ignored inside an agent |
 | `SEALCTL_NO_DAEMON=1` | No daemon: the command asks the phone itself and keeps keys for its own lifetime only (CI runners, containers) |
