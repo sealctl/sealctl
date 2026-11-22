@@ -1308,16 +1308,18 @@ them. Each line is to be folded into its section when the branch is reviewed.
 
 | Section | Note |
 | --- | --- |
-| 3, 18.3, 18.4 | `unseal` writes into `~/sealctl-unsealed-<date>` with the `folder` store (`passwords.txt`, `secrets.env`, `backup-<name>.env`, `README.txt`, `handback.json`), as decided for 0.6 on the `unseal` branch. `--to keychain\|op\|bw\|show` is refused with exit 2 for now |
+| 3, 18.3, 18.4 | `unseal` writes into `~/sealctl-unsealed-<date>` with the `folder` store by default (`passwords.txt`, `secrets.env`, `backup-<name>.env`, `README.txt`, `handback.json`), as decided for 0.6 on the `unseal` branch; `--to keychain\|op\|bw\|show` and `--secrets-to` use the stores ported from 0.6.0. `handback.json` is written after every step. The pairing step runs before local files are removed, so a resumed run can still unpair |
 | 4 | `SEALCTL_NO_SERVICE=1` skips login services; they are also skipped when `$HOME` is not the user's home folder from the password database, so a temporary HOME never loads a unit into the real login session |
 | 6.2 | Socket answers carry `code` (the exit code) and `message`; requests that wait on the phone first send `{"event": "waiting"}`. The hidden `sealctl daemon --stop` locks and stops a running daemon |
-| 6.6 | The `report` fallback for relays without the machine channel is not built; a `404` on the machine socket is retried after 6 hours |
-| 7 | Retries and error texts as specified; the relay origin is validated (`https://`, or `http://` to loopback) before any call |
+| 6.6 | Without the machine channel (`404` on the socket) the daemon uses `report` requests for 6 hours, then tries the socket again. Each report is sealed under the pairing lock and waited on without it |
+| 7 | Retries and error texts as specified; the relay origin is validated (`https://`, or `http://` to loopback) before any call. A `429` with `scope` `network` or `key` is waited out (its `retryAfter`, at most 60 s, three times) with a note on stderr; `scope` `phone` is exit 7 |
 | 10.1 | `status --json` also has `backups`; `daemon` is `running` or `stopped` |
-| 10.4, 16 | `scan` and `migrate` (rewrap, re-encryption, `old_words`) are not built yet |
+| 10.4, 16 | `scan` as specified. `migrate`: the daemon starts `sealctl migrate --depth rewrap --auto` itself after a move; re-encryption covers sparse bundles and restic repositories (APFS and LUKS volumes keep their data key); the job runs detached (`--foreground` hidden for tests), with no battery pause yet |
 | 13 | `seal volume` of a LUKS file adds sealctl's key, then removes the user's slot with `luksRemoveKey` once the new key opens it |
 | 14 | Backups of a volume exclude `.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.TemporaryItems` and `lost+found` |
-| 18.2 | `seal --from <hand-back list>` is not built yet |
+| 18.2 | `seal --from` reads both the 0.6.0 and the 0.7 hand-back list; a paired machine whose store was handed back gets a new store when a secret is next stored |
 | 18.9 | The delayed wait reads the relay every 60 seconds and at `releaseAt`; a cancelled approval names `your phone`, this machine's name, or `another paired machine` |
 | 20 | Hidden input (words, passphrases, values) is read from stdin with echo off through termios, so it works on any terminal stdin and never from a pipe for the words |
+| 18.4 | Ctrl-C or TERM during the steps lets the current step finish, records it, and stops with exit 13 |
+| 21 | `fuzz/` (its own workspace) has 12 targets; `bindings/` holds the Swift and Kotlin smoke tests run by `bindings.yml` |
 | 22 | `crates/sealctl-fakerelay` holds the fake relay and the scripted phone; the integration tests run against a live relay when `SEALCTL_TEST_RELAY` is set. `scripts/pair-test.sh` pairs a real phone with a throwaway HOME |

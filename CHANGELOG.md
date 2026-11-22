@@ -38,11 +38,23 @@ use. No Ledger code: sealctl 0.5 users hand their objects back with release 0.6
   `lock <volume>` (use `volume open/close`), `volume rekey`, `backup rekey`, emoji in output.
 - Backup passwords and credentials cached inside volumes.
 
+- `sealctl scan`: keys in `.env` files, shell rc files, shell histories and `~/.aws/credentials`
+  moved into the store, references left behind.
+- `sealctl migrate`: rewrap every object to new words (also started by the daemon when the
+  phone moves the machine to a new key), `old_words` for retired words, re-encryption of
+  sparse bundles and restic repositories under new keys, `--scan`.
+- `sealctl seal --from <hand-back list>` for lists written by 0.6.0 and 0.7.
+- `unseal --to keychain|op|bw|show|folder` and `--secrets-to`, with readable Keychain labels
+  (`sealctl: volume safe`), as in 0.6.0; Ctrl-C between steps stops with exit 13 and a
+  resumable journal.
+- The `report` fallback for relays without the machine channel.
+- The CLI waits out the relay's short-term limits (`429` with `scope` `network` or `key`).
+- Fuzz targets (`fuzz/`), `.github/CODEOWNERS`, the `bindings.yml` and `fuzz.yml` workflows.
+
 ### Not yet
 
-- `scan`, `migrate` (rewrap after new words, re-encryption), `seal --from <hand-back list>`,
-  `unseal --to keychain|op|bw|show`, the `report` fallback for relays without the machine
-  channel, `doctor` checks for hooks.
+- Re-encryption of APFS and LUKS volumes (they keep their data key; rewrap covers them), the
+  battery pause of the re-encryption job, `doctor` checks for hooks, cargo-vet.
 
 ## [0.5.0] - 2026-11-18
 

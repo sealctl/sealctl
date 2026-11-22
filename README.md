@@ -103,6 +103,27 @@ Volumes mount when the session opens and close when it locks. The passphrase is
 `hex(volume key)`, given to `diskutil`, `hdiutil` or `cryptsetup` on stdin only; restic gets the
 backup key on a pipe. Storage credentials are secrets `backup/<name>/<VAR>`.
 
+### Finding keys lying around
+
+```sh
+sealctl scan --dry-run            # .env files in this repository: file, line, first 4 characters
+sealctl scan --home               # also shell rc files, histories and ~/.aws/credentials
+```
+
+Values move into the store; `.sealctl.toml` mappings, comments in rc files and
+`credential_process` lines in `~/.aws/config` are left behind; keys in histories are masked.
+
+### New words
+
+When you change the words on the phone, it moves each machine to its new key and the daemon
+rewraps every object by itself. At the machine's terminal:
+
+```sh
+sealctl migrate --depth rewrap    # objects that could not be rewrapped, or sealed with retired words
+sealctl migrate                   # the table, then re-encrypt sparse bundles and restic repositories
+sealctl migrate --status          # the re-encryption job
+```
+
 ### Taking over what you have, and handing it back
 
 ```sh
@@ -121,7 +142,11 @@ it takes effect an hour later. Every paired machine is told and can stop it with
 `unseal` writes everything into one new folder, `~/sealctl-unsealed-<date>`: `passwords.txt`,
 `secrets.env`, `backup-<name>.env`, `handback.json` (no values in it) and `README.txt`. Volumes
 and backups stay encrypted under new random passwords; SSH keys become plain key files.
-Delete the folder once the new passwords work.
+Delete the folder once the new passwords work. `--to keychain|op|bw|show` and
+`--secrets-to keychain|op|bw|env` send them to the macOS Keychain (labels like
+`sealctl: volume safe`), 1Password, Bitwarden, the terminal once, or a `.env` file instead.
+`sealctl seal --from ~/sealctl-unsealed-<date>/handback.json` takes everything back, also a
+list written by sealctl 0.6.
 
 ### Recovery
 
