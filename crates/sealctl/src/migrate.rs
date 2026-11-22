@@ -405,7 +405,7 @@ pub struct JobItem {
     pub kind: String,
     /// Its name.
     pub name: String,
-    /// `waiting`, `running`, `done`, `failed`, `stopped`.
+    /// `waiting`, `running`, `done`, `failed`, `stopped`, `skipped` (nowhere to put a new copy).
     pub state: String,
     /// The new object id (made when the job starts).
     pub new_id: String,
@@ -419,23 +419,34 @@ fn job_path() -> Result<PathBuf> {
 }
 
 fn load_job() -> Option<Job> {
-    std::fs::read(job_path().ok()?)
+    load_job_at(&job_path().ok()?)
+}
+
+fn load_job_at(p: &Path) -> Option<Job> {
+    std::fs::read(p)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
 }
 
 fn save_job(j: &Job) -> Result<()> {
-    let p = job_path()?;
+    save_job_at(&job_path()?, j)
+}
+
+fn save_job_at(p: &Path, j: &Job) -> Result<()> {
     paths::ensure_private_dir(p.parent().context("state")?)?;
-    paths::write_private(&p, &serde_json::to_vec_pretty(j)?)
+    paths::write_private(p, &serde_json::to_vec_pretty(j)?)
 }
 
 /// The runner's save: the item states from `j`, and the `pause` or `cancel` on file (asked for
 /// by `sealctl migrate` while an item ran).
 fn save_progress(j: &Job) -> Result<()> {
+    save_progress_at(&job_path()?, j)
+}
+
+fn save_progress_at(p: &Path, j: &Job) -> Result<()> {
     let mut j = j.clone();
-    j.request = load_job().and_then(|d| d.request);
-    save_job(&j)
+    j.request = load_job_at(p).and_then(|d| d.request);
+    save_job_at(p, &j)
 }
 
 /// One runner at a time: an exclusive lock on `migrate.lock`, held until the process exits.
@@ -589,7 +600,7 @@ pub fn run(o: Opts) -> Result<()> {
         let mut j = load_job().ok_or_else(|| fail(exit::NOT_FOUND, "No re-encryption job."))?;
         j.request = if c == "resume" { None } else { Some(c.clone()) };
         save_job(&j)?;
-        if c == "resume" && j.items.iter().any(|i| i.state != "done") {
+        if c == "resume" && j.items.iter().any(|i| i.state != "done" && i.state != "skipped") {
             start_job(false)?;
         }
         eprintln!("Re-encryption: {c}.");
@@ -638,7 +649,11 @@ pub fn run(o: Opts) -> Result<()> {
         .into_iter()
         .filter_map(|o| match o {
             Obj::Volume(v) if v.kind == Kind::Sparsebundle => Some(("volume", v.name)),
-            Obj::Backup(b) => Some(("backup", b.name)),
+            Obj::Backup(b) if sibling_repo(&b.repo, "id").is_some() => Some(("backup", b.name)),
+            Obj::Backup(b) => {
+                eprintln!("backup {}: {}", b.name, no_place_note(&b.repo));
+                None
+            }
             _ => None,
         })
         .map(|(k, n)| JobItem {
@@ -736,6 +751,17 @@ fn run_job() -> Result<()> {
         }
         if job.items[i].state == "done" {
             continue;
+        }
+        // a definition changed since the job was made: nothing to fix by resuming
+        if job.items[i].kind == "backup" {
+            if let Ok(b) = Backup::load(&job.items[i].name) {
+                if sibling_repo(&b.repo, "id").is_none() {
+                    job.items[i].state = "skipped".into();
+                    job.items[i].note = no_place_note(&b.repo);
+                    save_progress(&job)?;
+                    continue;
+                }
+            }
         }
         job.items[i].state = "running".into();
         save_progress(&job)?;
@@ -891,7 +917,16 @@ fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
         let _ = std::fs::remove_dir(&old_mp);
         let _ = std::fs::remove_dir(&tmp);
     }
-    r?;
+    if let Err(e) = r {
+        if new_off && old_off {
+            return Err(e);
+        }
+        anyhow::bail!(
+            "{}; a copy is still attached under {}: detach it (hdiutil detach), then: sealctl migrate --resume",
+            exit::message_of(&e),
+            paths::tilde(&tmp)
+        );
+    }
     if !(new_off && old_off) {
         anyhow::bail!(
             "a copy is still attached under {}; detach it (hdiutil detach), then: sealctl migrate --resume",
@@ -995,15 +1030,7 @@ fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
         save_progress(job)?;
     }
     let new_id = job.items[i].new_id.clone();
-    let new_url = sibling_repo(&b.repo, &new_id).ok_or_else(|| {
-        fail(
-            exit::USAGE,
-            format!(
-                "{} is at the top of its bucket or server, so there is no place beside it for the new repository; it stays on its rewrapped key",
-                b.repo
-            ),
-        )
-    })?;
+    let new_url = sibling_repo(&b.repo, &new_id).ok_or_else(|| fail(exit::USAGE, no_place_note(&b.repo)))?;
     let (mut keys, _) = crate::daemon::client::keys(&[b.request_item()], Some(("backup", &b.name)))?;
     let old_key = keys.remove(0);
     let env = credentials(&b, &b.credential_names())?;
@@ -1053,10 +1080,19 @@ fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
     Ok(note)
 }
 
+/// Why a backup is left out of re-encryption: no place for a new repository beside it.
+fn no_place_note(repo: &str) -> String {
+    format!(
+        "not re-encrypted: {repo} has no place beside it on its server for a new repository; it stays on its rewrapped key"
+    )
+}
+
 /// Where the re-encrypted copy of the restic repository `repo` goes: beside it, its last path
-/// segment replaced by `id`, on the same server and in the same bucket or container. None when
-/// the repository has no path inside its bucket, container or server (a sibling there would be
-/// another bucket or host), or for a URL form not known here.
+/// segment replaced by `id`, on the same server (and, for B2, GCS, Azure and Swift, in the same
+/// bucket or container, which those URLs name before a `:`). On S3 and rclone the last segment
+/// may be the bucket itself: `backup init` makes `s3:host/<id>` from a base of `s3:host`, and
+/// restic creates the new bucket. None when nothing follows the server or the named bucket (a
+/// sibling would be another host or container), or for a URL form not known here.
 fn sibling_repo(repo: &str, id: &str) -> Option<String> {
     let repo = repo.trim_end_matches('/');
     let (scheme, rest) = match repo.split_once(':') {
@@ -1072,19 +1108,16 @@ fn sibling_repo(repo: &str, id: &str) -> Option<String> {
         "" | "local" => 0,
         "s3" => {
             let a = after_scheme(rest).unwrap_or(0);
-            a + segments_end(&rest[a..], 2)? // host and bucket
+            a + segments_end(&rest[a..], 1)? // host
         }
         "rest" => {
             let a = after_scheme(rest)?;
             a + segments_end(&rest[a..], 1)? // host
         }
         "sftp" if rest.starts_with("//") => 2 + segments_end(&rest[2..], 1)?,
-        "sftp" | "b2" | "gs" | "azure" | "swift" => colon(rest)?,
-        // the first segment of an rclone path can be a bucket
-        "rclone" => {
-            let c = colon(rest)?;
-            c + segments_end(&rest[c..], 1)?
-        }
+        // `remote:` stays; the path after it may start with `/` (`backup init` makes
+        // `rclone:remote:/<id>` from a base of `rclone:remote:`)
+        "sftp" | "b2" | "gs" | "azure" | "swift" | "rclone" => colon(rest)?,
         _ => return None,
     };
     let (head, path) = rest.split_at(fixed);
@@ -1252,18 +1285,109 @@ mod tests {
             s("rclone:remote:bucket/abc").as_deref(),
             Some("rclone:remote:bucket/NEW")
         );
-        // at the top of a bucket, container or server: no place beside it
-        assert_eq!(s("s3:s3.amazonaws.com/bucket"), None);
-        assert_eq!(s("s3:https://minio:9000/bucket/"), None);
+        assert_eq!(
+            s("rclone:nas:/backups/abc").as_deref(),
+            Some("rclone:nas:/backups/NEW")
+        );
+        assert_eq!(s("rclone:remote:/abc").as_deref(), Some("rclone:remote:/NEW"));
+        // a repository that is the whole bucket: a new bucket beside it, as `backup init` made it
+        assert_eq!(
+            s("s3:s3.amazonaws.com/bucket").as_deref(),
+            Some("s3:s3.amazonaws.com/NEW")
+        );
+        assert_eq!(s("rclone:remote:bucket").as_deref(), Some("rclone:remote:NEW"));
+        // nothing after the server or the named bucket: no place beside it
+        assert_eq!(s("s3:s3.amazonaws.com"), None);
+        assert_eq!(s("s3:https://minio:9000/"), None);
         assert_eq!(s("rest:https://host:8000/"), None);
         assert_eq!(s("rest:https://host:8000"), None);
         assert_eq!(s("b2:bucket:"), None);
         assert_eq!(s("azure:container:/"), None);
-        assert_eq!(s("rclone:remote:bucket"), None);
+        assert_eq!(s("rclone:remote:"), None);
+        assert_eq!(s("rclone:remote:/"), None);
         assert_eq!(s("sftp://user@host:22/"), None);
+        assert_eq!(s("sftp:user@host:"), None);
         assert_eq!(s("repo"), None);
         assert_eq!(s("/"), None);
         assert_eq!(s("unknown:thing/abc"), None);
+    }
+
+    /// Every base `backup init` takes gives `<base>/<id>`, and its sibling is `<base>/NEW`.
+    #[test]
+    fn siblings_of_repositories_made_by_init() {
+        for base in [
+            "/Users/a/repos",
+            "/",
+            "repos",
+            "local:/srv/restic",
+            "s3:s3.amazonaws.com",
+            "s3:s3.amazonaws.com/bucket",
+            "s3:s3.amazonaws.com/bucket/p",
+            "s3:http://minio:9000",
+            "s3:https://minio:9000/bucket/",
+            "rest:https://host:8000",
+            "rest:https://host:8000/",
+            "rest:https://user:pw@host:8000/p",
+            "sftp:user@host:",
+            "sftp:user@host:/srv",
+            "sftp:user@host:srv",
+            "sftp://user@host:22",
+            "sftp://user@host:22//srv",
+            "b2:bucket:",
+            "b2:bucket:p",
+            "gs:bucket:/",
+            "gs:bucket:/p",
+            "azure:container:",
+            "azure:container:/p",
+            "swift:container:/p",
+            "rclone:remote:",
+            "rclone:remote:bucket",
+            "rclone:nas:/backups",
+        ] {
+            let b = base.trim_end_matches('/');
+            let made = format!("{b}/abc");
+            assert_eq!(
+                sibling_repo(&made, "NEW").as_deref(),
+                Some(format!("{b}/NEW").as_str()),
+                "{made}"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_keeps_the_request_on_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state").join("migrate.json");
+        let item = |state: &str| JobItem {
+            kind: "volume".into(),
+            name: "v".into(),
+            state: state.into(),
+            new_id: String::new(),
+            note: String::new(),
+        };
+        for asked in ["pause", "cancel"] {
+            // `sealctl migrate --pause` while the item runs
+            save_job_at(
+                &p,
+                &Job {
+                    items: vec![item("running")],
+                    request: Some(asked.into()),
+                },
+            )
+            .unwrap();
+            // the runner's copy, read before the request was written
+            save_progress_at(
+                &p,
+                &Job {
+                    items: vec![item("done")],
+                    request: None,
+                },
+            )
+            .unwrap();
+            let on_file = load_job_at(&p).unwrap();
+            assert_eq!(on_file.request.as_deref(), Some(asked));
+            assert_eq!(on_file.items[0].state, "done");
+        }
     }
 
     #[test]
