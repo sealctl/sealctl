@@ -2,7 +2,7 @@
 # Build release artefacts for one target into ./dist (used by CI; works locally too).
 #   scripts/package.sh <target-triple> [binary-path]
 # Produces: dist/sealctl-<version>-<target>.tar.gz (+ .sha256) containing the binary,
-# LICENSE, README and shell completions.
+# LICENSE, THIRD-PARTY-NOTICES.md, README and shell completions.
 set -eu
 TARGET="$1"
 BIN="${2:-target/$TARGET/release/sealctl}"
@@ -21,7 +21,7 @@ NAME="sealctl-$VERSION-$TARGET"
 rm -rf "dist/$NAME"
 mkdir -p "dist/$NAME/completions"
 cp "$BIN" "dist/$NAME/sealctl"
-cp LICENSE README.md "dist/$NAME/"
+cp LICENSE THIRD-PARTY-NOTICES.md README.md "dist/$NAME/"
 cp "$COMP"/* "dist/$NAME/completions/"
 tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
 rm -rf "dist/$NAME"
