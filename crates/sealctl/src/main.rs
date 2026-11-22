@@ -44,7 +44,7 @@ enum Cmd {
     Open,
     /// Lock now: wipe keys, back up, close volumes.
     Lock {
-        /// A volume name (0.5): use `sealctl volume close <name>`.
+        /// Hidden: a volume name points to `sealctl volume close <name>`.
         #[arg(hide = true)]
         volume: Option<String>,
         /// Unmount even if files are open.
@@ -54,7 +54,7 @@ enum Cmd {
         #[arg(long)]
         no_backup: bool,
     },
-    /// Removed in 0.7: use `sealctl volume open <name>`.
+    /// Hidden: points to `sealctl volume open <name>`.
     #[command(hide = true)]
     Unlock { name: Option<String> },
     /// Pair this machine with the sealctl app on your phone.
@@ -467,7 +467,7 @@ enum ScheduleCmd {
 struct SealArgs {
     #[command(subcommand)]
     what: Option<SealCmd>,
-    /// Take over every object of a hand-back list (handback.json from `unseal`, 0.6.0 or 0.7).
+    /// Take over every object of a hand-back list (handback.json from `unseal`).
     #[arg(long)]
     from: Option<PathBuf>,
     /// With --from: leave one object out, <kind>/<name>.

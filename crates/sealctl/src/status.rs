@@ -77,7 +77,6 @@ fn describe(paired: &Paired, d: &approve::Delayed) -> (String, Option<String>) {
 
 /// `sealctl status [--json]`.
 pub fn status(json_out: bool) -> Result<i32> {
-    crate::legacy::warn();
     let paired = machine::load().ok();
     let daemon = client::status_if_running();
     let cfg = crate::config::Config::load()?;
@@ -416,11 +415,6 @@ pub fn doctor(json_out: bool) -> Result<i32> {
         Ok(n) => checks.push((format!("store readable ({n} secrets)"), None)),
         Err(e) => checks.push(("store".into(), Some(exit::message_of(&e)))),
     }
-    let legacy = crate::legacy::found();
-    checks.push((
-        "no sealctl 0.5 objects".into(),
-        (!legacy.is_empty()).then(|| crate::legacy::MESSAGE.to_string()),
-    ));
     let problems = checks.iter().filter(|c| c.1.is_some()).count();
     if json_out {
         let v: Vec<Value> = checks

@@ -149,7 +149,10 @@ impl Volume {
         let text = fs::read_to_string(&p).map_err(|_| fail(exit::NOT_FOUND, format!("No volume {name}.")))?;
         let v: Volume = toml::from_str(&text).with_context(|| format!("reading {}", p.display()))?;
         if v.words.is_empty() {
-            return Err(fail(exit::WRONG_KEY, crate::legacy::MESSAGE));
+            return Err(fail(
+                exit::WRONG_KEY,
+                format!("{} names no words: not a sealctl volume.", p.display()),
+            ));
         }
         Ok(v)
     }
@@ -457,8 +460,7 @@ pub fn read_marker(kind: Kind, target: &str) -> Result<Option<IdFile>> {
             let p = Path::new(target).join("sealctl.id");
             match fs::read_to_string(&p) {
                 Ok(t) => match sealctl_core::ids::IdFile::parse(&t) {
-                    Ok(sealctl_core::ids::IdFileContent::V1(f)) => Ok(Some(f)),
-                    Ok(_) => Err(fail(exit::WRONG_KEY, crate::legacy::MESSAGE)),
+                    Ok(f) => Ok(Some(f)),
                     Err(_) => Ok(None),
                 },
                 Err(_) => Ok(None),

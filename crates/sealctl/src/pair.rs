@@ -72,12 +72,6 @@ fn valid_name(n: &str) -> bool {
 
 /// `sealctl pair`.
 pub fn pair(opts: PairOpts) -> Result<()> {
-    if crate::legacy::warn() && !opts.force {
-        return Err(fail(
-            exit::USAGE,
-            "Hand back the sealctl 0.5 objects first, or pair with --force.",
-        ));
-    }
     let person = term::is_person();
     if machine::is_paired() {
         let label = machine::load()

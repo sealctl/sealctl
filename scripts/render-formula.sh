@@ -7,7 +7,7 @@ VERSION="$1"; BASE="$2"; DIST="$3"
 sha() { cut -d' ' -f1 "$DIST/sealctl-$VERSION-$1.tar.gz.sha256"; }
 cat <<EOF
 class Sealctl < Formula
-  desc "Secrets for AI coding agents, approved on your phone"
+  desc "API keys, SSH keys, encrypted volumes and backups, approved on your phone"
   homepage "https://sealctl.com"
   version "$VERSION"
   license "MIT"

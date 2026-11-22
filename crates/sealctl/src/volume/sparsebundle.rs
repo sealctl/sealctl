@@ -92,10 +92,7 @@ impl Backend for Sparsebundle {
         let text = std::fs::read_to_string(path.join(ID_FILE))
             .with_context(|| format!("{} has no {ID_FILE}: not a sealctl volume?", path.display()))?;
         match sealctl_core::ids::IdFile::parse(&text) {
-            Ok(sealctl_core::ids::IdFileContent::V1(f)) => Ok(f.id),
-            Ok(sealctl_core::ids::IdFileContent::Legacy(_)) => {
-                Err(crate::exit::fail(crate::exit::WRONG_KEY, crate::legacy::MESSAGE))
-            }
+            Ok(f) => Ok(f.id),
             Err(_) => anyhow::bail!("{} is damaged", path.join(ID_FILE).display()),
         }
     }

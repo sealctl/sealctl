@@ -1,6 +1,6 @@
-//! `sealctl seal --from <hand-back list>` (SPEC 18.2): a list written by 0.6.0 (Ledger) and
-//! one written by 0.7's own `unseal`, each object taken over with its password read from
-//! where `unseal` put it.
+//! `sealctl seal --from <hand-back list>` (SPEC 18.2): a list written by hand in the folder
+//! store's format, and one written by `unseal` itself, each object taken over with its password
+//! read from where `unseal` put it.
 
 mod common;
 
@@ -38,13 +38,13 @@ fn seal_from(env: &Env, list: &std::path::Path) -> (i32, String) {
 }
 
 #[test]
-fn a_list_written_by_0_6_0() {
+fn a_list_in_the_folder_store_format() {
     let mut env = Env::new();
     env.pair();
     let dir = env.h().join("sealctl-unsealed-2026-11-21");
     std::fs::create_dir_all(&dir).unwrap();
     let secret = canary();
-    // the folder store as 0.6.0 writes it
+    // the folder store's files, as `unseal` writes them
     std::fs::write(
         dir.join("secrets.env"),
         format!("# The secrets of sealctl's store\nSHOP_API_KEY=\"{secret}\"\n"),
@@ -108,7 +108,7 @@ fn a_list_written_by_0_6_0() {
     }
     std::fs::write(dir.join("passwords.txt"), passwords).unwrap();
     let list = json!({"sealctl": 1, "kind": "handback", "created": "2026-11-21T10:31:07+01:00",
-        "machine": "dev@mbp.example.com", "from": "0.6.0", "objects": objects});
+        "machine": "dev@mbp.example.com", "from": "0.7.0", "objects": objects});
     std::fs::write(
         dir.join("handback.json"),
         serde_json::to_vec_pretty(&list).unwrap(),
@@ -118,7 +118,7 @@ fn a_list_written_by_0_6_0() {
     let (code, screen) = seal_from(&env, &dir.join("handback.json"));
     assert_eq!(code, 0, "{screen}");
     assert!(
-        screen.contains("handed back by sealctl 0.6.0 on dev@mbp.example.com"),
+        screen.contains("handed back by sealctl 0.7.0 on dev@mbp.example.com"),
         "{screen}"
     );
     let ((code, out, err), _) =

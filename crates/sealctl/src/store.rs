@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use sealctl_core::ids::{IdFile, IdFileContent};
+use sealctl_core::ids::IdFile;
 use sealctl_core::sealed::{self, Header, Mode};
 use sealctl_core::wire::{ObjectFacts, RequestItem};
 use sealctl_core::ObjectKey;
@@ -106,7 +106,7 @@ impl Store {
         match std::fs::read_to_string(self.id_path()) {
             Ok(t) => {
                 match IdFile::parse(&t).map_err(|e| anyhow::anyhow!("{}: {e}", self.id_path().display()))? {
-                    IdFileContent::V1(f) if f.kind == "store" && f.id == self.id => Ok(Some(f)),
+                    f if f.kind == "store" && f.id == self.id => Ok(Some(f)),
                     _ => Err(fail(
                         exit::WRONG_KEY,
                         format!("{} does not describe this store.", self.id_path().display()),

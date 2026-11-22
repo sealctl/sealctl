@@ -960,15 +960,13 @@ fn scan(roots: &[PathBuf], json_out: bool) -> Result<()> {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
                 if let Ok(t) = std::fs::read_to_string(p.join("sealctl.id")) {
-                    if let Ok(sealctl_core::ids::IdFileContent::V1(f)) = sealctl_core::ids::IdFile::parse(&t)
-                    {
+                    if let Ok(f) = sealctl_core::ids::IdFile::parse(&t) {
                         out.push(json!({"kind": "volume", "volume": "sparsebundle", "id": f.id, "words": f.words, "path": paths::tilde(&p)}));
                         continue;
                     }
                 }
                 if let Ok(t) = std::fs::read_to_string(p.join(format!("{n}.id"))) {
-                    if let Ok(sealctl_core::ids::IdFileContent::V1(f)) = sealctl_core::ids::IdFile::parse(&t)
-                    {
+                    if let Ok(f) = sealctl_core::ids::IdFile::parse(&t) {
                         out.push(
                             json!({"kind": f.kind, "id": f.id, "words": f.words, "path": paths::tilde(&p)}),
                         );

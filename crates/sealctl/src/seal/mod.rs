@@ -517,8 +517,8 @@ pub fn seal_env(file: &Path, prefix: &str, delete: bool, force: bool) -> Result<
 }
 
 /// `sealctl seal --from <hand-back list>`: takes over every object of a `handback.json` written
-/// by `unseal` (0.6.0 on the Ledger, or 0.7), each with its password read from where `unseal`
-/// put it. Volumes go first, so a backup can follow the volume of the same name.
+/// by `unseal`, each with its password read from where `unseal` put it. Volumes go first, so a
+/// backup can follow the volume of the same name.
 pub fn seal_from(file: &Path, skip: &[String], words: bool) -> Result<()> {
     term::require_person("sealctl seal --from", None)?;
     let text = std::fs::read_to_string(file)
@@ -647,7 +647,7 @@ fn seal_one(stores: &mut store::Stores, o: &handback::Object, words: bool) -> Re
             for c in &o.credentials {
                 env.insert(c.var.clone(), text_of(stores.read(&c.location)?));
             }
-            // a backup of a volume (0.6.0 names it by its volume) backs up that volume again
+            // a backup named like a volume backs up that volume again
             let from = Volume::load(&o.name).ok().map(|v| v.name);
             let name = if Backup::load(&o.name).is_ok() {
                 format!("{}-backup", o.name)

@@ -67,22 +67,9 @@ pub struct IdFile {
     pub volume: Option<String>,
 }
 
-/// What an `.id` file holds: the version 1 object, or a 0.5.0 sparse bundle's bare UUID.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdFileContent {
-    /// A version 1 `.id` file.
-    V1(IdFile),
-    /// A 0.5.0 `sealctl.id`: only the UUID and a newline, sealed through the Ledger.
-    Legacy(String),
-}
-
 impl IdFile {
-    /// Parses either form.
-    pub fn parse(text: &str) -> Result<IdFileContent> {
-        let trimmed = text.trim();
-        if parse_uuid(trimmed).is_some() {
-            return Ok(IdFileContent::Legacy(trimmed.to_owned()));
-        }
+    /// Parses a version 1 `.id` file.
+    pub fn parse(text: &str) -> Result<IdFile> {
         let file: IdFile = serde_json::from_str(text).map_err(|_| CoreError::BadSealed)?;
         if file.sealctl > 1 {
             return Err(CoreError::NewerVersion);
@@ -90,7 +77,7 @@ impl IdFile {
         if file.sealctl != 1 {
             return Err(CoreError::BadSealed);
         }
-        Ok(IdFileContent::V1(file))
+        Ok(file)
     }
 
     /// Pretty JSON with a trailing newline.

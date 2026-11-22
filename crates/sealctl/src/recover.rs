@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use sealctl_core::ids::{IdFile, IdFileContent};
+use sealctl_core::ids::IdFile;
 use sealctl_core::{complete_word, ObjectKey, Purpose, Root, Words};
 use zeroize::Zeroizing;
 
@@ -142,8 +142,7 @@ fn classify(target: &str) -> Result<Target> {
 fn read_id_file(p: &Path) -> Result<IdFile> {
     let t = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
     match IdFile::parse(&t) {
-        Ok(IdFileContent::V1(f)) => Ok(f),
-        Ok(IdFileContent::Legacy(_)) => Err(fail(exit::WRONG_KEY, crate::legacy::MESSAGE)),
+        Ok(f) => Ok(f),
         Err(_) => Err(fail(exit::ERROR, format!("{} is damaged.", p.display()))),
     }
 }

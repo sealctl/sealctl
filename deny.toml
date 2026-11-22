@@ -5,13 +5,13 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # rsa (via rPGP / openpgp-card-rpgp): Marvin timing attack on RSA *private-key*
-    # decryption. sealctl never performs RSA private-key operations on the host —
-    # private keys live on the Ledger, and sealctl uses Curve25519 keys.
-    { id = "RUSTSEC-2023-0071", reason = "no host-side RSA private-key operations" },
-    # crypto-bigint 0.5 (via rPGP NIST/X448 curves): non-constant-time arithmetic.
-    # sealctl performs no private-key operations on these curves on the host.
-    { id = "RUSTSEC-2026-0387", reason = "no host-side private-key ops on NIST/X448 curves" },
+    # rsa (via ssh-key and ssh-agent-lib): Marvin timing attack on RSA *decryption*.
+    # sealctl never decrypts with RSA; SSH keys only sign, and `ssh keygen` makes Ed25519 keys.
+    { id = "RUSTSEC-2023-0071", reason = "no RSA decryption anywhere in sealctl" },
+    # crypto-bigint 0.5 (via ssh-key's p256/p384 support): non-constant-time arithmetic.
+    # sealctl's own keys are Ed25519 and X25519; only an ECDSA SSH key a user imports with
+    # `seal ssh` would sign on these curves, locally. No ssh-key 0.6 release avoids it.
+    { id = "RUSTSEC-2026-0387", reason = "NIST curves only for user-imported ECDSA SSH keys" },
     # zvariant, zbus_names, zvariant_derive (via keyring 3 → zbus 4, the Linux Secret
     # Service): "unmaintained" because they were merged into zbus 6, not a vulnerability.
     # No keyring release uses zbus 6 yet; move when one does.
