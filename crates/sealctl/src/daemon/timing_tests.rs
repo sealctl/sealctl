@@ -237,3 +237,72 @@ async fn a_session_approved_during_the_backups_keeps_its_volumes() {
     assert!(!e.iter().any(|x| x.starts_with("unmount")), "{e:?}");
     assert!(d.st().open);
 }
+
+#[tokio::test(start_paused = true)]
+async fn waking_with_a_key_press_still_locks_for_the_time_asleep() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    // asleep for two hours; the key press that woke the machine is input
+    d.t.advance(2 * 3_600_000);
+    d.t.set_idle(Some(0));
+    d.tick().await;
+    assert!(!d.st().open, "time asleep counts as idle");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_session_hands_out_no_key_before_the_tick() {
+    let (d, _) = testing::daemon(DEAD);
+    let vol = item("volume", "fa5a93d5-28d9-4c08-b608-c2b6f344b4d8");
+    open(&d, &[item("secrets", STORE), vol.clone()]).await;
+    // just woken from a long sleep; the tick has not run yet
+    d.t.advance(ALLOWANCE_MS + 60_000);
+    let r = d.op_keys(vec![vol], None, &ev(), false).await;
+    assert!(r.is_err(), "no key from a session past its idle allowance");
+    assert!(!d.st().open);
+}
+
+#[tokio::test(start_paused = true)]
+async fn past_the_hard_stop_a_session_hands_out_no_key_before_the_tick() {
+    let (d, _) = testing::daemon(DEAD);
+    let vol = item("volume", "fa5a93d5-28d9-4c08-b608-c2b6f344b4d8");
+    open(&d, &[item("secrets", STORE), vol.clone()]).await;
+    let stop = session::hard_stop(t0());
+    // worked up to the hard stop (a use every minute), then a request just after it
+    let mut t = t0();
+    while t + 60_000 < stop {
+        t += 60_000;
+        d.t.set_now(t);
+        d.st().saved.work(t);
+    }
+    d.t.set_now(stop + 1);
+    let r = d.op_keys(vec![vol], None, &ev(), false).await;
+    assert!(r.is_err());
+    assert!(!d.st().open);
+    assert_eq!(d.st().saved.worked, 0, "the hard stop reset the credit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clock_set_back_locks_the_session() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    d.t.set_now(t0() - 10 * 60_000);
+    d.tick().await;
+    assert!(!d.st().open, "idle time and the hard stop cannot be trusted any more");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_first_open_in_the_future_does_not_carry_its_credit() {
+    let (d, _) = testing::daemon(DEAD);
+    {
+        // saved while the clock was a day ahead
+        let mut st = d.st();
+        st.saved.first_open = Some(t0() + 86_400_000);
+        st.saved.worked = 500;
+        st.saved.last_minute = (t0() + 86_400_000) / 60_000;
+        st.saved.last_work = t0() + 86_400_000;
+    }
+    open(&d, &store_items()).await;
+    let st = d.st();
+    assert_eq!(st.saved.first_open, Some(t0()));
+    assert_eq!(st.saved.worked, 1);
+}

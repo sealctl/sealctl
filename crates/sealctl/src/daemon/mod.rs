@@ -216,6 +216,20 @@ fn save_saved(s: &Saved) {
     }
 }
 
+/// Has the time of the session in `saved` run out at `n`? `Some(true)` past the hard stop, or
+/// when the wall clock went back more than a minute behind the last work (neither idle time nor
+/// the hard stop can be trusted then, so the credit goes too); `Some(false)` when the idle
+/// allowance is used up.
+fn expired(saved: &Saved, n: u64) -> Option<bool> {
+    if saved.past_hard_stop(n) || saved.last_work > n + 60_000 {
+        Some(true)
+    } else if saved.left(n) == 0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Remembered answers from the phone (`answers.json`).
 pub fn load_answers() -> Vec<Allowed> {
     paths::answers_file()
@@ -525,7 +539,10 @@ impl Daemon {
                 let mut st = self.st();
                 st.open = true;
                 st.opened_at = n;
-                if st.saved.past_hard_stop(n) {
+                // past the hard stop, or saved while the clock was ahead: a new day of credit
+                if expired(&st.saved, n) == Some(true)
+                    || st.saved.first_open.is_some_and(|f| f > n)
+                {
                     st.saved.reset_credit();
                 }
                 if st.saved.first_open.is_none() {
@@ -591,6 +608,7 @@ impl Daemon {
 
     /// `open`.
     pub async fn op_open(self: &Arc<Self>, ctx: RequestContext, ev: &Events, notify: bool) -> Result<Value> {
+        self.expire();
         let _opening = self.join_open(ev).await;
         if !self.st().open {
             let (session, _) = self.open_session(vec![], vec![], ctx, ev, notify).await?;
@@ -608,6 +626,7 @@ impl Daemon {
         req: ValuesReq,
         ev: &Events,
     ) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
+        self.expire();
         let store = Store::configured()?;
         let mut headers = Vec::new();
         for n in &req.names {
@@ -769,6 +788,7 @@ impl Daemon {
         ev: &Events,
         notify: bool,
     ) -> Result<(Vec<ObjectKey>, String)> {
+        self.expire();
         let held = || -> Option<(Vec<ObjectKey>, String)> {
             let st = self.st();
             if !st.open || items.iter().any(|i| i.words.is_none()) {
@@ -815,6 +835,7 @@ impl Daemon {
 
     /// `store`: write or rename a secret with the store key.
     pub async fn op_store(self: &Arc<Self>, req: &Value, ev: &Events) -> Result<Value> {
+        self.expire();
         let store = Store::configured()?;
         let action = req["action"].as_str().unwrap_or("");
         let name = req["name"].as_str().unwrap_or("").to_string();
@@ -929,7 +950,7 @@ impl Daemon {
     /// Locks: wipes keys, runs on-lock backups, unmounts volumes, tells the phone (SPEC 6.5).
     /// Waits for the slow steps, and for those of any lock still running before them.
     pub async fn lock(self: &Arc<Self>, reason: &str, no_backup: bool, force: bool) -> Value {
-        let c = self.close(reason, no_backup, false, |_| true);
+        let c = self.close(reason, no_backup, |_| Some(false));
         match c {
             Some(c) => tokio::spawn(self.clone().finish(c, force))
                 .await
@@ -938,16 +959,16 @@ impl Daemon {
         }
     }
 
-    /// Locks at once if `when` holds for the state (checked under the same lock), and runs the
-    /// slow steps in the background. `reset_credit` at the hard stop. Returns whether it locked.
+    /// Locks at once if `when` gives `Some` for the state (checked under the same lock), and
+    /// runs the slow steps in the background. `Some(true)` also resets the credit (hard stop).
+    /// Returns whether it locked.
     fn lock_soon(
         self: &Arc<Self>,
         reason: &str,
         no_backup: bool,
-        reset_credit: bool,
-        when: impl FnOnce(&State) -> bool,
+        when: impl FnOnce(&State) -> Option<bool>,
     ) -> bool {
-        match self.close(reason, no_backup, reset_credit, when) {
+        match self.close(reason, no_backup, when) {
             Some(c) => {
                 tokio::spawn(self.clone().finish(c, false));
                 true
@@ -959,19 +980,17 @@ impl Daemon {
     /// SPEC 6.5 step 1: the session closes and its keys leave the shared state before anything
     /// slow runs, so nothing is handed out while backups and unmounts go on, and a second lock
     /// meanwhile finds the session Locked. The backups get their keys and credentials here;
-    /// everything else taken is wiped when it drops. `None` when `when` does not hold.
+    /// everything else taken is wiped when it drops. `when` gives `None` to leave the session
+    /// as it is, or whether to reset the credit.
     fn close(
         &self,
         reason: &str,
         no_backup: bool,
-        reset_credit: bool,
-        when: impl FnOnce(&State) -> bool,
+        when: impl FnOnce(&State) -> Option<bool>,
     ) -> Option<Closing> {
         let (turn, was_open, store_key, keys, channel) = {
             let mut st = self.st();
-            if !when(&st) {
-                return None;
-            }
+            let reset_credit = when(&st)?;
             st.allowed.clear();
             st.answers_parts.clear();
             let was_open = std::mem::replace(&mut st.open, false);
@@ -1326,8 +1345,8 @@ impl Daemon {
         match msg.kind {
             MessageKind::Lock { reason } => {
                 // the channel goes on taking messages while the lock runs its slow steps
-                self.lock_soon(&reason, reason == "words", false, |st| {
-                    st.open && msg.time >= st.opened_at
+                self.lock_soon(&reason, reason == "words", |st| {
+                    (st.open && msg.time >= st.opened_at).then_some(false)
                 });
             }
             MessageKind::Answers { answers, more } => {
@@ -1434,25 +1453,26 @@ impl Daemon {
 
     /// One tick (every 15 s): idle input counts as work; idle allowance and hard stop lock.
     pub async fn tick(self: &Arc<Self>) {
+        // The allowance is checked against the last work before this sample counts: after a
+        // sleep, the key press that woke the machine must not turn the time asleep into work.
+        // The tick goes on (status, the next session's timers) while the lock's backups run.
+        if self.expire() {
+            return;
+        }
+        // `ioreg` runs outside the state lock
+        let idle = if self.st().open { self.idle_input() } else { None };
         let n = self.now();
-        let (open, lock_now, status_due) = {
+        let (open, status_due) = {
             let mut st = self.st();
-            if st.open && self.idle_input().is_some_and(|s| s < 60) {
+            if st.open && idle.is_some_and(|s| s < 60) {
                 st.saved.work(n);
                 save_saved(&st.saved);
             }
-            let lock_now = st.open && (st.saved.left(n) == 0 || st.saved.past_hard_stop(n));
             let due = st.open
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
                     || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000));
-            (st.open, lock_now, due)
+            (st.open, due)
         };
-        if lock_now {
-            // the tick goes on (status, the next session's timers) while backups run
-            let hard = self.st().saved.past_hard_stop(n);
-            self.lock_soon("idle", false, hard, |st| st.open);
-            return;
-        }
         if open && status_due && !self.inproc {
             if let Err(e) = self.send_status(&[]).await {
                 log::info!("status: {e:#}");
@@ -1463,6 +1483,20 @@ impl Daemon {
                 st.status_dirty = true;
             }
         }
+    }
+
+    /// Locks an Open session whose time is up (SPEC 6.4). The tick does this every 15 seconds,
+    /// and every request for a key does it first, so a request right after a wake from sleep
+    /// does not get a key, or count as work, before the tick has run. Returns whether it locked.
+    fn expire(self: &Arc<Self>) -> bool {
+        let n = self.now();
+        self.lock_soon("idle", false, |st| {
+            if st.open {
+                expired(&st.saved, n)
+            } else {
+                None
+            }
+        })
     }
 
     /// A spawned daemon exits after 10 minutes Locked with no client (SPEC 6.1).

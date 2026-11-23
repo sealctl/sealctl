@@ -324,7 +324,8 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 - **Hard stop:** 02:00 local time or 14 hours after the first `open` granted today, whichever is first. It locks and resets the credit (minutes worked) to 0.
 - **Credit** survives locks and daemon restarts until the hard stop; it is kept in `session.json` with the first-approval time.
 - **Own-approval keys** are wiped when the command that asked exits (the daemon watches the client connection).
-- The daemon samples every 15 seconds. It detects sleep by comparing the wall clock with the monotonic clock at each tick, and then checks the idle allowance and hard stop at once.
+- The daemon samples every 15 seconds. At each sample it checks the idle allowance and the hard stop against the last work moment before it counts the sample's input as work, so the key press that wakes a machine from sleep does not turn the time asleep into work. Every request for a key (values, keys, store, `open`, the SSH agent) makes the same check first, so a request right after a wake does not get a key from a session whose time ran out while asleep.
+- **Clock changes:** when the wall clock is more than a minute behind the last work moment (set back), the session locks and the credit resets, since neither the idle time nor the hard stop can be trusted. A saved first open in the future (the clock was ahead) does not carry its credit into the next `open`. A clock set forward only brings the lock sooner.
 
 ### 6.5 Locking
 
