@@ -88,16 +88,27 @@ pub fn attached_mounts(path: &std::path::Path) -> Result<Vec<String>> {
     Ok(mounts)
 }
 
-/// Detaches every attachment of the image at `path`, wherever it is mounted.
+/// Detaches every attachment of the image at `path`, wherever it is mounted. Just after a
+/// mount or a write, macOS services (Spotlight, fseventsd) can hold the volume for a moment,
+/// so a detach without `force` is tried three times, a second apart, before the volume is
+/// reported busy. Callers in the daemon run this off its async threads.
 fn detach_all(path: &std::path::Path, force: bool) -> Result<()> {
+    const TRIES: u32 = 3;
     for a in attachments(path)? {
-        let mut cmd = crate::util::system_cmd("hdiutil");
-        cmd.args(["detach", "-quiet"]);
-        if force {
-            cmd.arg("-force");
+        for attempt in 1..=TRIES {
+            let mut cmd = crate::util::system_cmd("hdiutil");
+            cmd.args(["detach", "-quiet"]);
+            if force {
+                cmd.arg("-force");
+            }
+            cmd.arg(&a.disk);
+            let out = cmd.output()?;
+            if out.status.success() || force || attempt == TRIES {
+                check(out, "hdiutil detach (files still open? use --force)")?;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        cmd.arg(&a.disk);
-        check(cmd.output()?, "hdiutil detach (files still open? use --force)")?;
     }
     Ok(())
 }

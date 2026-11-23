@@ -313,6 +313,91 @@ fn rewrite(file: &Path, text: &[u8]) -> Result<()> {
     paths::write_mode(&target, text, mode).with_context(|| format!("rewriting {}", file.display()))
 }
 
+/// A history file's lock as the shells take it, held while sealctl reads it again and
+/// replaces it: zsh's `<file>.LOCK` (made with `link`, so an exclusive create matches it; one
+/// older than 10 s is stale to zsh and to sealctl), and fish's `flock` on the file. Released
+/// when dropped.
+struct HistoryLock {
+    dot: PathBuf,
+    _flock: Option<nix::fcntl::Flock<std::fs::File>>,
+}
+
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.dot);
+    }
+}
+
+/// How long [`lock_history`] waits for a shell, as zsh waits for another zsh.
+const HISTORY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Takes [`HistoryLock`] of `file`, waiting up to [`HISTORY_WAIT`] for a shell writing it.
+fn lock_history(file: &Path) -> Result<HistoryLock> {
+    use nix::fcntl::{Flock, FlockArg};
+    let mut dot = file.as_os_str().to_owned();
+    dot.push(".LOCK");
+    let dot = PathBuf::from(dot);
+    let until = std::time::Instant::now() + HISTORY_WAIT;
+    let mut said = false;
+    let mut wait = |what: &str| -> Result<()> {
+        if std::time::Instant::now() >= until {
+            anyhow::bail!("{} stayed locked by {what}", file.display());
+        }
+        if !said {
+            said = true;
+            eprintln!(
+                "Waiting for the shell writing {} to finish...",
+                paths::tilde(file)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        Ok(())
+    };
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dot)
+        {
+            Ok(mut f) => {
+                let _ = std::io::Write::write_all(&mut f, std::process::id().to_string().as_bytes());
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&dot)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > HISTORY_WAIT);
+                if stale {
+                    let _ = std::fs::remove_file(&dot);
+                    continue;
+                }
+                wait("a shell (.LOCK)")?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut held = HistoryLock { dot, _flock: None };
+    let Ok(mut f) = std::fs::File::open(file) else {
+        return Ok(held);
+    };
+    loop {
+        match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
+            Ok(l) => {
+                held._flock = Some(l);
+                return Ok(held);
+            }
+            Err((back, nix::errno::Errno::EWOULDBLOCK)) => {
+                f = back;
+                wait("a shell (flock)")?;
+            }
+            // a file system without locks: the .LOCK file is all there is
+            Err(_) => return Ok(held),
+        }
+    }
+}
+
 /// `hay` with every `needle` replaced by `****`, byte for byte (a zsh history is not UTF-8).
 fn mask_bytes(hay: &[u8], needle: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::with_capacity(hay.len()));
@@ -449,14 +534,35 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
     for f in findings {
         by_file.entry(f.file.clone()).or_default().push(f);
     }
+    // the files were read before the store was written, which can wait on the phone: one that
+    // changed meanwhile (a shell appending to its history, an edit) is never rewritten from the
+    // old text. A history is masked as it is now; any other file is left as it is
+    let mut changed = Vec::new();
     for (file, fs) in by_file {
         let bytes = &texts[&file];
         if fs[0].kind == "history" {
-            let mut t = Zeroizing::new(bytes.to_vec());
+            // read again and replaced under the shells' own history lock, so a line a shell
+            // that locks (zsh, fish) writes meanwhile is never lost
+            let Ok(_held) = lock_history(&file) else {
+                changed.push(paths::tilde(&file));
+                continue;
+            };
+            let Ok(mut t) = std::fs::read(&file).map(Zeroizing::new) else {
+                changed.push(paths::tilde(&file));
+                continue;
+            };
             for f in &fs {
                 t = mask_bytes(&t, f.value.as_bytes());
             }
             rewrite(&file, &t)?;
+            continue;
+        }
+        let Ok(now) = std::fs::read(&file).map(Zeroizing::new) else {
+            changed.push(paths::tilde(&file));
+            continue;
+        };
+        if *now != **bytes {
+            changed.push(paths::tilde(&file));
             continue;
         }
         let text = Zeroizing::new(String::from_utf8(bytes.to_vec()).map_err(|_| {
@@ -564,6 +670,15 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
             }
             _ => {}
         }
+    }
+    if !changed.is_empty() {
+        return Err(fail(
+            exit::PARTWAY,
+            format!(
+                "{} changed while sealctl scanned; left as it is (the values are stored). Run sealctl scan again.",
+                changed.join(", ")
+            ),
+        ));
     }
     Ok(stored)
 }

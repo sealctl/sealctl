@@ -429,6 +429,7 @@ pub struct InitOpts<'a> {
 /// Makes a repository with a new id and key, and records the definition.
 pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Result<(Backup, ObjectKey)> {
     crate::volume::validate_name(opts.name)?;
+    let _name = lock_name(opts.name)?;
     if Backup::load(opts.name).is_ok() {
         return Err(fail(exit::USAGE, format!("Backup {} exists already.", opts.name)));
     }
@@ -488,6 +489,23 @@ pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Resu
     };
     b.save()?;
     Ok((b, key))
+}
+
+/// The [`crate::util::object_lock`] of a restic repository: held by `backup run`, `seal backup`,
+/// `unseal`, rewrap and re-encryption while they use or change it.
+pub fn lock_repo(url: &str) -> Result<crate::util::ObjectLock> {
+    let key = if url.contains(':') {
+        format!("restic:{url}")
+    } else {
+        crate::util::path_key(std::path::Path::new(url))
+    };
+    crate::util::object_lock(&key, &format!("The restic repository {url}"))
+}
+
+/// The [`crate::util::object_lock`] of a backup name, held from the check that it is free to the
+/// saved definition (`backup init`, `seal backup`).
+pub fn lock_name(name: &str) -> Result<crate::util::ObjectLock> {
+    crate::util::object_lock(&format!("backup-name:{name}"), &format!("Backup {name}"))
 }
 
 /// When restic has to stop: at `deadline`, or as soon as `stop` is set (the daemon exits).
@@ -581,6 +599,22 @@ pub fn run_one_until(
             },
         ));
     }
+    // never beside a re-encryption, rewrap or unseal of this repository, and only into the
+    // repository the definition names now: one that moved (re-encrypted) or went (unsealed)
+    // since `b` was read would take a snapshot that is then lost
+    let _lock = lock_repo(&b.repo)?;
+    match Backup::load(&b.name) {
+        Ok(cur) if cur.repo == b.repo && cur.check == b.check => {}
+        _ => {
+            return Err(fail(
+                exit::BUSY,
+                format!(
+                    "Backup {} changed while it was starting (re-encrypted or handed back). Run it again.",
+                    b.name
+                ),
+            ))
+        }
+    }
     let repo = Repo::new(&b.repo, key, env);
     let mut st = b.state();
     let src = b.source.to_string_lossy().into_owned();
@@ -615,9 +649,7 @@ pub fn run_one_until(
         Ok(warning) => {
             st.last_success = Some(now_secs());
             st.last_error = warning.clone();
-            let prune = st
-                .last_prune
-                .is_none_or(|t| now_secs().saturating_sub(t) > 7 * 86_400);
+            let prune = prune_due(st.last_prune, now_secs());
             let (d, w, m) = (
                 b.policy.keep_daily.to_string(),
                 b.policy.keep_weekly.to_string(),
@@ -643,6 +675,13 @@ pub fn run_one_until(
     }
     b.save_state(&st)?;
     r
+}
+
+/// Whether `forget` prunes this time: at most weekly. A last prune later than `now` (Unix
+/// seconds) means the clock was set back since; it counts as long ago, or no prune would come
+/// until the clock caught up with it.
+fn prune_due(last: Option<u64>, now: u64) -> bool {
+    last.is_none_or(|t| t > now || now - t > 7 * 86_400)
 }
 
 /// `1 h 5 min ago`.
@@ -761,5 +800,24 @@ mod deadline_tests {
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(child.try_wait().unwrap().is_some(), "killed and reaped");
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::prune_due;
+
+    const NOW: u64 = 1_795_300_000;
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn prune_at_most_weekly_by_the_clock_as_it_is() {
+        assert!(prune_due(None, NOW));
+        assert!(!prune_due(Some(NOW - DAY), NOW));
+        assert!(!prune_due(Some(NOW - 7 * DAY), NOW));
+        assert!(prune_due(Some(NOW - 7 * DAY - 1), NOW));
+        // the clock set back after a prune (a year ahead, then corrected)
+        assert!(prune_due(Some(NOW + 365 * DAY), NOW));
+        assert!(prune_due(Some(NOW + 1), NOW));
     }
 }

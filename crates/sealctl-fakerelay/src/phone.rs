@@ -110,6 +110,15 @@ impl Phone {
         self.root.clone()
     }
 
+    /// The phone's clock moves on by `ms` (a fake clock for its plan window): every plan
+    /// approval it keeps is that much older, so a continuation after it is judged as it would
+    /// be `ms` later by the phone's clock, the machine's clock staying where it is.
+    pub fn pass_time(&self, ms: u64) {
+        for a in self.approvals.lock().unwrap().iter_mut() {
+            a.not_before = a.not_before.saturating_sub(ms);
+        }
+    }
+
     /// One signed call.
     pub async fn call_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value)> {
         let bytes = body

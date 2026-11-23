@@ -602,6 +602,42 @@ fn wait_delayed(
     }
 }
 
+/// Waits until `nb` by this machine's wall clock (`now`, Unix ms). The wait is slept in steps
+/// of at most a minute, each checked against the wall clock again: a sleep of the machine, or
+/// a clock set forward, never makes it wait longer than to `nb`, and a clock set back makes it
+/// wait for `nb` by the clock as it is now. More than about two hours to go is refused.
+fn wait_for_nb(nb: u64, now: &dyn Fn() -> u64, sleep: &mut dyn FnMut(Duration)) -> Result<()> {
+    let first = now();
+    if nb > first && nb - first > 130 * 60_000 {
+        return Err(fail(
+            exit::ERROR,
+            "The approval starts more than two hours from now. Nothing was changed.",
+        ));
+    }
+    let mut said = false;
+    loop {
+        let t = now();
+        if t >= nb {
+            return Ok(());
+        }
+        if nb - t > 130 * 60_000 {
+            // the clock was set back by hours meanwhile: refused, as at the start
+            return Err(fail(
+                exit::ERROR,
+                "This machine's clock moved back by hours while waiting for the approval to start. Nothing was changed.",
+            ));
+        }
+        if !said && nb - t > 5_000 {
+            said = true;
+            eprintln!(
+                "Waiting until {} for the approval to start (this machine's clock is behind your phone's).",
+                session::hhmm(nb)
+            );
+        }
+        sleep(Duration::from_millis((nb - t).min(60_000)));
+    }
+}
+
 /// The plan signature, checked against our own hash, the request id and `nb`.
 fn check_signature(
     paired: &Paired,
@@ -737,16 +773,7 @@ fn keys_from_phone(
         let (reply, id, sent) = final_reply.context("no reply")?;
         let (nb, sig) = check_signature(&paired, &reply, &id, &ph, &h)?;
         // never before nb by this machine's clock
-        let now = machine::now_ms();
-        if nb > now {
-            if nb - now > 130 * 60_000 {
-                return Err(fail(
-                    exit::ERROR,
-                    "The approval starts more than two hours from now. Nothing was changed.",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(nb - now));
-        }
+        wait_for_nb(nb, &machine::now_ms, &mut std::thread::sleep)?;
         plan.h = Some(h.clone());
         plan.nb = Some(nb);
         plan.sig = Some(sig);
@@ -791,6 +818,19 @@ fn keys_from_phone(
         let Asked::Reply { reply, .. } = asked else {
             return Err(fail(exit::ERROR, "The phone delayed a key of an approved plan."));
         };
+        if !reply.ok && still_valid && reply.err.as_deref() == Some("plan_expired") {
+            // the approval on file looked current by this machine's clock, but the phone's
+            // window is over (this clock is behind the phone's, or was set back): the approval
+            // is dropped and the phone asked again, with a new number, as for an old one
+            eprintln!("The approval on your phone has expired. Asking it again.");
+            plan.h = None;
+            plan.nb = None;
+            plan.sig = None;
+            if let Some(r) = run {
+                r.write("plan.json", &serde_json::to_vec_pretty(plan)?)?;
+            }
+            return keys_from_phone(plan, pending, run);
+        }
         if !reply.ok {
             return Err(approve::refusal(&reply, None, Some("sealctl unseal")));
         }
@@ -893,6 +933,10 @@ impl Ctx<'_> {
     }
 
     fn done(&mut self, kind: &str, name: &str, to: String, obj: hb::Object) -> Result<()> {
+        // a step run again after a stop replaces what its earlier attempt listed
+        self.handback.retain(|h| !(h.kind == kind && h.name == name));
+        self.objects
+            .retain(|o| !(o.kind == obj.kind && o.name == obj.name));
         self.handback.push(HandbackItem {
             kind: kind.into(),
             name: name.into(),
@@ -985,7 +1029,11 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         let _ = base;
         return Ok("credentials go with the backup.".into());
     }
-    let b = Backup::load(name)?;
+    let b = match Backup::load(name) {
+        Ok(b) => b,
+        Err(e) => return finished_before(c, "backup", name).ok_or(e),
+    };
+    let _lock = crate::backup::lock_repo(&b.repo)?;
     let key = c.key("backup", &b.repo_id)?;
     let mut env = BTreeMap::new();
     if !b.credentials.is_empty() {
@@ -1063,6 +1111,15 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             )?;
         }
     }
+    // what the hand-back list says of it, also in the journal's `changed` line: a resumed run
+    // that finds the definition gone finishes the step from there
+    let obj = hb::Object {
+        kind: "backup".into(),
+        name: b.name.clone(),
+        url: Some(b.repo.clone()),
+        credentials: creds,
+        ..Default::default()
+    };
     let own = Repo::with_password(&b.repo, pw.clone(), env.clone());
     let opens_already = own.opens().unwrap_or(false);
     // a resumed step whose earlier attempt removed sealctl's key already has nothing to change
@@ -1093,7 +1150,7 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             ));
         }
         own.key_remove(&ours, &new_id)?;
-        c.run.log(&step, "changed", "")?;
+        c.run.log(&step, "changed", &serde_json::to_string(&obj)?)?;
         if derived.opens()? {
             return Err(fail(
                 exit::ERROR,
@@ -1101,29 +1158,31 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             ));
         }
     }
-    b.forget()?;
-    if Backup::list()?.is_empty() {
-        let _ = crate::backup::schedule_uninstall();
-    }
+    // the hand-back list names it before its definition goes: a resumed run that finds the
+    // definition gone finishes the step from the list
     let to = loc.describe();
     c.done(
         "backup",
         &b.name,
         to,
         hb::Object {
-            kind: "backup".into(),
-            name: b.name.clone(),
-            url: Some(b.repo.clone()),
             password: Some(loc),
-            credentials: creds,
-            ..Default::default()
+            ..obj
         },
     )?;
+    b.forget()?;
+    if Backup::list()?.is_empty() {
+        let _ = crate::backup::schedule_uninstall();
+    }
     Ok("your password works; sealctl's key is removed.".into())
 }
 
 fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
-    let v = Volume::load(name)?;
+    let v = match Volume::load(name) {
+        Ok(v) => v,
+        Err(e) => return finished_before(c, "volume", name).ok_or(e),
+    };
+    let _lock = v.lock()?;
     let key = c.key("volume", &v.id)?;
     let derived = key.hex();
     let was_open = v.is_open();
@@ -1232,13 +1291,31 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         // the words marker goes with sealctl's key slot (SPEC 18.2)
         volume::luks::remove_tokens(path.as_ref().context("path")?);
     }
-    c.run.log(&step, "changed", "")?;
+    let obj = hb::Object {
+        kind: "volume".into(),
+        name: v.name.clone(),
+        volume: Some(v.kind.as_str().into()),
+        uuid: Some(v.id.clone()),
+        path: v.path.as_ref().map(|p| paths::tilde(p)),
+        ..Default::default()
+    };
+    c.run.log(&step, "changed", &serde_json::to_string(&obj)?)?;
     if opens(derived.as_bytes())? {
         return Err(fail(
             exit::ERROR,
             format!("sealctl's key still opens volume {}.", v.name),
         ));
     }
+    // the hand-back list names it before its definition goes (see `step_backup`)
+    c.done(
+        "volume",
+        &v.name,
+        loc.describe(),
+        hb::Object {
+            password: Some(loc),
+            ..obj
+        },
+    )?;
     match v.kind {
         Kind::Sparsebundle => {
             if let Some(p) = volume::sparsebundle::id_path(&v) {
@@ -1253,22 +1330,44 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     let _ = std::fs::remove_dir_all(v.mountpoint.join(".sealctl"));
     let cfg = paths::volumes_dir()?.join(format!("{}.toml", v.name));
     let _ = std::fs::remove_file(cfg);
-    let to = loc.describe();
-    c.done(
-        "volume",
-        &v.name,
-        to,
-        hb::Object {
-            kind: "volume".into(),
-            name: v.name.clone(),
-            volume: Some(v.kind.as_str().into()),
-            uuid: Some(v.id.clone()),
-            path: v.path.as_ref().map(|p| paths::tilde(p)),
-            password: Some(loc),
-            ..Default::default()
-        },
-    )?;
     Ok("your passphrase works; sealctl's is removed.".into())
+}
+
+/// A volume or backup step whose definition is gone: done already when an earlier attempt of
+/// this run changed the object (its journal's `changed` line) and then stopped before the
+/// step's `done` line. The hand-back entry comes from the list, or else from the journal: the
+/// object from `changed`, its password's place from `password`. Anything else stays the error
+/// of the missing definition.
+fn finished_before(c: &mut Ctx<'_>, kind: &str, name: &str) -> Option<String> {
+    let step = format!("{kind}:{name}");
+    let changed = c.run.last_note(&step, "changed")?;
+    let listed = c
+        .objects
+        .iter()
+        .find(|o| o.kind == kind && o.name == name)
+        .cloned();
+    let obj = match listed {
+        Some(o) => o,
+        None => {
+            let mut o: hb::Object = serde_json::from_str(&changed).ok()?;
+            let pw = c.run.last_note(&step, "password")?;
+            o.password = Some(serde_json::from_str(&pw).ok()?);
+            o
+        }
+    };
+    if obj.kind != kind || obj.name != name || obj.password.is_none() {
+        return None;
+    }
+    let to = obj.password.as_ref().map(|l| l.describe()).unwrap_or_default();
+    c.done(kind, name, to, obj).ok()?;
+    Some(format!(
+        "done by the earlier attempt; your {} works.",
+        if kind == "volume" {
+            "passphrase"
+        } else {
+            "password"
+        }
+    ))
 }
 
 /// `<key file>.pub`: the name gets `.pub` added, so `work.laptop` has `work.laptop.pub`, never
@@ -1930,7 +2029,84 @@ pub fn newest_run() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::pub_of;
+    use std::cell::Cell;
     use std::path::Path;
+    use std::time::Duration;
+
+    /// A fake wall clock for [`super::wait_for_nb`]: `sleep` moves it on by what `step` says
+    /// for each requested duration (the machine asleep, a clock set back, ...).
+    fn waited(
+        start: u64,
+        nb: u64,
+        mut step: impl FnMut(u64, Duration) -> u64,
+    ) -> (anyhow::Result<()>, Vec<Duration>, u64) {
+        let clock = Cell::new(start);
+        let mut sleeps = Vec::new();
+        let r = super::wait_for_nb(nb, &|| clock.get(), &mut |d| {
+            sleeps.push(d);
+            clock.set(step(clock.get(), d));
+        });
+        (r, sleeps, clock.get())
+    }
+
+    const T: u64 = 1_795_300_000_000;
+
+    #[test]
+    fn nb_reached_or_passed_waits_nothing() {
+        let (r, sleeps, _) = waited(T, T, |c, d| c + d.as_millis() as u64);
+        assert!(r.is_ok() && sleeps.is_empty());
+        let (r, sleeps, _) = waited(T, T - 60_000, |c, d| c + d.as_millis() as u64);
+        assert!(r.is_ok() && sleeps.is_empty());
+    }
+
+    /// The machine sleeps while waiting (the wall clock runs on, a monotonic sleep does not):
+    /// the wait ends once the wall clock reaches nb, not after the whole time slept again.
+    #[test]
+    fn a_machine_asleep_while_waiting_for_nb_waits_no_longer() {
+        let nb = T + 40 * 60_000;
+        // the first sleep lasts an hour of wall time (lid closed), the others as asked
+        let mut first = true;
+        let (r, sleeps, end) = waited(T, nb, |c, d| {
+            let to = if first {
+                c + 3_600_000
+            } else {
+                c + d.as_millis() as u64
+            };
+            first = false;
+            to
+        });
+        assert!(r.is_ok());
+        assert_eq!(sleeps.len(), 1, "checked against the wall clock after the sleep");
+        assert!(sleeps[0] <= Duration::from_secs(60), "{sleeps:?}");
+        assert_eq!(end, T + 3_600_000);
+    }
+
+    /// The clock set back by minutes while waiting: never before nb by the clock as it is.
+    #[test]
+    fn a_clock_set_back_while_waiting_still_waits_for_nb() {
+        let nb = T + 3 * 60_000;
+        let mut n = 0;
+        let (r, _, end) = waited(T, nb, |c, d| {
+            n += 1;
+            let c = c + d.as_millis() as u64;
+            if n == 1 {
+                c - 10 * 60_000
+            } else {
+                c
+            }
+        });
+        assert!(r.is_ok());
+        assert!(end >= nb, "{end} < {nb}");
+    }
+
+    /// The clock set back by hours while waiting, or nb hours away: refused, nothing done.
+    #[test]
+    fn hours_to_nb_are_refused() {
+        let (r, sleeps, _) = waited(T, T + 131 * 60_000, |c, d| c + d.as_millis() as u64);
+        assert!(r.is_err() && sleeps.is_empty());
+        let (r, _, _) = waited(T, T + 5 * 60_000, |c, d| c + d.as_millis() as u64 - 3 * 3_600_000);
+        assert!(r.is_err());
+    }
 
     #[test]
     fn a_dotted_key_name_keeps_its_own_public_file() {

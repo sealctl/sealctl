@@ -77,6 +77,9 @@ jobs:
       - run: cargo test --locked
       # tests that kill a run at a set point of its journal (SEALCTL_TEST_KILL, test-hooks only)
       - run: cargo test --locked -p sealctl --features test-hooks --test unseal resume_after_a_kill
+      # long operations against each other: kill points, stand-in restic, a phone that holds
+      # requests, and the phone's clock moved on (every test of the file, hooks included)
+      - run: cargo test --locked -p sealctl --features test-hooks --test long_ops
       - if: runner.os == 'macOS'
         run: cargo test --locked -p sealctl --features test-hooks --test volumes resumed
       # the keychain store, in the keychain file made above (macOS runner only)

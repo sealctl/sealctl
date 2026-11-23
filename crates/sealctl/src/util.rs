@@ -202,6 +202,132 @@ fn clear_script(secs: u64, paste: &str, hash: &str, copy: &str) -> String {
     )
 }
 
+/// A lock on one object (a volume, a restic repository) among sealctl's long operations on
+/// this machine: `seal`, `unseal`, `migrate` (rewrap and re-encryption) and `backup run` each
+/// hold it while they change or write the object, so two of them never interleave on it. An
+/// exclusive `flock` on `<state>/locks/<hash of key>.lock`, released when the value drops (or
+/// the process ends). A second command is told the object is busy (exit 11).
+pub struct ObjectLock {
+    _f: nix::fcntl::Flock<std::fs::File>,
+}
+
+/// How [`lock_named`] takes its lock.
+#[derive(Clone, Copy, Debug)]
+pub enum LockHow {
+    /// Exclusive, never waits.
+    Exclusive,
+    /// Shared, never waits.
+    Shared,
+    /// Exclusive, waiting up to the given time for the holders to finish.
+    ExclusiveWait(std::time::Duration),
+}
+
+/// The folder of the lock files: `<state>/locks` (local to this machine, never synced with a
+/// store folder). Unit tests use a folder of their own.
+fn locks_dir() -> Result<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(std::env::temp_dir().join(format!("sealctl-test-locks-{}", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        Ok(crate::paths::state_dir()?.join("locks"))
+    }
+}
+
+/// Takes the lock file `<state>/locks/<file>`. Only a lock held by another process makes it
+/// busy (exit 11, `busy` names it); a file system that cannot lock is reported as it is.
+/// `waiting` is called once if an [`LockHow::ExclusiveWait`] has to wait.
+pub fn lock_named(
+    file: &str,
+    how: LockHow,
+    busy: &dyn Fn() -> String,
+    waiting: &mut dyn FnMut(),
+) -> Result<ObjectLock> {
+    use nix::fcntl::{Flock, FlockArg};
+    let dir = locks_dir()?;
+    crate::paths::ensure_private_dir(&dir)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(file))?;
+    let (arg, until) = match how {
+        LockHow::Exclusive => (FlockArg::LockExclusiveNonblock, None),
+        LockHow::Shared => (FlockArg::LockSharedNonblock, None),
+        LockHow::ExclusiveWait(d) => (
+            FlockArg::LockExclusiveNonblock,
+            Some(std::time::Instant::now() + d),
+        ),
+    };
+    let mut waited = false;
+    loop {
+        match Flock::lock(f, arg) {
+            Ok(l) => return Ok(ObjectLock { _f: l }),
+            Err((back, nix::errno::Errno::EWOULDBLOCK)) => match until {
+                Some(t) if std::time::Instant::now() < t => {
+                    if !waited {
+                        waited = true;
+                        waiting();
+                    }
+                    f = back;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                _ => return Err(crate::exit::fail(crate::exit::BUSY, busy())),
+            },
+            Err((_, e)) => {
+                return Err(anyhow::anyhow!(
+                    "locking {}: {e}",
+                    crate::paths::tilde(&dir.join(file))
+                ))
+            }
+        }
+    }
+}
+
+fn object_busy(what: &str) -> String {
+    format!("{what} is busy: another sealctl command is changing it. Try again once it ends.")
+}
+
+fn object_file(key: &str) -> String {
+    format!("{}.lock", &sha256_hex(key.as_bytes())[..24])
+}
+
+/// Takes the [`ObjectLock`] of `key` (a canonical path, or `<kind>:<id>`); `what` names the
+/// object in the message. Never waits.
+pub fn object_lock(key: &str, what: &str) -> Result<ObjectLock> {
+    lock_named(
+        &object_file(key),
+        LockHow::Exclusive,
+        &|| object_busy(what),
+        &mut || {},
+    )
+}
+
+/// [`object_lock`], waiting up to `max` for the command holding it; `waiting` is called once
+/// when it has to wait.
+pub fn object_lock_wait(
+    key: &str,
+    what: &str,
+    max: std::time::Duration,
+    waiting: &mut dyn FnMut(),
+) -> Result<ObjectLock> {
+    lock_named(
+        &object_file(key),
+        LockHow::ExclusiveWait(max),
+        &|| object_busy(what),
+        waiting,
+    )
+}
+
+/// The [`object_lock`] key of a file or folder: its canonical path.
+pub fn path_key(p: &std::path::Path) -> String {
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(data)
