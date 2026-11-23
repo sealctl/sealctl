@@ -49,10 +49,20 @@ fn spawn() -> Result<UnixStream> {
         Some(f) => cmd.stderr(f),
         None => cmd.stderr(std::process::Stdio::null()),
     };
-    cmd.spawn().context("starting the sealctl daemon")?;
-    for _ in 0..100 {
+    let mut child = cmd.spawn().context("starting the sealctl daemon")?;
+    // The new daemon may wait up to 30 s for `daemon.lock` while a daemon of another version
+    // locks on its way out (unmounts, a last status), so wait while it is still starting.
+    let until = std::time::Instant::now() + Duration::from_secs(40);
+    while std::time::Instant::now() < until {
         if let Some(s) = connect() {
             return Ok(s);
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            // it exited: another daemon may have bound the socket meanwhile
+            if let Some(s) = connect() {
+                return Ok(s);
+            }
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }

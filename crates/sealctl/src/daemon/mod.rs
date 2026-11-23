@@ -65,6 +65,59 @@ pub struct Pending {
     pub at: u64,
 }
 
+/// The usage log (protocol.md, Machine status): uses wait here until a status that carried
+/// them is acknowledged. Each status carries the oldest 50 waiting, and an `ack` removes only
+/// what the acknowledged status carried.
+#[derive(Default)]
+struct UsageLog {
+    /// Entries with their number, oldest first.
+    entries: Vec<(u64, LogEntry)>,
+    next: u64,
+    /// `(status seq, number of the newest entry it carried)`, oldest first.
+    carried: Vec<(u64, u64)>,
+}
+
+impl UsageLog {
+    const KEEP: usize = 200;
+    const PER_STATUS: usize = 50;
+
+    fn push(&mut self, e: LogEntry) {
+        self.next += 1;
+        self.entries.push((self.next, e));
+        if self.entries.len() > Self::KEEP {
+            let drop = self.entries.len() - Self::KEEP;
+            self.entries.drain(..drop);
+        }
+    }
+
+    /// The entries the status `seq` carries, remembered for its `ack`.
+    fn carry(&mut self, seq: u64) -> Vec<LogEntry> {
+        let batch: Vec<&(u64, LogEntry)> = self.entries.iter().take(Self::PER_STATUS).collect();
+        if let Some((last, _)) = batch.last() {
+            self.carried.push((seq, *last));
+            if self.carried.len() > 100 {
+                self.carried.remove(0);
+            }
+        }
+        batch.into_iter().map(|(_, e)| e.clone()).collect()
+    }
+
+    /// The phone stored status `seq`: its entries are done. Returns whether any are left.
+    fn ack(&mut self, seq: u64) -> bool {
+        let upto = self
+            .carried
+            .iter()
+            .filter(|(s, _)| *s <= seq)
+            .map(|(_, n)| *n)
+            .max();
+        self.carried.retain(|(s, _)| *s > seq);
+        if let Some(upto) = upto {
+            self.entries.retain(|(n, _)| *n > upto);
+        }
+        !self.entries.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct State {
     open: bool,
@@ -73,9 +126,11 @@ struct State {
     store_key: Option<ObjectKey>,
     keys: BTreeMap<String, ObjectKey>,
     allowed: BTreeSet<Allowed>,
+    /// Parts of an `answers` list whose last part has not arrived yet.
+    answers_parts: Vec<Allowed>,
     words: Option<String>,
     waiting_since: Option<u64>,
-    log: Vec<LogEntry>,
+    log: UsageLog,
     pending: Vec<Pending>,
     clients: usize,
     last_client: u64,
@@ -90,6 +145,9 @@ struct State {
 pub struct Daemon {
     st: Mutex<State>,
     asking: tokio::sync::Mutex<()>,
+    /// Held from the check that the session is Locked through the `open` it asks for, so that
+    /// callers arriving meanwhile join that open instead of sending their own (SPEC 6.3).
+    opening: tokio::sync::Mutex<()>,
     paired: tokio::sync::Mutex<Paired>,
     relay: Relay,
     inproc: bool,
@@ -183,6 +241,7 @@ impl Daemon {
         Ok(Arc::new(Daemon {
             st: Mutex::new(st),
             asking: tokio::sync::Mutex::new(()),
+            opening: tokio::sync::Mutex::new(()),
             paired: tokio::sync::Mutex::new(paired),
             relay,
             inproc,
@@ -192,6 +251,28 @@ impl Daemon {
 
     fn st(&self) -> std::sync::MutexGuard<'_, State> {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The turn to open the session (SPEC 6.3): a caller that finds an open pending waits for it
+    /// and is told it is waiting for the phone, like the caller that asked. On an Open session the
+    /// other holder usually needs the turn only for a moment, so the caller is told only when the
+    /// phone is being asked or the turn has not come within half a second.
+    async fn join_open(&self, ev: &Events) -> tokio::sync::MutexGuard<'_, ()> {
+        if let Ok(g) = self.opening.try_lock() {
+            return g;
+        }
+        let phone = {
+            let st = self.st();
+            !st.open || st.waiting_since.is_some()
+        };
+        if !phone {
+            let soon = tokio::time::timeout(Duration::from_millis(500), self.opening.lock());
+            if let Ok(g) = soon.await {
+                return g;
+            }
+        }
+        ev(json!({"event": "waiting"}));
+        self.opening.lock().await
     }
 
     /// Asks the phone; one request at a time.
@@ -396,6 +477,7 @@ impl Daemon {
 
     /// `open`.
     pub async fn op_open(self: &Arc<Self>, ctx: RequestContext, ev: &Events, notify: bool) -> Result<Value> {
+        let _opening = self.join_open(ev).await;
         if !self.st().open {
             let (session, _) = self.open_session(vec![], vec![], ctx, ev, notify).await?;
             if !session {
@@ -432,6 +514,9 @@ impl Daemon {
             .await;
         let mut ctx_n = ctx.clone();
         ctx_n.names = req.names.iter().take(10).cloned().collect();
+        // what is not covered yet is judged after any pending open: a caller that joined it may
+        // find its uses granted for the session already
+        let opening = self.join_open(ev).await;
         let remembered = load_answers();
         let uncovered: Vec<String> = match &req.agent {
             Some(a) => req
@@ -458,21 +543,26 @@ impl Daemon {
             _ => vec![],
         };
         let mut once_store_key: Option<ObjectKey> = None;
-        let mut granted_uses = false;
-        if !self.st().open {
+        // Agent uses are kept for the session only when the phone granted `session`; a `once`
+        // answer covers this call and nothing after it.
+        let mut session_uses = false;
+        let was_open = self.st().open;
+        if !was_open {
             let (session, set) = self
                 .open_session(vec![], uses.clone(), ctx_n.clone(), ev, req.notify)
                 .await?;
-            granted_uses = true;
+            session_uses = session;
             if !session {
                 once_store_key = set.get("secrets", &store.id);
             }
-        } else if !uses.is_empty() {
+        }
+        drop(opening);
+        if was_open && !uses.is_empty() {
             let mut body = approve::body("agent");
             body.uses = uses.clone();
             body.ctx = Some(ctx_n.clone());
             let reply = self.ask(body, ev, req.notify).await?;
-            granted_uses = true;
+            session_uses = reply.grant.as_deref() == Some("session");
             if reply.remember == Some(true) {
                 let mut a = load_answers();
                 for u in &uses {
@@ -489,7 +579,7 @@ impl Daemon {
                 save_answers(&a);
             }
         }
-        if granted_uses {
+        if session_uses {
             let mut st = self.st();
             for u in &uses {
                 for n in &u.names {
@@ -551,10 +641,6 @@ impl Daemon {
                 names: req.names.clone(),
                 own: !own.is_empty(),
             });
-            if st.log.len() > 200 {
-                let drop = st.log.len() - 200;
-                st.log.drain(..drop);
-            }
             st.status_dirty = true;
         }
         self.count_used(out.len() as u64);
@@ -569,24 +655,22 @@ impl Daemon {
         ev: &Events,
         notify: bool,
     ) -> Result<(Vec<ObjectKey>, String)> {
-        let held: Option<Vec<ObjectKey>> = {
+        let held = || -> Option<(Vec<ObjectKey>, String)> {
             let st = self.st();
-            if st.open {
-                items
-                    .iter()
-                    .map(|i| st.keys.get(&key_name(&i.purpose, &i.id)).map(copy_key))
-                    .collect()
-            } else {
-                None
+            if !st.open || items.iter().any(|i| i.words.is_none()) {
+                return None;
             }
+            let keys = items
+                .iter()
+                .map(|i| st.keys.get(&key_name(&i.purpose, &i.id)).map(copy_key))
+                .collect::<Option<Vec<_>>>()?;
+            Some((keys, st.words.clone().unwrap_or_default()))
         };
-        if let Some(h) = held {
-            let w = self.st().words.clone().unwrap_or_default();
-            if !items.iter().any(|i| i.words.is_none()) {
-                return Ok((h, w));
-            }
+        if let Some(h) = held() {
+            return Ok(h);
         }
         let ctx = self.context(None, "", "", subject).await;
+        let opening = self.join_open(ev).await;
         if !self.st().open {
             let (_, set) = self.open_session(items.clone(), vec![], ctx, ev, notify).await?;
             let keys = items
@@ -595,6 +679,11 @@ impl Daemon {
                 .collect::<Result<Vec<_>>>()?;
             let w = self.st().words.clone().unwrap_or_default();
             return Ok((keys, w));
+        }
+        drop(opening);
+        // the session was opened while this request waited for that open
+        if let Some(h) = held() {
+            return Ok(h);
         }
         let mut body = approve::body("keys");
         body.keys = items.clone();
@@ -616,6 +705,9 @@ impl Daemon {
         let action = req["action"].as_str().unwrap_or("");
         let name = req["name"].as_str().unwrap_or("").to_string();
         crate::store::check_name(&name)?;
+        // a `once` key serves this write only; it never goes into the session's state
+        let mut once_key: Option<ObjectKey> = None;
+        let opening = self.join_open(ev).await;
         if !self.st().open {
             let ctx = self
                 .context(None, "", "", Some(("secret".into(), name.clone())))
@@ -624,16 +716,19 @@ impl Daemon {
                 .open_session(vec![], vec![], ctx, ev, req["notify"].as_bool().unwrap_or(false))
                 .await?;
             if !session {
-                let k = set.get("secrets", &store.id);
-                self.st().store_key = k;
+                once_key = set.get("secrets", &store.id);
             }
         }
-        let key = self
-            .st()
-            .store_key
-            .as_ref()
-            .map(copy_key)
-            .ok_or_else(|| fail(exit::ERROR, "No store key."))?;
+        drop(opening);
+        let key = match once_key {
+            Some(k) => k,
+            None => self
+                .st()
+                .store_key
+                .as_ref()
+                .map(copy_key)
+                .ok_or_else(|| fail(exit::ERROR, "No store key."))?,
+        };
         let words = store.id_file()?.map(|f| f.words).unwrap_or_default();
         match action {
             "set" => {
@@ -719,34 +814,60 @@ impl Daemon {
 
     /// Locks: wipes keys, runs on-lock backups, unmounts volumes, tells the phone.
     pub async fn lock(&self, reason: &str, no_backup: bool, force: bool) -> Value {
-        let was_open = {
+        // SPEC 6.5 step 1: the session closes and its keys leave the shared state before
+        // anything slow runs, so nothing is handed out while backups and unmounts go on, and a
+        // second lock meanwhile finds the session Locked. The backups get their keys and
+        // credentials here; everything else taken is wiped when it drops.
+        let (was_open, store_key, keys, channel) = {
             let mut st = self.st();
             st.allowed.clear();
-            st.open
+            st.answers_parts.clear();
+            let was_open = std::mem::replace(&mut st.open, false);
+            st.saved.lock_reason = match reason {
+                "phone" => Some("Locked from your phone".into()),
+                "place" => Some("Locked: your phone left the place".into()),
+                _ => None,
+            };
+            save_saved(&st.saved);
+            st.status_dirty = true;
+            (
+                was_open,
+                st.store_key.take(),
+                std::mem::take(&mut st.keys),
+                st.channel.take(),
+            )
         };
-        let mut lines = Vec::new();
-        let mut busy = Vec::new();
-        // on-lock backups with the keys still held
+        let mut jobs = Vec::new();
         if was_open && !no_backup && reason != "words" && reason != "unpaired" {
             for b in Backup::list().unwrap_or_default() {
                 if !b.policy.on_lock {
                     continue;
                 }
-                let key = self.st().keys.get(&key_name("backup", &b.repo_id)).map(copy_key);
-                let Some(key) = key else { continue };
-                let env = self.backup_env(&b);
-                let name = b.name.clone();
-                let r = tokio::time::timeout(
-                    Duration::from_secs(15 * 60),
-                    tokio::task::spawn_blocking(move || crate::backup::run_one(&b, &key, env, true)),
-                )
-                .await;
-                match r {
-                    Ok(Ok(Ok(()))) => lines.push(format!("Backed up {name}.")),
-                    _ => lines.push(format!(
-                        "Backup {name} failed; run sealctl backup run {name} later."
-                    )),
-                }
+                let Some(key) = keys.get(&key_name("backup", &b.repo_id)).map(copy_key) else {
+                    continue;
+                };
+                let env = Self::backup_env(&b, store_key.as_ref());
+                jobs.push((b, key, env));
+            }
+        }
+        drop(store_key);
+        drop(keys);
+        let mut lines = Vec::new();
+        let mut busy = Vec::new();
+        // step 2: on-lock backups, at most 15 minutes in total
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        for (b, key, env) in jobs {
+            let name = b.name.clone();
+            let r = tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || crate::backup::run_one(&b, &key, env, true)),
+            )
+            .await;
+            match r {
+                Ok(Ok(Ok(()))) => lines.push(format!("Backed up {name}.")),
+                _ => lines.push(format!(
+                    "Backup {name} failed; run sealctl backup run {name} later."
+                )),
             }
         }
         // unmount
@@ -780,22 +901,18 @@ impl Daemon {
                 Err(_) => {}
             }
         }
-        let channel = {
+        {
             let mut st = self.st();
-            // the store key went with the backups' credentials; now every key goes
-            st.store_key = None;
-            st.keys.clear();
-            st.mounted.clear();
-            st.open = false;
-            st.saved.lock_reason = match reason {
-                "phone" => Some("Locked from your phone".into()),
-                "place" => Some("Locked: your phone left the place".into()),
-                _ => None,
-            };
-            save_saved(&st.saved);
+            // Unless the phone approved a new session meanwhile, wipe what came in during the
+            // lock: a key or agent use approved by a request that started before it.
+            if !st.open {
+                st.store_key = None;
+                st.keys.clear();
+                st.allowed.clear();
+                st.mounted.clear();
+            }
             st.status_dirty = true;
-            st.channel.take()
-        };
+        }
         if was_open && !self.inproc {
             let _ = self.send_status(&busy).await;
         }
@@ -805,16 +922,15 @@ impl Daemon {
         json!({"lines": lines, "busy": busy.len()})
     }
 
-    /// Storage credentials of a backup, read with the store key the session holds.
-    fn backup_env(&self, b: &Backup) -> BTreeMap<String, Zeroizing<String>> {
+    /// Storage credentials of a backup, read with the session's store key.
+    fn backup_env(b: &Backup, key: Option<&ObjectKey>) -> BTreeMap<String, Zeroizing<String>> {
         let mut env = BTreeMap::new();
         let Ok(store) = Store::configured() else {
             return env;
         };
-        let key = self.st().store_key.as_ref().map(copy_key);
         let Some(key) = key else { return env };
         for var in &b.credentials {
-            if let Ok(v) = store.read(&format!("backup/{}/{var}", b.name), &key) {
+            if let Ok(v) = store.read(&format!("backup/{}/{var}", b.name), key) {
                 env.insert(
                     var.clone(),
                     Zeroizing::new(String::from_utf8_lossy(&v).into_owned()),
@@ -850,13 +966,16 @@ impl Daemon {
     }
 
     /// The machine status for the phone (protocol.md, Machine status).
-    /// The session state and the unacknowledged usage log, as status and reports carry them.
+    /// The session state and the unacknowledged usage log, as the status or report `seq`
+    /// carries them. Called under the `paired` lock that numbered `seq`, so the newest entry a
+    /// status carries never goes back as `seq` grows.
     fn status_parts(
         &self,
         busy: &[sealctl_core::wire::BusyVolume],
+        seq: u64,
     ) -> (sealctl_core::wire::SessionState, Vec<LogEntry>) {
         {
-            let st = self.st();
+            let mut st = self.st();
             let n = now();
             let s = sealctl_core::wire::SessionState {
                 session: if st.waiting_since.is_some() {
@@ -871,34 +990,41 @@ impl Daemon {
                 place: st.saved.place.clone(),
                 busy: busy.to_vec(),
             };
-            (s, st.log.iter().rev().take(50).rev().cloned().collect::<Vec<_>>())
+            let log = st.log.carry(seq);
+            (s, log)
         }
-    }
-
-    /// The next status `seq`.
-    async fn next_seq(&self) -> u64 {
-        let mut paired = self.paired.lock().await;
-        paired.file.status_seq += 1;
-        let _ = paired.file.save();
-        paired.file.status_seq
     }
 
     /// A `report` request body with the status fields (the fallback without a machine channel).
     async fn report_body(&self) -> sealctl_core::wire::RequestBody {
-        let (state, log) = self.status_parts(&[]);
+        let mut paired = self.paired.lock().await;
+        paired.file.status_seq += 1;
+        let seq = paired.file.status_seq;
+        let _ = paired.file.save();
+        let (state, log) = self.status_parts(&[], seq);
+        drop(paired);
         let mut b = approve::body("report");
-        b.seq = Some(self.next_seq().await);
+        b.seq = Some(seq);
         b.state = Some(state);
         b.log = log;
         b
     }
 
+    /// The phone stored the status or report `seq`: drop the uses it carried, and send the
+    /// rest with the next status.
+    pub fn ack(&self, seq: u64) {
+        let mut st = self.st();
+        if st.log.ack(seq) {
+            st.status_dirty = true;
+        }
+    }
+
     async fn send_status(&self, busy: &[sealctl_core::wire::BusyVolume]) -> Result<()> {
-        let (state, log) = self.status_parts(busy);
         let mut paired = self.paired.lock().await;
         paired.file.status_seq += 1;
         let seq = paired.file.status_seq;
         let _ = paired.file.save();
+        let (state, log) = self.status_parts(busy, seq);
         let status = sealctl_core::wire::MachineStatus {
             version: 1,
             time: now(),
@@ -962,27 +1088,31 @@ impl Daemon {
                     self.lock(&reason, reason == "words", false).await;
                 }
             }
-            MessageKind::Answers { answers, .. } => {
-                let a: Vec<Allowed> = answers
-                    .iter()
-                    .flat_map(|x| {
-                        x.names.iter().map(|n| Allowed {
-                            agent: x.agent.clone(),
-                            repo: x.repository.clone(),
-                            name: n.clone(),
-                        })
-                    })
-                    .collect();
-                save_answers(&a);
-            }
-            MessageKind::Ack { ack } => {
+            MessageKind::Answers { answers, more } => {
+                // a long list comes in parts; the list is replaced when the last part arrives
                 let mut st = self.st();
-                if ack > 0 {
-                    st.log.clear();
+                st.answers_parts.extend(answers.iter().flat_map(|x| {
+                    x.names.iter().map(|n| Allowed {
+                        agent: x.agent.clone(),
+                        repo: x.repository.clone(),
+                        name: n.clone(),
+                    })
+                }));
+                if !more {
+                    let a = std::mem::take(&mut st.answers_parts);
+                    drop(st);
+                    save_answers(&a);
                 }
             }
+            MessageKind::Ack { ack } => self.ack(ack),
             MessageKind::Notice { notice } => self.on_notice(&notice),
         }
+    }
+
+    /// Drops `answers` parts of a list that never finished (its last part lost or expired);
+    /// called when a new machine socket or report session starts.
+    pub fn reset_answer_parts(&self) {
+        self.st().answers_parts.clear();
     }
 
     fn on_notice(&self, n: &sealctl_core::wire::Notice) {
@@ -1144,7 +1274,7 @@ impl Daemon {
             "store" => self.op_store(&req, &ev).await,
             "exit" => {
                 self.lock("cli", true, false).await;
-                self.shutdown.notify_waiters();
+                self.shutdown.notify_one();
                 Ok(json!({}))
             }
             other => Err(fail(exit::USAGE, format!("unknown daemon op {other}"))),
@@ -1171,8 +1301,52 @@ pub fn idle_input_secs() -> Option<u64> {
     Some(ns / 1_000_000_000)
 }
 
+/// SPEC 6.7: no core dumps, and no other process of this user attaching a debugger or
+/// reading the daemon's memory.
 fn harden() {
     let _ = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0);
+    #[cfg(target_os = "linux")]
+    if let Err(e) = nix::sys::prctl::set_dumpable(false) {
+        log::info!("PR_SET_DUMPABLE: {e}");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: PT_DENY_ATTACH takes no address or data and only marks this process.
+        let r = unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) };
+        if r != 0 {
+            log::info!("PT_DENY_ATTACH: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+/// One daemon per user: `daemon.lock` beside the socket, held while the daemon runs. A lock
+/// held by a daemon that does not answer yet (starting) or any more (locking on its way out)
+/// is waited for; one that answers means this daemon is not needed.
+async fn instance_lock(sock: &std::path::Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = sock.with_file_name("daemon.lock");
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .context("opening daemon.lock")?;
+        match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
+            Ok(l) => return Ok(l),
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
+                if tokio::net::UnixStream::connect(sock).await.is_ok() || tokio::time::Instant::now() >= until
+                {
+                    return Err(fail(exit::USAGE, "The daemon is running already."));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err((_, e)) => return Err(anyhow::Error::from(e).context("locking daemon.lock")),
+        }
+    }
 }
 
 async fn serve_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) {
@@ -1230,7 +1404,7 @@ async fn serve_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) {
         let _ = w.write_all(format!("{answer}\n").as_bytes()).await;
         let _ = w.flush().await;
         if !version_ok {
-            d.shutdown.notify_waiters();
+            d.shutdown.notify_one();
         }
     }
     let mut st = d.st();
@@ -1247,12 +1421,11 @@ pub fn run(spawned: bool) -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let d = Daemon::new(false)?;
         let sock = paths::daemon_socket()?;
         paths::ensure_private_dir(sock.parent().context("state dir")?)?;
-        if tokio::net::UnixStream::connect(&sock).await.is_ok() {
-            return Err(fail(exit::USAGE, "The daemon is running already."));
-        }
+        // the state is read only once a daemon locking on its way out has written it
+        let _instance = instance_lock(&sock).await?;
+        let d = Daemon::new(false)?;
         let _ = std::fs::remove_file(&sock);
         let listener = tokio::net::UnixListener::bind(&sock).context("binding the daemon socket")?;
         use std::os::unix::fs::PermissionsExt;
@@ -1272,7 +1445,7 @@ pub fn run(spawned: bool) -> Result<()> {
                             && now().saturating_sub(st.last_client) > 10 * 60 * 1000
                         {
                             drop(st);
-                            d.shutdown.notify_waiters();
+                            d.shutdown.notify_one();
                         }
                     }
                 }
@@ -1286,15 +1459,80 @@ pub fn run(spawned: bool) -> Result<()> {
                     }
                 }
                 _ = d.shutdown.notified() => break,
-                _ = tokio::signal::ctrl_c() => {
-                    d.lock("cli", true, false).await;
-                    break;
-                }
+                _ = tokio::signal::ctrl_c() => break,
             }
         }
         ticker.abort();
+        // Stop taking requests first, so the next CLI call starts the new daemon (which waits
+        // for `daemon.lock`); then lock as any daemon exit does (SPEC 6.3), the version
+        // mismatch included.
+        drop(listener);
         let _ = std::fs::remove_file(&sock);
+        if d.st().open {
+            d.lock("cli", true, false).await;
+        }
         let _ = std::fs::remove_file(paths::ssh_agent_socket()?);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(i: u64) -> LogEntry {
+        LogEntry {
+            time: i,
+            ..LogEntry::default()
+        }
+    }
+
+    fn times(v: &[LogEntry]) -> Vec<u64> {
+        v.iter().map(|e| e.time).collect()
+    }
+
+    #[test]
+    fn an_ack_drops_only_what_its_status_carried() {
+        let mut log = UsageLog::default();
+        for i in 1..=3 {
+            log.push(entry(i));
+        }
+        assert_eq!(times(&log.carry(7)), [1, 2, 3]);
+        // a use after status 7 was built, before its ack
+        log.push(entry(4));
+        assert!(log.ack(7));
+        assert_eq!(times(&log.carry(8)), [4]);
+        // an ack of an older status changes nothing more
+        assert!(log.ack(7));
+        assert!(!log.ack(8));
+        assert!(log.carry(9).is_empty());
+    }
+
+    #[test]
+    fn a_backlog_goes_out_oldest_first_fifty_at_a_time() {
+        let mut log = UsageLog::default();
+        for i in 1..=120 {
+            log.push(entry(i));
+        }
+        let first = log.carry(1);
+        assert_eq!(times(&first), (1..=50).collect::<Vec<_>>());
+        assert!(log.ack(1));
+        assert_eq!(times(&log.carry(2)), (51..=100).collect::<Vec<_>>());
+        assert!(log.ack(2));
+        assert_eq!(times(&log.carry(3)), (101..=120).collect::<Vec<_>>());
+        assert!(!log.ack(3));
+    }
+
+    #[test]
+    fn the_log_keeps_the_newest_two_hundred() {
+        let mut log = UsageLog::default();
+        for i in 1..=250 {
+            log.push(entry(i));
+        }
+        assert_eq!(log.carry(1)[0].time, 51);
+        // an ack for a status this daemon did not send drops nothing
+        let mut fresh = UsageLog::default();
+        fresh.push(entry(1));
+        assert!(fresh.ack(99));
+    }
 }

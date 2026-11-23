@@ -24,11 +24,13 @@ program gets the key while the agent sees only `****`.
      `AI_AGENT`, …; force with `SEALCTL_AGENT=1`).
    * The credential helpers (`sealctl git credential`, `sealctl aws credentials`) answer inside
      an agent only when git or the AWS CLI itself started them: sealctl looks at the executables
-     of its parent processes (git or a `git-*` program through at most one `sh -c`; the `aws`
-     program). The agent calling a helper from its shell, through `sh -c`, or with
-     `git credential fill` gets exit 8, whether its output is a pipe or a terminal. Inside an
-     agent, a helper also recognises the agent's own program among its parents, so removing the
-     variables does not get around it. `git push` and `aws s3 ls` run by an agent work as
+     of its parent processes (git's transports such as `git-remote-https`, or `git-lfs`,
+     through at most one `sh -c`; the `aws` program). The `git` program itself only passes the
+     answer on, so a git alias, pager or hook that runs a helper is refused too. The agent
+     calling a helper from its shell, through `sh -c`, or with `git credential fill` gets
+     exit 8, whether its output is a pipe or a terminal. Inside an agent, a helper also
+     recognises the agent's own program among its parents, so removing the variables does not
+     get around it. `git push` and `aws s3 ls` run by an agent work as
      before; a program that uses an AWS SDK directly does not (run it yourself).
    * An agent's first use of a secret in a repository during a session asks the phone (the
      card shows the agent, the repository, the command and the secret names); the phone can
@@ -85,8 +87,8 @@ Files sealctl changes are backed up once as `<file>.before-sealctl`.
   attacker. A program you run with `sealctl run` can always read its own secrets.
 * The credential helpers' check of who started them reads executable names on the process
   tree. It stops an agent calling them directly, not code running as you that sets out to get
-  around it (a copy of a shell named `git`, git's trace output with redaction off). `git push`
-  run by an agent uses the token, as intended, and the phone logs the use.
+  around it (a copy of a shell named `git-remote-https`, git's trace output with redaction
+  off). `git push` run by an agent uses the token, as intended, and the phone logs the use.
 * Detection of keys is by pattern (known token formats plus random-looking `key = value`). A
   false alarm can be overridden by starting the prompt with `#nosecret`.
 * After `brew upgrade` nothing needs reinstalling: hooks call `/opt/homebrew/bin/sealctl`.

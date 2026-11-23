@@ -8,8 +8,9 @@
 //! that runs the helper itself (from its shell, `sh -c`, `git credential fill`, …) is refused.
 //!
 //! This is a check on the process tree, not a security boundary against code running as the same
-//! user: such code can name a copy of a shell `git`. The agent hooks and deny rules (section 11)
-//! are the other layer; every value given out is still a use of the secret, approved and logged.
+//! user: such code can name a copy of a shell `git-remote-https`. The agent hooks and deny rules
+//! (section 11) are the other layer; every value given out is still a use of the secret, approved
+//! and logged.
 
 use std::path::{Path, PathBuf};
 
@@ -194,25 +195,48 @@ fn is_git(p: &Proc) -> bool {
     n == "git" || n.starts_with("git-")
 }
 
-/// A git process asked for a credential on someone else's behalf: `git credential fill` (also
-/// through `-c alias.x=credential`), whose answer goes to whoever ran it.
-fn is_git_front_end(p: &Proc) -> bool {
-    p.argv.iter().skip(1).any(|a| a.contains("credential"))
+/// The programs of git's that ask a credential helper for their own use: the HTTP and FTP
+/// transports and the other programs built on git's HTTP code, and Git LFS (which asks through
+/// `git credential fill`). Matched by the executable the kernel ran.
+const GIT_ASKERS: &[&str] = &[
+    "git-remote-http",
+    "git-remote-https",
+    "git-remote-ftp",
+    "git-remote-ftps",
+    "git-http-fetch",
+    "git-http-push",
+    "git-imap-send",
+    "git-lfs",
+];
+
+/// Whether a git process asks for a credential for its own use (`Some(true)`) or only passes on
+/// what it is given (`Some(false)`); `None` when it is not git.
+///
+/// Only the programs in [`GIT_ASKERS`] ask for their own use. The `git` program itself never
+/// runs a credential helper for `push`, `fetch` or `clone` (its transports do, as child
+/// processes), so a helper whose nearest git is `git` was started for whoever ran that git:
+/// `git credential fill`, an alias (from `-c`, `--config-env`, `GIT_CONFIG_*` or a config file,
+/// in any case), a pager, a hook or any other command git runs from its configuration. Such a
+/// git is a relay whatever its arguments say, and counts only if an asker started it in turn.
+/// The same holds for `git-credential` and any other `git-*` program not in the list.
+fn git_asks(p: &Proc) -> Option<bool> {
+    is_git(p).then(|| GIT_ASKERS.contains(&p.name()))
 }
 
 fn is_aws(p: &Proc) -> bool {
     let n = p.name();
-    if n == "aws" {
-        return true;
-    }
-    // AWS CLI v1: `python3 /usr/local/bin/aws …`
-    n.starts_with("python") && p.argv.get(1).is_some_and(|a| base(a) == "aws")
+    // AWS CLI v1: `python3 /usr/local/bin/aws …`; a macOS framework build runs as `Python`
+    let aws = n == "aws"
+        || (n.to_ascii_lowercase().starts_with("python") && p.argv.get(1).is_some_and(|a| base(a) == "aws"));
+    // `aws configure export-credentials` prints what the helper gives it
+    aws && !p.argv.iter().any(|a| a == "export-credentials")
 }
 
-/// Whether `chain` (parent first) shows the helper started by `tool` itself: git (or one of its
-/// `git-*` programs) or the AWS CLI, with at most one shell in between (git runs `!` helpers
-/// through `sh -c`). A git process that only relays the answer (`git credential fill`) counts
-/// only if git started it in turn, as git-lfs and git-send-email do.
+/// Whether `chain` (parent first) shows the helper started by `tool` itself: one of git's
+/// programs that asks for its own use ([`git_asks`]) or the AWS CLI, with at most one shell in
+/// between (git runs `!` helpers through `sh -c`). A git process that only relays the answer
+/// (`git credential fill`, the `git` program) counts only if an asker started it in turn, as
+/// git-lfs does.
 pub fn started_by(tool: Tool, chain: &[Proc]) -> bool {
     let mut i = 0;
     // up to 4 relays (git credential fill run by git-lfs run by git …)
@@ -223,9 +247,11 @@ pub fn started_by(tool: Tool, chain: &[Proc]) -> bool {
         let Some(p) = chain.get(i) else { return false };
         match tool {
             Tool::Aws => return is_aws(p),
-            Tool::Git if !is_git(p) => return false,
-            Tool::Git if !is_git_front_end(p) => return true,
-            Tool::Git => i += 1,
+            Tool::Git => match git_asks(p) {
+                None => return false,
+                Some(true) => return true,
+                Some(false) => i += 1,
+            },
         }
     }
     false
@@ -306,6 +332,20 @@ mod tests {
         }
     }
 
+    /// `[sh -c helper, <git>, agent shell, agent]`
+    fn via(git: Proc) -> Vec<Proc> {
+        vec![
+            p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+            git,
+            agent_shell(),
+            agent(),
+        ]
+    }
+
+    fn git(argv: &[&str]) -> Proc {
+        p("/usr/bin/git", argv)
+    }
+
     fn agent() -> Proc {
         p(
             "/opt/homebrew/bin/node",
@@ -338,6 +378,30 @@ mod tests {
         assert!(started_by(Tool::Git, &chain));
         // without the shell (a helper configured without `!`)
         assert!(started_by(Tool::Git, &chain[1..]));
+        // arguments that only mention credentials: git itself still asks
+        let clone = [
+            p(
+                "/usr/libexec/git-core/git-remote-https",
+                &[
+                    "git-remote-https",
+                    "origin",
+                    "https://github.com/o/git-credential-manager",
+                ],
+            ),
+            p(
+                "/usr/bin/git",
+                &[
+                    "git",
+                    "-c",
+                    "credential.useHttpPath=true",
+                    "clone",
+                    "https://github.com/o/git-credential-manager",
+                ],
+            ),
+            agent_shell(),
+            agent(),
+        ];
+        assert!(started_by(Tool::Git, &clone));
         // git-lfs runs `git credential fill`, which runs the helper
         let lfs = [
             p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
@@ -348,6 +412,51 @@ mod tests {
             agent(),
         ];
         assert!(started_by(Tool::Git, &lfs));
+        // as seen with Homebrew git 2.52: `git ls-remote` runs `git remote-http`, which runs the
+        // transport (a symlink resolved to its target)
+        let homebrew = [
+            p("/bin/sh", &["/bin/sh", "/opt/sealctl-helper", "get"]),
+            p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/libexec/git-core/git-remote-http",
+                &[
+                    "/opt/homebrew/opt/git/libexec/git-core/git-remote-http",
+                    "http://h/r.git",
+                    "http://h/r.git",
+                ],
+            ),
+            p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/bin/git",
+                &[
+                    "/opt/homebrew/opt/git/libexec/git-core/git",
+                    "remote-http",
+                    "http://h/r.git",
+                ],
+            ),
+            p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/bin/git",
+                &["git", "ls-remote", "http://h/r.git"],
+            ),
+            agent_shell(),
+            agent(),
+        ];
+        assert!(started_by(Tool::Git, &homebrew));
+        // command-line settings and a branch that only mention credentials
+        let push = [
+            p(
+                "/usr/libexec/git-core/git-remote-https",
+                &["git-remote-https", "origin", "https://github.com/a/b"],
+            ),
+            git(&[
+                "git",
+                "-c",
+                "credential.helper=x",
+                "push",
+                "origin",
+                "credential-fix",
+            ]),
+            agent(),
+        ];
+        assert!(started_by(Tool::Git, &push));
     }
 
     #[test]
@@ -382,6 +491,85 @@ mod tests {
                 agent_shell(),
                 agent(),
             ],
+            // with options before the subcommand
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "-C", "/tmp", "-c", "a.b=c", "credential", "fill"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
+            // an option whose value comes as the next argument
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "--shallow-file", "/dev/null", "credential", "fill"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
+            // an option git may add later, not in the list
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "--some-new-option", "v", "credential", "fill"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
+            // an alias given through the environment
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                p(
+                    "/usr/bin/git",
+                    &["git", "--config-env=alias.x=CREDENTIAL_CMD", "x"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
+            // aliases given on the command line, in any case and with quotes git removes
+            via(git(&["git", "-c", "ALIAS.x=credential fill", "x"])),
+            via(git(&["git", "-c", "alias.x=cre\"d\"ential fill", "x"])),
+            via(git(&["git", "--config-env=ALIAS.x=VAR", "x"])),
+            via(git(&["git", "--config-env", "alias.x=VAR", "x"])),
+            via(git(&["git", "-c", "include.path=/tmp/c", "x"])),
+            // an alias from GIT_CONFIG_COUNT/KEY/VALUE, GIT_CONFIG_PARAMETERS or a config file
+            // leaves no trace in the arguments
+            via(git(&["git", "x"])),
+            // a command git runs from its configuration: a pager, a hook
+            via(git(&[
+                "git",
+                "-c",
+                "core.pager=sealctl git credential get",
+                "log",
+            ])),
+            vec![
+                p(
+                    "/bin/sh",
+                    &["/bin/sh", "/tmp/hooks/pre-push", "origin", "https://h/r"],
+                ),
+                git(&["git", "push"]),
+                agent(),
+            ],
+            // `credential` in another case; the dashed form of the git program
+            via(git(&["git", "Credential", "fill"])),
+            via(p(
+                "/opt/homebrew/Cellar/git/2.52.0_1/bin/git",
+                &["git-credential", "fill"],
+            )),
+            // a relay above a relay, with no asker
+            vec![
+                p("/bin/sh", &["sh", "-c", "sealctl git credential get"]),
+                git(&["git", "credential", "fill"]),
+                git(&["git", "x"]),
+                agent(),
+            ],
+            // a git-* program that is not one of git's askers
+            via(p("/usr/local/bin/git-foo", &["git-foo"])),
             // two shells deep
             vec![
                 p("/bin/sh", &["sh", "-c", "x"]),
@@ -409,8 +597,25 @@ mod tests {
                 &["python3", "/usr/local/bin/aws", "s3", "ls"]
             )]
         ));
+        // a macOS framework Python (Homebrew, python.org) runs as `Python`
+        assert!(started_by(
+            Tool::Aws,
+            &[p(
+                "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+                &["/opt/homebrew/opt/python@3.12/bin/python3.12", "/opt/homebrew/bin/aws", "s3", "ls"]
+            )]
+        ));
         for chain in [
             vec![agent_shell(), agent()],
+            // prints the credentials it resolves
+            vec![
+                p(
+                    "/usr/local/aws-cli/aws",
+                    &["aws", "configure", "export-credentials", "--profile", "p"],
+                ),
+                agent_shell(),
+                agent(),
+            ],
             vec![
                 p("/usr/bin/python3.12", &["python3", "-c", "import subprocess"]),
                 agent(),
