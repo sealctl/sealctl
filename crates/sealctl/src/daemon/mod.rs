@@ -36,6 +36,9 @@ use session::Saved;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// How far the phone's clock may be behind the machine's for a `lock` message.
+const LOCK_SKEW_MS: u64 = 60_000;
+
 /// Set in the daemon process (the rewrap after a phone key change starts from there).
 pub static IN_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -138,6 +141,8 @@ impl State {
 #[derive(Default)]
 struct State {
     open: bool,
+    /// When the session's `open` was sent, Unix ms: a `lock` message made more than a minute
+    /// before it is old.
     opened_at: u64,
     saved: Saved,
     store_key: Option<ObjectKey>,
@@ -538,6 +543,7 @@ impl Daemon {
         body.uses = uses;
         body.ctx = Some(ctx);
         body.work = Some(self.st().saved.worked);
+        let asked_at = self.now();
         let reply = self.ask(body, ev, notify).await?;
         let keys = approve::keys_from(&reply, &items)?;
         let words = reply.w.clone().unwrap_or_default();
@@ -552,7 +558,7 @@ impl Daemon {
             let generation = {
                 let mut st = self.st();
                 st.open = true;
-                st.opened_at = n;
+                st.opened_at = asked_at;
                 // past the hard stop, or saved while the clock was ahead: a new day of credit
                 if expired(&st.saved, n) == Some(true)
                     || st.saved.first_open.is_some_and(|f| f > n)
@@ -674,21 +680,27 @@ impl Daemon {
         // find its uses granted for the session already
         let opening = self.join_open(ev).await;
         let remembered = load_answers();
-        let uncovered: Vec<String> = match &req.agent {
-            Some(a) => req
-                .names
-                .iter()
-                .filter(|n| {
-                    let al = Allowed {
-                        agent: a.clone(),
-                        repo: repo.clone(),
-                        name: (*n).clone(),
-                    };
-                    !self.st().allowed.contains(&al) && !remembered.contains(&al)
-                })
-                .cloned()
-                .collect(),
-            None => vec![],
+        // what the session covers and whether it is Open, read together: a lock in between
+        // would leave uses counted as covered for the `open` that follows
+        let (was_open, mut generation, uncovered) = {
+            let st = self.st();
+            let uncovered: Vec<String> = match &req.agent {
+                Some(a) => req
+                    .names
+                    .iter()
+                    .filter(|n| {
+                        let al = Allowed {
+                            agent: a.clone(),
+                            repo: repo.clone(),
+                            name: (*n).clone(),
+                        };
+                        !st.allowed.contains(&al) && !remembered.contains(&al)
+                    })
+                    .cloned()
+                    .collect(),
+                None => vec![],
+            };
+            (st.open, st.generation, uncovered)
         };
         let uses = match &req.agent {
             Some(a) if !uncovered.is_empty() => vec![AgentUse {
@@ -702,12 +714,12 @@ impl Daemon {
         // Agent uses are kept for the session only when the phone granted `session`; a `once`
         // answer covers this call and nothing after it.
         let mut session_uses = false;
-        let was_open = self.st().open;
         if !was_open {
             let (session, set) = self
                 .open_session(vec![], uses.clone(), ctx_n.clone(), ev, req.notify)
                 .await?;
             session_uses = session;
+            generation = self.st().generation;
             if !session {
                 once_store_key = set.get("secrets", &store.id);
             }
@@ -737,7 +749,10 @@ impl Daemon {
         }
         if session_uses {
             let mut st = self.st();
-            for u in &uses {
+            // kept only by the session that was asked: one that locked meanwhile does not hand
+            // them to the next
+            let same = st.open && st.generation == generation;
+            for u in uses.iter().filter(|_| same) {
                 for n in &u.names {
                     st.allowed.insert(Allowed {
                         agent: u.agent.clone(),
@@ -842,13 +857,19 @@ impl Daemon {
         if let Some(h) = held() {
             return Ok(h);
         }
+        let generation = self.st().generation;
         let mut body = approve::body("keys");
         body.keys = items.clone();
         body.ctx = Some(ctx);
         let reply = self.ask(body, ev, notify).await?;
         let keys = approve::keys_from(&reply, &items)?;
+        // kept only by the session that asked: one that locked meanwhile does not hand them
+        // to the next
         if reply.grant.as_deref() == Some("session") {
             let mut st = self.st();
+            if !st.open || st.generation != generation {
+                return Ok((keys, reply.w.unwrap_or_default()));
+            }
             for (i, k) in items.iter().zip(keys.iter()) {
                 st.keys.insert(key_name(&i.purpose, &i.id), copy_key(k));
             }
@@ -1363,9 +1384,12 @@ impl Daemon {
         use sealctl_core::wire::MessageKind;
         match msg.kind {
             MessageKind::Lock { reason } => {
-                // the channel goes on taking messages while the lock runs its slow steps
+                // A lock made before this session started is old (protocol.md); the phone's clock
+                // may be behind the machine's, so "before" leaves a minute. The channel goes on
+                // taking messages while the lock runs its slow steps.
                 self.lock_soon(&reason, reason == "words", |st| {
-                    (st.open && msg.time >= st.opened_at).then_some(false)
+                    (st.open && msg.time.saturating_add(LOCK_SKEW_MS) >= st.opened_at)
+                        .then_some(false)
                 });
             }
             MessageKind::Answers { answers, more } => {

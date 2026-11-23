@@ -314,6 +314,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 
 - **Waiting** is a sub-state: the daemon is Locked or Open and a request is on the phone. There is one pending `open` at a time; other callers that need the same session join it. A caller whose need the pending request does not cover (another agent use, an own-approval secret) gets its own request after the pending one is answered.
 - `grant: once` hands the keys to the waiting command only; the session stays Locked.
+- A `grant: session` answer (keys, agent uses) is kept only by the session that asked. When that session locked while the phone was asked, the waiting command still gets what was approved, but the keys and uses are not kept for a later session.
 - On Open the daemon holds the store key, the keys of auto volumes it mounted, and the backup keys of configured backups (all asked for in the same `open`).
 
 ### 6.4 Timers and credit
@@ -347,7 +348,7 @@ While Open, the daemon keeps the phone informed and listens for locks (protocol.
 - Until then it keeps one `report` request waiting (ttl 300, renewed at most once per 60 seconds) and applies `ack` and `msgs` from the reply.
 - The phone takes the session as Open by the machine's last status, so the status goes out when the session opens, before the command that asked (or one that joined its `open`) goes on to its next request, and before volumes are mounted. When a status went out while the phone was asked (`waiting`), the next 15-second sample tells the phone the session is Open again. A request waiting for the phone (up to 5 minutes) holds up neither statuses nor messages: a `lock` from the phone applies at once.
 - Usage log entries wait in `usage.jsonl` until a status that carries them is acknowledged. The log holds names, agents, repositories and masked commands, never values.
-- A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"). An `answers` message replaces `answers.json` (used by `sealctl rules`).
+- A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"), unless it was made more than 60 seconds before the session's `open` was sent (a lock held from an earlier session; the minute allows for the phone's clock being behind). An `answers` message replaces `answers.json` (used by `sealctl rules`).
 - A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory, shows it in `sealctl status`, and shows a desktop notification (5.2) whether or not an agent is running:
   - pending: `sealctl: your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at 11:00. Not you? Run: sealctl cancel`. The relay's own note, without the phone's details, reads `sealctl: a sensitive action was approved on your phone. It takes effect at 11:00. Not you? Run: sealctl cancel`;
   - cancelled: `sealctl: cancelled from your phone: leaving sealctl on dev@mbp.example.com`;

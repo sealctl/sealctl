@@ -385,3 +385,39 @@ async fn a_lock_message_is_applied_while_the_phone_is_asked() {
     assert!(!d.st().open);
     asking.abort();
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_lock_made_just_after_the_approval_locks_despite_clock_skew() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    // the phone's clock is half a second behind the machine's
+    d.apply_message(lock_message(t0() - 500, 1, "place")).await;
+    settle().await;
+    assert!(!d.st().open);
+    // a lock held for an offline machine since yesterday is still ignored
+    open(&d, &store_items()).await;
+    d.apply_message(lock_message(t0() - 86_400_000, 2, "phone")).await;
+    settle().await;
+    assert!(d.st().open);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_grant_answered_after_a_lock_is_not_kept_for_the_next_session() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    let vol = item("volume", "fa5a93d5-28d9-4c08-b608-c2b6f344b4d8");
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    d.t.answer(testing::session_reply(&[vol.clone()]), Some(gate.clone()));
+    let asking = tokio::spawn({
+        let d = d.clone();
+        let vol = vol.clone();
+        async move { d.op_keys(vec![vol], None, &ev(), false).await.is_ok() }
+    });
+    settle().await;
+    d.lock("phone", true, false).await;
+    gate.add_permits(1);
+    assert!(asking.await.unwrap(), "the waiting command gets the key it asked for");
+    open(&d, &store_items()).await;
+    let held = d.st().keys.contains_key(&super::key_name(&vol.purpose, &vol.id));
+    assert!(!held, "the new session does not hold the old session's grant");
+}
