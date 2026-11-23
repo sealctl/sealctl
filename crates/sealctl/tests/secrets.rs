@@ -75,8 +75,10 @@ fn secrets_run_and_agents() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(String::from_utf8_lossy(&o.stderr).contains("sealctl: K ← shop/api-key"));
 
-    // .sealctl.toml mappings
+    // .sealctl.toml mappings, once the file is trusted (tests/project.rs)
     std::fs::write(env.h().join(".sealctl.toml"), "[env]\nK = \"shop/api-key\"\n").unwrap();
+    let (code, _, err) = env.run(&["project", "trust"]);
+    assert_eq!(code, 0, "{err}");
     let mut c = env.cmd();
     c.env("WANT", &value)
         .args(["run", "--", "sh", "-c", "test \"$K\" = \"$WANT\""]);

@@ -58,6 +58,9 @@ mapping to `.sealctl.toml` over ad-hoc `-e`:
 OPENAI_API_KEY = "myapp/openai-api-key"
 ```
 
+sealctl trusts a `.sealctl.toml` on first use: after you add or change one, the user's own next
+`sealctl run` there asks them to trust it. That is expected; never run `sealctl project trust`.
+
 ## Look around (safe)
 
 ```sh
@@ -68,7 +71,7 @@ sealctl status             # session, volumes, this machine — no secrets
 ## Never run
 
 `sealctl secret get`, `sealctl recover`, `sealctl seal`, `sealctl unseal`, `sealctl unpair`,
-the credential helpers (`sealctl git credential`, `sealctl aws credentials`), `printenv`/`env`
+`sealctl project trust`, the credential helpers (`sealctl git credential`, `sealctl aws credentials`), `printenv`/`env`
 dumps, `echo $SOME_KEY`, `cat .env`, `pbpaste`, `git credential fill`. sealctl itself refuses
 the sealctl ones inside an AI agent (the credential helpers answer only git and the AWS CLI
 themselves, so `git push` and `aws …` work); the installed hooks deny the others. If the user

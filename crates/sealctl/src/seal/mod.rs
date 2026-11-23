@@ -579,17 +579,13 @@ pub fn seal_env(file: &Path, prefix: &str, delete: bool, force: bool) -> Result<
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("."));
     let pfile = dir.join(crate::project::FILE);
-    let mut project = if pfile.exists() {
-        crate::project::load(&pfile)?
-    } else {
-        crate::project::ProjectFile::default()
-    };
-    for (k, n) in &named {
-        if !vars[k].is_empty() {
-            project.env.insert(k.clone(), n.clone());
+    crate::project::update(&pfile, |project| {
+        for (k, n) in &named {
+            if !vars[k].is_empty() {
+                project.env.insert(k.clone(), n.clone());
+            }
         }
-    }
-    std::fs::write(&pfile, toml::to_string_pretty(&project)?)?;
+    })?;
     eprintln!(
         "{} variables stored; mapping written to {}.",
         names.len(),

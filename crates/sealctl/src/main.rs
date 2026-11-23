@@ -98,6 +98,9 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// Project files (.sealctl.toml) trusted on this machine.
+    #[command(subcommand)]
+    Project(ProjectCmd),
     /// AI coding agents: skill, hooks and deny rules.
     #[command(subcommand)]
     Ai(AiCmd),
@@ -268,6 +271,15 @@ enum SecretCmd {
         use_dir: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// Trust a .sealctl.toml as it is now, so sealctl run uses it without asking.
+    Trust {
+        /// The file, or a folder to search upwards from (default: this folder).
+        path: Option<PathBuf>,
     },
 }
 
@@ -659,6 +671,7 @@ fn run(cli: Cli) -> Result<i32> {
             no_project,
             command,
         } => sealctl::project::run(&env, !no_project, &command).map(|_| 0),
+        Cmd::Project(ProjectCmd::Trust { path }) => sealctl::project::trust(path.as_deref()).map(|_| 0),
         Cmd::Ai(c) => {
             match c {
                 AiCmd::Install { tools } => print_reports(sealctl::ai::install(&tools)?),
