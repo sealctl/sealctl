@@ -1548,11 +1548,16 @@ impl Daemon {
         })
     }
 
-    /// A spawned daemon exits after 10 minutes Locked with no client (SPEC 6.1).
+    /// A spawned daemon exits after 10 minutes Locked with no client (SPEC 6.1). A request
+    /// on the phone is a client too: an SSH signature comes over the agent socket, not
+    /// `daemon.sock`.
     fn idle_exit_due(&self) -> bool {
         let n = self.now();
         let st = self.st();
-        !st.open && st.clients == 0 && n.saturating_sub(st.last_client) > 10 * 60 * 1000
+        !st.open
+            && st.clients == 0
+            && st.waiting_since.is_none()
+            && n.saturating_sub(st.last_client) > 10 * 60 * 1000
     }
 
     /// The daemon is about to exit: it locks as any exit does (SPEC 6.3), and first lets any
@@ -1770,6 +1775,10 @@ pub fn run(spawned: bool) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
         crate::ssh::start_agent(d.clone());
+        // the service manager stops the daemon with SIGTERM (logout, `launchctl bootout`,
+        // `systemctl stop`): that is a daemon exit too, and locks
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("SIGTERM handler")?;
         let ticker = {
             let d = d.clone();
             tokio::spawn(async move {
@@ -1792,6 +1801,7 @@ pub fn run(spawned: bool) -> Result<()> {
                 }
                 _ = d.shutdown.notified() => break,
                 _ = tokio::signal::ctrl_c() => break,
+                _ = term.recv() => break,
             }
         }
         ticker.abort();

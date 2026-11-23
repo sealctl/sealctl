@@ -197,3 +197,56 @@ fn a_daemon_of_another_version_locks_before_it_exits() {
     assert_eq!(a["ok"], false, "{a}");
     assert!(session("locked"), "the phone hears the session lock");
 }
+
+#[test]
+fn a_daemon_stopped_by_its_service_manager_locks_first() {
+    // the service manager stops the daemon with SIGTERM (logout, `systemctl stop`)
+    if !common::have("lsof") {
+        return;
+    }
+    let mut env = Env::fake(Options::default());
+    let m = env.pair();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["open"]));
+    assert_eq!(code, 0, "{err}");
+    let session = |want: &str| {
+        for _ in 0..50 {
+            if let Ok(Some(s)) = env.block(env.phone.status_of(&m)) {
+                if s.state.is_some_and(|st| st.session == want) {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    };
+    assert!(session("open"));
+    // the daemon holds daemon.lock while it runs
+    let o = std::process::Command::new("lsof")
+        .arg("-t")
+        .arg(env.h().join("s/sealctl/daemon.lock"))
+        .output()
+        .unwrap();
+    let pid = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    assert!(!pid.is_empty(), "the daemon's pid");
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let mut gone = false;
+    for _ in 0..100 {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(gone, "the daemon exits");
+    assert!(session("locked"), "the phone hears the session lock");
+}

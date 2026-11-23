@@ -421,3 +421,20 @@ async fn a_session_grant_answered_after_a_lock_is_not_kept_for_the_next_session(
     let held = d.st().keys.contains_key(&super::key_name(&vol.purpose, &vol.id));
     assert!(!held, "the new session does not hold the old session's grant");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_spawned_daemon_does_not_exit_while_the_phone_is_asked() {
+    let (d, _) = testing::daemon(DEAD);
+    d.st().last_client = t0() - 11 * 60_000;
+    assert!(d.idle_exit_due());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    d.t.answer(testing::grant("once", &[]), Some(gate.clone()));
+    let asking = tokio::spawn({
+        let d = d.clone();
+        async move { d.ask(approve::body("open"), &ev(), false).await.is_ok() }
+    });
+    settle().await;
+    assert!(!d.idle_exit_due(), "an SSH signature is waiting for the phone");
+    gate.add_permits(1);
+    assert!(asking.await.unwrap());
+}

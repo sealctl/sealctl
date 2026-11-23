@@ -279,9 +279,10 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 | Situation | How the daemon runs |
 | --- | --- |
 | Paired desktop or laptop | Login service installed by `sealctl pair`: launchd `com.sealctl.daemon` (`RunAtLoad`, `KeepAlive`) or systemd user unit `sealctl.service` (`Restart=on-failure`). Runs `sealctl daemon` |
-| Service missing (containers, dev boxes without a user systemd) | The CLI starts `sealctl daemon --spawned` detached (`setsid`, stdio to `/dev/null`). It exits after 10 minutes Locked with no client |
+| Service missing (containers, dev boxes without a user systemd) | The CLI starts `sealctl daemon --spawned` detached (`setsid`, stdio to `/dev/null`). It exits after 10 minutes Locked with no client and no request waiting for the phone |
 | `SEALCTL_NO_DAEMON=1` (CI runners) | No daemon. Each command asks the phone itself; keys live as long as that process. No Open session, no SSH agent |
 
+- Any exit locks first (SPEC 6.5), whether asked over the socket, by a version mismatch, by Ctrl-C, or by SIGTERM from the service manager (logout, `launchctl bootout`, `systemctl stop`), and waits for a lock still running.
 - The CLI and the daemon are the same binary. Every socket request carries the CLI version; on a mismatch the daemon answers, then exits, and the service manager (or the next CLI call) starts the new binary. `brew upgrade` therefore needs no step.
 
 ### 6.2 Socket
