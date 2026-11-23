@@ -337,3 +337,61 @@ fn resume_after_a_kill_uses_the_same_approval() {
     assert_eq!(phone.numbers.load(Ordering::SeqCst), 1, "one number in all");
     assert!(!env.h().join(".config/sealctl").exists());
 }
+
+/// A run killed after its first step, resumed after the phone's 30-minute plan window has
+/// ended by the phone's clock but not by this machine's (its clock is behind, or was set
+/// back): the resume asks the phone again, with a new number, and finishes. Without that, every
+/// resume was refused as expired until this machine's clock caught up. The phone's clock is
+/// moved on with [`sealctl_fakerelay::Phone::pass_time`]; this machine's stays.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn resume_after_a_kill_once_the_phone_window_ended_asks_again() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (env, value) = setup();
+    let mut c = env.cmd();
+    c.env("SEALCTL_TEST_KILL", "done:secrets")
+        .args(["unseal", "--all"]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Type unseal to start:", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("unseal");
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st;
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = pty.child.kill();
+            panic!("not killed; screen:\n{}", pty.screen.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.signal(), Some(9));
+    assert_eq!(phone.numbers.load(Ordering::SeqCst), 1);
+    drop(phone);
+    let run = unseal_run_dir(&env);
+    assert!(!run.join("done").exists());
+
+    // 31 minutes later by the phone's clock
+    env.phone.pass_time(31 * 60_000);
+    let mut c = env.cmd();
+    c.args(["unseal", "--resume"]);
+    let pty = Pty::spawn(c);
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    assert!(screen.contains("has expired"), "{screen}");
+    assert_eq!(
+        phone.numbers.load(Ordering::SeqCst),
+        1,
+        "asked again with a number: {screen}"
+    );
+    assert!(run.join("done").exists());
+    let env_file = std::fs::read_to_string(run.join("secrets.env")).unwrap();
+    assert_eq!(
+        env_file.matches(&value).count(),
+        1,
+        "the secret step was not repeated"
+    );
+}

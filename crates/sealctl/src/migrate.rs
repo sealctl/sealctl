@@ -511,6 +511,20 @@ fn lock_runner(state: &Path) -> Result<()> {
     Ok(())
 }
 
+/// [`lock_runner`], waiting for a runner at work to end.
+fn lock_runner_after(state: &Path) -> Result<()> {
+    paths::ensure_private_dir(state)?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("migrate.lock"))?;
+    let held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| anyhow::anyhow!("locking the re-encryption job: {e}"))?;
+    std::mem::forget(held);
+    Ok(())
+}
+
 fn dir_size(p: &Path) -> u64 {
     let Ok(m) = std::fs::symlink_metadata(p) else {
         return 0;
@@ -642,11 +656,19 @@ pub struct Opts {
 /// `sealctl migrate`.
 pub fn run(o: Opts) -> Result<()> {
     if o.run_job {
-        return run_job();
+        return run_job(o.control.as_deref() == Some("resume"));
     }
     if let Some(c) = o.control {
         let j = set_request_at(&job_path()?, if c == "resume" { None } else { Some(c.clone()) })?;
         if c == "resume" && j.items.iter().any(|i| i.state != "done" && i.state != "skipped") {
+            // A runner at work goes on (the pause asked is withdrawn above). One that saw the
+            // pause may be ending right now: the runner started here waits for it, then goes on
+            // with the job as it is on file (nothing to do if the first one finished it).
+            if runner_running(&paths::state_dir()?)? {
+                eprintln!("Re-encryption is running; it goes on. Progress: sealctl migrate --status");
+                spawn_runner(true)?;
+                return Ok(());
+            }
             start_job(false)?;
         }
         eprintln!("Re-encryption: {c}.");
@@ -801,26 +823,40 @@ fn report_outcome(out: &Outcome) {
 
 fn start_job(foreground: bool) -> Result<()> {
     if foreground {
-        return run_job();
+        return run_job(false);
     }
+    spawn_runner(false)?;
+    eprintln!("Re-encryption started. Progress: sealctl migrate --status");
+    Ok(())
+}
+
+/// Starts `sealctl migrate --run-job` in the background; `after` (`--resume`): it waits for a
+/// runner at work to end instead of stopping.
+fn spawn_runner(after: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log = paths::state_dir()?.join("migrate.log");
     let f = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     use std::os::unix::process::CommandExt;
-    std::process::Command::new(exe)
-        .args(["migrate", "--run-job"])
-        .stdin(std::process::Stdio::null())
+    let mut c = std::process::Command::new(exe);
+    c.args(["migrate", "--run-job"]);
+    if after {
+        c.arg("--resume");
+    }
+    c.stdin(std::process::Stdio::null())
         .stdout(f.try_clone()?)
         .stderr(f)
         .process_group(0)
         .spawn()
         .context("starting the re-encryption job")?;
-    eprintln!("Re-encryption started. Progress: sealctl migrate --status");
     Ok(())
 }
 
-fn run_job() -> Result<()> {
-    lock_runner(&paths::state_dir()?)?;
+fn run_job(after: bool) -> Result<()> {
+    if after {
+        lock_runner_after(&paths::state_dir()?)?;
+    } else {
+        lock_runner(&paths::state_dir()?)?;
+    }
     let mut job = load_job().ok_or_else(|| fail(exit::NOT_FOUND, "No re-encryption job."))?;
     for i in 0..job.items.len() {
         if let Some(r) = load_job().and_then(|j| j.request) {
@@ -856,6 +892,11 @@ fn run_job() -> Result<()> {
                 job.items[i].state = "done".into();
                 job.items[i].note = note;
             }
+            // a pause or cancel asked while the item waited for its object: stopped, not failed
+            Err(e) if exit::code_of(&e) == exit::BUSY && load_job().and_then(|j| j.request).is_some() => {
+                job.items[i].state = "stopped".into();
+                job.items[i].note = exit::message_of(&e);
+            }
             Err(e) => {
                 job.items[i].state = "failed".into();
                 job.items[i].note = exit::message_of(&e);
@@ -890,10 +931,56 @@ fn new_key(kind: &str, id: &str, path: String) -> Result<(ObjectKey, String)> {
     crate::daemon::client::new_key(&item, (kind, "migrate"))
 }
 
+/// The longest the runner waits for another command on an object (a long `backup run`).
+const OBJECT_WAIT: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
+/// An object's lock for the runner. Another command may hold it for a while (a `backup run`,
+/// a volume being opened): the runner waits, saying so in `--status`, until it is free, a
+/// pause or cancel is asked (busy, the item is stopped), or [`OBJECT_WAIT`] has passed.
+fn runner_lock(
+    job: &mut Job,
+    i: usize,
+    take: &dyn Fn() -> Result<util::ObjectLock>,
+) -> Result<util::ObjectLock> {
+    let until = std::time::Instant::now() + OBJECT_WAIT;
+    let mut noted = false;
+    loop {
+        match take() {
+            Ok(l) => {
+                if noted {
+                    job.items[i].note.clear();
+                    save_progress(job)?;
+                }
+                return Ok(l);
+            }
+            Err(e) if exit::code_of(&e) == exit::BUSY => {
+                if let Some(r) = load_job().and_then(|j| j.request) {
+                    return Err(fail(
+                        exit::BUSY,
+                        format!("{r} asked while waiting: {}", exit::message_of(&e)),
+                    ));
+                }
+                if std::time::Instant::now() >= until {
+                    return Err(e);
+                }
+                if !noted {
+                    noted = true;
+                    job.items[i].note = format!("waiting: {}", exit::message_of(&e));
+                    save_progress(job)?;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
     let v = Volume::load(&job.items[i].name)?;
     // nothing else changes, opens or backs up from the bundle while it is copied and swapped
-    let _lock = v.lock()?;
+    let _lock = runner_lock(job, i, &|| v.lock())?;
+    // what it is now, under the lock (an unseal may have handed it back meanwhile)
+    let v = Volume::load(&job.items[i].name)?;
     let old_path = v.path.clone().context("bundle path")?;
     if job.items[i].new_id.is_empty() {
         job.items[i].new_id = util::new_uuid()?;
@@ -1123,21 +1210,62 @@ fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
         job.items[i].old = Some(b.repo.clone());
         save_progress(job)?;
     }
-    let new_id = job.items[i].new_id.clone();
-    if b.repo_id == new_id {
+    if b.repo_id == job.items[i].new_id {
         // an earlier run saved the definition on the new repository and stopped before the job
         // noted it: only the old repository may be left to remove
         let old = job.items[i].old.clone();
-        let _lock = old.as_deref().map(crate::backup::lock_repo).transpose()?;
+        let _lock = match old.as_deref() {
+            Some(o) => Some(runner_lock(job, i, &|| crate::backup::lock_repo(o))?),
+            None => None,
+        };
+        let b = Backup::load(&job.items[i].name)?;
         return remove_old_repo(&b, old.as_deref());
     }
     // no backup run, rewrap or unseal of this repository while it is copied
-    let _lock = crate::backup::lock_repo(&b.repo)?;
-    let new_url = sibling_repo(&b.repo, &new_id).ok_or_else(|| fail(exit::USAGE, no_place_note(&b.repo)))?;
+    let _lock = runner_lock(job, i, &|| crate::backup::lock_repo(&b.repo))?;
+    // the definition as it is under the lock: one that moved meanwhile is left for a resume
+    let b = match Backup::load(&job.items[i].name) {
+        Ok(cur) if cur.repo == b.repo => cur,
+        _ => {
+            return Err(fail(
+                exit::BUSY,
+                format!(
+                    "Backup {} changed while the job waited for it. Resume the job.",
+                    b.name
+                ),
+            ))
+        }
+    };
     let (mut keys, _) = crate::daemon::client::keys(&[b.request_item()], Some(("backup", &b.name)))?;
     let old_key = keys.remove(0);
     let env = credentials(&b, &b.credential_names())?;
-    let (key, fp) = new_key("backup", &new_id, new_url.clone())?;
+    // The new repository: made here, or by an earlier run under this id. One there that this
+    // id's key does not open (a run under other words, then stopped) is never used: a folder
+    // is made again, any other is left (named in the note) and a new id is taken.
+    let mut left = Vec::new();
+    let (new_id, new_url, key, fp) = loop {
+        let new_id = job.items[i].new_id.clone();
+        let new_url =
+            sibling_repo(&b.repo, &new_id).ok_or_else(|| fail(exit::USAGE, no_place_note(&b.repo)))?;
+        let (key, fp) = new_key("backup", &new_id, new_url.clone())?;
+        if Repo::new(&new_url, &key, env.clone()).opens().ok() != Some(false) {
+            break (new_id, new_url, key, fp);
+        }
+        // (a folder only while the original opens with its key: the copy is made again from it)
+        if !new_url.contains(':')
+            && backup_naming(&new_url)?.is_none()
+            && Repo::new(&b.repo, &old_key, env.clone()).opens()?
+        {
+            std::fs::remove_dir_all(&new_url)?;
+            break (new_id, new_url, key, fp);
+        }
+        if left.len() > 2 {
+            anyhow::bail!("repositories left over at {}", left.join(", "));
+        }
+        left.push(new_url);
+        job.items[i].new_id = util::new_uuid()?;
+        save_progress(job)?;
+    };
     let newr = Repo::new(&new_url, &key, env.clone());
     let pw_old = old_key.hex();
     let run_two = |args: &[&str]| -> Result<()> {
@@ -1177,21 +1305,44 @@ fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
     nb.check = key.check();
     nb.save()?;
     crate::seal::journal::test_kill("reencrypt-backup", "saved");
-    remove_old_repo(&nb, Some(&b.repo))
+    let note = remove_old_repo(&nb, Some(&b.repo))?;
+    Ok(if left.is_empty() {
+        note
+    } else {
+        format!(
+            "{note}; an unfinished copy from an earlier run is left at {}: delete it in its provider's console",
+            left.join(", ")
+        )
+    })
+}
+
+/// The backup whose definition names the repository at `url` (a folder by its real path).
+fn backup_naming(url: &str) -> Result<Option<String>> {
+    let canon = |u: &str| {
+        (!u.contains(':'))
+            .then(|| std::fs::canonicalize(u).ok())
+            .flatten()
+    };
+    let want = canon(url);
+    Ok(Backup::list()?
+        .into_iter()
+        .find(|o| o.repo == url || (want.is_some() && canon(&o.repo) == want))
+        .map(|o| o.name))
 }
 
 /// Removes the repository a backup had before its re-encryption: a folder is removed, other
-/// back ends are named for the person. Never the one the definition names now. The caller
-/// holds the old repository's lock.
+/// back ends are named for the person. Never one a backup definition names (this one's, or
+/// another's). The caller holds the old repository's lock.
 fn remove_old_repo(b: &Backup, old: Option<&str>) -> Result<String> {
     let Some(old) = old.filter(|o| *o != b.repo) else {
         return Ok("copied to a new repository".into());
     };
+    if let Some(n) = backup_naming(old)? {
+        return Ok(format!(
+            "copied to a new repository; the old one at {old} is kept: backup {n} uses it"
+        ));
+    }
     if !old.contains(':') && Path::new(old).is_dir() {
-        let same = std::fs::canonicalize(old).ok() == std::fs::canonicalize(&b.repo).ok();
-        if same {
-            return Ok("copied to a new repository".into());
-        }
         std::fs::remove_dir_all(old)?;
         Ok("copied to a new repository; the old one is removed".to_string())
     } else if !old.contains(':') {

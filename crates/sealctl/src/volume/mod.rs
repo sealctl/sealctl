@@ -197,6 +197,17 @@ impl Volume {
         )
     }
 
+    /// [`Volume::lock`], waiting up to `max` for the command that holds it.
+    pub fn lock_wait(&self, max: std::time::Duration) -> Result<crate::util::ObjectLock> {
+        let name = self.name.clone();
+        crate::util::object_lock_wait(
+            &target_key(self.kind, self.path.as_deref(), &self.id),
+            &format!("Volume {}", self.name),
+            max,
+            &mut || eprintln!("Waiting for another sealctl command on volume {name}..."),
+        )
+    }
+
     /// Mounted?
     pub fn is_open(&self) -> bool {
         backend(self.kind).is_unlocked(self).unwrap_or(false)
@@ -400,12 +411,28 @@ pub fn write_inner_id(vol: &Volume) {
     }
 }
 
-/// Mounts a volume with its key (checked against the definition first).
-pub fn open_with(vol: &Volume, key: &ObjectKey) -> Result<()> {
+/// Mounts a volume with its key (checked against the definition first). `wait`: how long to
+/// wait for another command holding the volume (`volume open` waits; the daemon mounting a
+/// session's volumes does not, so a session never waits on a long change of one).
+pub fn open_with(vol: &Volume, key: &ObjectKey, wait: Option<std::time::Duration>) -> Result<()> {
     vol.check_key(key)?;
     // never while a seal, unseal, rewrap or re-encryption changes it
-    let _lock = vol.lock()?;
     let be = backend(vol.kind);
+    let _lock = match vol.lock() {
+        Ok(l) => l,
+        // another open (the daemon mounting the session's volumes) may have it mounted by now;
+        // a mount takes seconds, a change of the volume longer
+        Err(e) if exit::code_of(&e) == exit::BUSY => {
+            if be.is_unlocked(vol).unwrap_or(false) {
+                return Ok(());
+            }
+            match wait {
+                Some(max) => vol.lock_wait(max)?,
+                None => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     if be.is_unlocked(vol)? {
         return Ok(());
     }
@@ -500,11 +527,14 @@ pub fn lock_name(name: &str) -> Result<crate::util::ObjectLock> {
 /// The [`crate::util::object_lock`] of a volume target: its image or container file, or an APFS
 /// volume's UUID.
 pub fn lock_target(kind: Kind, path: Option<&Path>, id: &str, what: &str) -> Result<crate::util::ObjectLock> {
-    let key = match path {
+    crate::util::object_lock(&target_key(kind, path, id), what)
+}
+
+fn target_key(kind: Kind, path: Option<&Path>, id: &str) -> String {
+    match path {
         Some(p) if kind != Kind::Apfs => crate::util::path_key(p),
         _ => format!("apfs:{}", id.to_lowercase()),
-    };
-    crate::util::object_lock(&key, what)
+    }
 }
 
 /// Compares paths after resolving symlinks (macOS reports `/private/var/…` for `/var/…`).

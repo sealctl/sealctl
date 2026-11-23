@@ -602,6 +602,42 @@ fn wait_delayed(
     }
 }
 
+/// Waits until `nb` by this machine's wall clock (`now`, Unix ms). The wait is slept in steps
+/// of at most a minute, each checked against the wall clock again: a sleep of the machine, or
+/// a clock set forward, never makes it wait longer than to `nb`, and a clock set back makes it
+/// wait for `nb` by the clock as it is now. More than about two hours to go is refused.
+fn wait_for_nb(nb: u64, now: &dyn Fn() -> u64, sleep: &mut dyn FnMut(Duration)) -> Result<()> {
+    let first = now();
+    if nb > first && nb - first > 130 * 60_000 {
+        return Err(fail(
+            exit::ERROR,
+            "The approval starts more than two hours from now. Nothing was changed.",
+        ));
+    }
+    let mut said = false;
+    loop {
+        let t = now();
+        if t >= nb {
+            return Ok(());
+        }
+        if nb - t > 130 * 60_000 {
+            // the clock was set back by hours meanwhile: refused, as at the start
+            return Err(fail(
+                exit::ERROR,
+                "This machine's clock moved back by hours while waiting for the approval to start. Nothing was changed.",
+            ));
+        }
+        if !said && nb - t > 5_000 {
+            said = true;
+            eprintln!(
+                "Waiting until {} for the approval to start (this machine's clock is behind your phone's).",
+                session::hhmm(nb)
+            );
+        }
+        sleep(Duration::from_millis((nb - t).min(60_000)));
+    }
+}
+
 /// The plan signature, checked against our own hash, the request id and `nb`.
 fn check_signature(
     paired: &Paired,
@@ -737,16 +773,7 @@ fn keys_from_phone(
         let (reply, id, sent) = final_reply.context("no reply")?;
         let (nb, sig) = check_signature(&paired, &reply, &id, &ph, &h)?;
         // never before nb by this machine's clock
-        let now = machine::now_ms();
-        if nb > now {
-            if nb - now > 130 * 60_000 {
-                return Err(fail(
-                    exit::ERROR,
-                    "The approval starts more than two hours from now. Nothing was changed.",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(nb - now));
-        }
+        wait_for_nb(nb, &machine::now_ms, &mut std::thread::sleep)?;
         plan.h = Some(h.clone());
         plan.nb = Some(nb);
         plan.sig = Some(sig);
@@ -791,6 +818,19 @@ fn keys_from_phone(
         let Asked::Reply { reply, .. } = asked else {
             return Err(fail(exit::ERROR, "The phone delayed a key of an approved plan."));
         };
+        if !reply.ok && still_valid && reply.err.as_deref() == Some("plan_expired") {
+            // the approval on file looked current by this machine's clock, but the phone's
+            // window is over (this clock is behind the phone's, or was set back): the approval
+            // is dropped and the phone asked again, with a new number, as for an old one
+            eprintln!("The approval on your phone has expired. Asking it again.");
+            plan.h = None;
+            plan.nb = None;
+            plan.sig = None;
+            if let Some(r) = run {
+                r.write("plan.json", &serde_json::to_vec_pretty(plan)?)?;
+            }
+            return keys_from_phone(plan, pending, run);
+        }
         if !reply.ok {
             return Err(approve::refusal(&reply, None, Some("sealctl unseal")));
         }
@@ -1989,7 +2029,84 @@ pub fn newest_run() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::pub_of;
+    use std::cell::Cell;
     use std::path::Path;
+    use std::time::Duration;
+
+    /// A fake wall clock for [`super::wait_for_nb`]: `sleep` moves it on by what `step` says
+    /// for each requested duration (the machine asleep, a clock set back, ...).
+    fn waited(
+        start: u64,
+        nb: u64,
+        mut step: impl FnMut(u64, Duration) -> u64,
+    ) -> (anyhow::Result<()>, Vec<Duration>, u64) {
+        let clock = Cell::new(start);
+        let mut sleeps = Vec::new();
+        let r = super::wait_for_nb(nb, &|| clock.get(), &mut |d| {
+            sleeps.push(d);
+            clock.set(step(clock.get(), d));
+        });
+        (r, sleeps, clock.get())
+    }
+
+    const T: u64 = 1_795_300_000_000;
+
+    #[test]
+    fn nb_reached_or_passed_waits_nothing() {
+        let (r, sleeps, _) = waited(T, T, |c, d| c + d.as_millis() as u64);
+        assert!(r.is_ok() && sleeps.is_empty());
+        let (r, sleeps, _) = waited(T, T - 60_000, |c, d| c + d.as_millis() as u64);
+        assert!(r.is_ok() && sleeps.is_empty());
+    }
+
+    /// The machine sleeps while waiting (the wall clock runs on, a monotonic sleep does not):
+    /// the wait ends once the wall clock reaches nb, not after the whole time slept again.
+    #[test]
+    fn a_machine_asleep_while_waiting_for_nb_waits_no_longer() {
+        let nb = T + 40 * 60_000;
+        // the first sleep lasts an hour of wall time (lid closed), the others as asked
+        let mut first = true;
+        let (r, sleeps, end) = waited(T, nb, |c, d| {
+            let to = if first {
+                c + 3_600_000
+            } else {
+                c + d.as_millis() as u64
+            };
+            first = false;
+            to
+        });
+        assert!(r.is_ok());
+        assert_eq!(sleeps.len(), 1, "checked against the wall clock after the sleep");
+        assert!(sleeps[0] <= Duration::from_secs(60), "{sleeps:?}");
+        assert_eq!(end, T + 3_600_000);
+    }
+
+    /// The clock set back by minutes while waiting: never before nb by the clock as it is.
+    #[test]
+    fn a_clock_set_back_while_waiting_still_waits_for_nb() {
+        let nb = T + 3 * 60_000;
+        let mut n = 0;
+        let (r, _, end) = waited(T, nb, |c, d| {
+            n += 1;
+            let c = c + d.as_millis() as u64;
+            if n == 1 {
+                c - 10 * 60_000
+            } else {
+                c
+            }
+        });
+        assert!(r.is_ok());
+        assert!(end >= nb, "{end} < {nb}");
+    }
+
+    /// The clock set back by hours while waiting, or nb hours away: refused, nothing done.
+    #[test]
+    fn hours_to_nb_are_refused() {
+        let (r, sleeps, _) = waited(T, T + 131 * 60_000, |c, d| c + d.as_millis() as u64);
+        assert!(r.is_err() && sleeps.is_empty());
+        let (r, _, _) = waited(T, T + 5 * 60_000, |c, d| c + d.as_millis() as u64 - 3 * 3_600_000);
+        assert!(r.is_err());
+    }
 
     #[test]
     fn a_dotted_key_name_keeps_its_own_public_file() {

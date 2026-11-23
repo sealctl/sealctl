@@ -713,7 +713,7 @@ impl Daemon {
             let job = async move {
                 tokio::task::spawn_blocking(move || {
                     let was = v.is_open();
-                    crate::volume::open_with(&v, &key).map(|_| !was)
+                    crate::volume::open_with(&v, &key, None).map(|_| !was)
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("the mount stopped"))?
@@ -1046,9 +1046,10 @@ impl Daemon {
             Some(k) => k,
             None => self.session_store_key()?,
         };
-        // never while `migrate` moves the store to new words (the key may be the old one)
-        let _writing = store.lock_writes()?;
-        let words = store.id_file()?.map(|f| f.words).unwrap_or_default();
+        // Each write holds the store's write lock (never while `migrate` moves the store to new
+        // words: the key may be the old one), taken after any phone answer so a rewrap never
+        // waits on the phone; the words are read under it.
+        let words = || -> Result<String> { Ok(store.id_file()?.map(|f| f.words).unwrap_or_default()) };
         match action {
             "set" => {
                 let value = Zeroizing::new(
@@ -1083,7 +1084,11 @@ impl Daemon {
                     body.ctx = Some(ctx);
                     let reply = self.ask(body, ev, false).await?;
                     let k = approve::keys_from(&reply, &[item])?.remove(0);
-                    let w = reply.w.unwrap_or(words);
+                    let _writing = store.lock_writes()?;
+                    let w = match reply.w {
+                        Some(w) => w,
+                        None => words()?,
+                    };
                     store.write(
                         &name,
                         sealctl_core::sealed::Mode::OwnApproval,
@@ -1094,11 +1099,12 @@ impl Daemon {
                     )?;
                     store.add_own_check(&file_id, &k.check())?;
                 } else {
+                    let _writing = store.lock_writes()?;
                     store.write(
                         &name,
                         sealctl_core::sealed::Mode::StoreKey,
                         &key,
-                        &words,
+                        &words()?,
                         &value,
                         None,
                     )?;
@@ -1118,13 +1124,18 @@ impl Daemon {
                     body.keys = vec![item.clone()];
                     let reply = self.ask(body, ev, false).await?;
                     let k = approve::keys_from(&reply, &[item])?.remove(0);
+                    let _writing = store.lock_writes()?;
                     let v = store.read(&name, &k)?;
                     store.write(&new, h.mode, &k, &h.words, &v, Some(&h.file_id))?;
+                    store.remove(&name)?;
                 } else {
+                    let _writing = store.lock_writes()?;
+                    // the header under the lock: a rewrap may have moved it meanwhile
+                    let h = store.header(&name)?;
                     let v = store.read(&name, &key)?;
                     store.write(&new, h.mode, &key, &h.words, &v, None)?;
+                    store.remove(&name)?;
                 }
-                store.remove(&name)?;
                 Ok(json!({}))
             }
             _ => Err(fail(exit::USAGE, "unknown store action")),

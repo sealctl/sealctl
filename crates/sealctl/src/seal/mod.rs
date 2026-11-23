@@ -140,7 +140,14 @@ pub fn seal_volume_given(
     // one seal (or other change) of this target at a time, from the marker read to the saved
     // definition: a second seal whose phone answers late would write its own id over the marker
     // of the first, leaving the bundle under a key its marker does not lead to
-    let _lock = volume::lock_target(kind, path.as_deref(), target, target)?;
+    // (an APFS volume by its UUID, as every other command locks it, whatever name it was given)
+    let apfs_uuid = (kind == Kind::Apfs).then(|| uuid_of_apfs(target)).transpose()?;
+    let _lock = volume::lock_target(
+        kind,
+        path.as_deref(),
+        apfs_uuid.as_deref().unwrap_or(target),
+        target,
+    )?;
     // a marker with no volume of this machine on the bundle: left by a seal that stopped
     // before it finished; its id is used again if the passphrase still opens the bundle
     let mut leftover = None;
@@ -194,7 +201,7 @@ pub fn seal_volume_given(
             Some(f) => f.id.clone(),
             None => util::new_uuid()?,
         },
-        Kind::Apfs => uuid_of_apfs(target)?,
+        Kind::Apfs => apfs_uuid.clone().context("APFS volume UUID")?,
         Kind::Luks => {
             let out = util::system_cmd("cryptsetup")
                 .arg("luksUUID")
@@ -279,7 +286,17 @@ pub fn seal_volume_given(
                 .arg(path.as_ref().expect("path")),
             old.as_bytes(),
         )?;
-        util::check(out, "cryptsetup luksRemoveKey")?;
+        util::check(out, "cryptsetup luksRemoveKey").map_err(|e| {
+            fail(
+                exit::ERROR,
+                format!(
+                    "Volume {name} is sealed, but removing your old passphrase failed ({}); your \
+                     passphrase still opens it too. Remove it with: cryptsetup luksRemoveKey {}",
+                    exit::message_of(&e),
+                    target
+                ),
+            )
+        })?;
     }
     // check before the old way in is gone: the new key opens it
     if !opens(new.as_bytes())? {

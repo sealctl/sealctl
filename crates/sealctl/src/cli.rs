@@ -256,7 +256,7 @@ pub fn volume_open(name: &str) -> Result<()> {
         return Ok(());
     }
     let (keys, _) = client::keys(&[vol.request_item()], Some(("volume", name)))?;
-    volume::open_with(&vol, &keys[0])?;
+    volume::open_with(&vol, &keys[0], Some(std::time::Duration::from_secs(60)))?;
     println!("{}", vol.mountpoint.display());
     Ok(())
 }
@@ -383,11 +383,13 @@ pub fn backup_run(names: &[String], all: bool, if_open: bool, quiet: bool) -> Re
         names.iter().map(|n| Backup::load(n)).collect::<Result<_>>()?
     };
     let mut failed = Vec::new();
+    let mut all_busy = true;
     for b in list {
         let (key, env) = backup_material(&b)?;
         match backup::run_one(&b, &key, env, quiet) {
             Err(e) => {
                 eprintln!("sealctl: backup {} failed: {}", b.name, exit::message_of(&e));
+                all_busy &= exit::code_of(&e) == exit::BUSY;
                 failed.push(b.name.clone());
             }
             Ok(Some(warning)) => eprintln!("Backed up {} ({warning}).", b.name),
@@ -396,8 +398,9 @@ pub fn backup_run(names: &[String], all: bool, if_open: bool, quiet: bool) -> Re
         }
     }
     if !failed.is_empty() {
+        // busy (another sealctl command has the repository) when that is the only reason
         return Err(fail(
-            exit::ERROR,
+            if all_busy { exit::BUSY } else { exit::ERROR },
             format!("Backups failed: {}", failed.join(", ")),
         ));
     }
