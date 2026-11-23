@@ -14,12 +14,9 @@ sealctl = { path = "../crates/sealctl" }
 serde_json = "1"
 toml = "1.1"
 
-# Not part of the main workspace: built with cargo fuzz on nightly.
-[workspace]
-members = ["."]
-
-[profile.release]
-debug = 1
+# A member of the main workspace (one Cargo.lock), outside its default members: built only
+# with cargo fuzz on nightly. The workspace release profile (LTO, strip) is overridden for
+# fuzzing through CARGO_PROFILE_RELEASE_* in .github/workflows/fuzz.yml.
 
 [[bin]]
 name = "pairing_link"
