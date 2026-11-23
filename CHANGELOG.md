@@ -26,6 +26,10 @@ the sealctl phone app, and the 24 words alone open every object.
 - The secret store on `.sealed` files (`secret set/get/ls/rm/mv/store`, `--own-approval`);
   `sealctl run` with `.sealctl.toml` mappings and `[command."<words>"]` sections, masking values
   in output.
+- Project files trusted on first use: `sealctl run` asks before it first uses a `.sealctl.toml`,
+  and again after it changes, listing the secret names it maps; without a terminal it refuses
+  until `sealctl project trust`. Files written by `seal env` and `scan` are trusted; agents never
+  trust one.
 - `sealctl ai install` for Claude Code, Codex, Gemini CLI, Qwen Code, Copilot CLI and Cursor:
   skill, hooks and deny rules, so agents use secrets by name and never see values.
 - `sealctl ssh keygen`, `ssh setup`, `git setup` (SSH commit signing), `git credentials <host>`

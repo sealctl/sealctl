@@ -24,6 +24,12 @@ machine when the phone approves. Wire formats and keys: [protocol.md](protocol.m
   deny rules (`sealctl ai install`): blocking `cat .env`, environment dumps, `echo $KEY`,
   clipboard reads, `git credential fill`, and changes to the agent variables. See
   [ai-agents.md](ai-agents.md).
+- **A `.sealctl.toml` from a cloned repository.** A project file names secrets for
+  `sealctl run`. A person's run uses one only once it is trusted on this machine (its path and a
+  hash of its content): the first time, and after every change, sealctl lists the secrets it
+  names and asks at the terminal; without a terminal it refuses until `sealctl project trust`.
+  Inside an agent nothing is trusted: the agent's use goes to the phone, which shows the agent,
+  repository and names.
 - **A reflexive tap on a sensitive request.** Handing objects back (`unseal`) and taking over
   existing ones (`seal`) are level 2 (biometrics on the phone, proximity or the number shown at
   the terminal); `unseal --all` is level 3: the number match, a signed plan the CLI cannot leave,
@@ -46,7 +52,9 @@ machine when the phone approves. Wire formats and keys: [protocol.md](protocol.m
   make git itself print a token (its trace output with redaction turned off, a credential
   helper of its own, a command one of git's transports runs from its configuration). Hooks
   deny the known ways when installed, and every value given out is a use the phone logs.
-- **Programs run with `sealctl run`.** They get the values they are given, by design.
+- **Programs run with `sealctl run`.** They get the values they are given, by design. Trusting
+  a project file trusts the names it maps for the commands run there, not what those commands
+  do with the values.
 - **A malicious relay holding back or delaying messages.** It cannot forge a reply or release a
   delayed one early (the machine checks the signed not-before time), but it can drop notes and
   messages.

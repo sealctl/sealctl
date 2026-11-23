@@ -78,6 +78,11 @@ OPENAI_API_KEY = "shop/openai-api-key"
 DEPLOY_TOKEN = "shop/deploy-token"
 ```
 
+A `.sealctl.toml` can come with a cloned repository, so `sealctl run` asks before it first uses
+one, and again after it changes, listing the secrets it names. Without a terminal (scripts, CI)
+it refuses until you trust the file once: `sealctl project trust`. Files that `seal env` and
+`scan` write are trusted already.
+
 The store is a folder of `.sealed` files under a store id (docs/protocol.md, Store format). It
 can live in a synced folder or a git repository: `sealctl secret store --use <folder>`.
 

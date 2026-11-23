@@ -163,6 +163,7 @@ fn denied_verb(verb: &str, sub: Option<&str>) -> Option<&'static str> {
         ),
         ("seal" | "unseal" | "buy" | "unpair", _)
         | ("secret", Some("import-env"))
+        | ("project", Some("trust"))
         | ("volume" | "ssh", Some("import")) => Some(USER_ONLY),
         _ => None,
     }
@@ -837,6 +838,8 @@ mod tests {
             "sealctl secret import-env .env --prefix p --delete",
             "sealctl volume import safe disk3s5",
             "sealctl ssh import ~/.ssh/id_ed25519",
+            "sealctl project trust",
+            "cd repo && sealctl project trust .sealctl.toml",
         ] {
             assert!(bash(c).is_some(), "should deny: {c}");
         }
