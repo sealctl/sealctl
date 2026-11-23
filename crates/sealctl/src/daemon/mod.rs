@@ -8,6 +8,8 @@ pub mod client;
 pub mod session;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(test)]
+mod timing_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -138,6 +140,13 @@ struct State {
     last_client: u64,
     mounted: Vec<String>,
     channel: Option<tokio::task::JoinHandle<()>>,
+    /// Machine channels of locks still running: each is closed at its lock's step 5, or at
+    /// once when a new session starts its own (two sockets on one machine key evict each other).
+    closing: Vec<tokio::task::JoinHandle<()>>,
+    /// Counts the sessions opened; work started for one session never lands in a later one.
+    generation: u64,
+    /// Locks begun; each runs its slow steps after the one before it has finished.
+    locks_begun: u64,
     status_dirty: bool,
     last_status: u64,
     keys_used_month: u64,
@@ -154,8 +163,25 @@ pub struct Daemon {
     relay: Relay,
     inproc: bool,
     shutdown: tokio::sync::Notify,
+    /// The number of locks whose slow steps have finished (see `State::locks_begun`).
+    locks_done: tokio::sync::watch::Sender<u64>,
+    /// Held while volumes are mounted or a lock runs its backups and unmounts.
+    volumes: tokio::sync::Mutex<()>,
     #[cfg(test)]
     t: testing::Hooks,
+}
+
+/// What a lock took from the session at once (SPEC 6.5 step 1), for the slow steps.
+struct Closing {
+    /// Its place among the locks.
+    turn: u64,
+    was_open: bool,
+    /// On-lock backups run (step 2); `jobs` are the ones configured.
+    #[cfg_attr(not(test), allow(dead_code))]
+    backups: bool,
+    jobs: Vec<(Backup, ObjectKey, BTreeMap<String, Zeroizing<String>>)>,
+    /// The machine channel it closes at step 5.
+    channel: Option<tokio::task::Id>,
 }
 
 fn key_name(p: &str, i: &str) -> String {
@@ -254,6 +280,8 @@ impl Daemon {
             relay,
             inproc,
             shutdown: tokio::sync::Notify::new(),
+            locks_done: tokio::sync::watch::channel(0).0,
+            volumes: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             t: testing::Hooks::default(),
         })
@@ -308,7 +336,7 @@ impl Daemon {
 
     /// Asks the phone; one request at a time.
     async fn ask(
-        &self,
+        self: &Arc<Self>,
         body: sealctl_core::wire::RequestBody,
         ev: &Events,
         notify: bool,
@@ -493,7 +521,7 @@ impl Daemon {
         let session = reply.grant.as_deref() == Some("session");
         if session {
             let n = self.now();
-            {
+            let generation = {
                 let mut st = self.st();
                 st.open = true;
                 st.opened_at = n;
@@ -514,17 +542,22 @@ impl Daemon {
                     st.keys.insert(k.clone(), copy_key(v));
                 }
                 st.status_dirty = true;
+                st.generation += 1;
                 save_saved(&st.saved);
-            }
-            self.mount_auto().await;
+                st.generation
+            };
+            self.mount_auto(generation).await;
             if !self.inproc {
-                self.start_channel();
+                self.start_channel(generation);
             }
         }
         Ok((session, KeySet(set)))
     }
 
-    async fn mount_auto(&self) {
+    /// Mounts the auto volumes of session `generation`, while it stays Open. A lock meanwhile
+    /// unmounts after the mount in progress (both hold `volumes`).
+    async fn mount_auto(&self, generation: u64) {
+        let _volumes = self.volumes.lock().await;
         #[cfg(test)]
         self.t.mount.pass("mount", &self.t).await;
         let vols: Vec<Volume> = Volume::list()
@@ -533,7 +566,13 @@ impl Daemon {
             .filter(|v| !v.manual)
             .collect();
         for v in vols {
-            let key = self.st().keys.get(&key_name("volume", &v.id)).map(copy_key);
+            let key = {
+                let st = self.st();
+                if !st.open || st.generation != generation {
+                    return;
+                }
+                st.keys.get(&key_name("volume", &v.id)).map(copy_key)
+            };
             let Some(key) = key else { continue };
             let name = v.name.clone();
             let r = tokio::task::spawn_blocking(move || {
@@ -887,14 +926,52 @@ impl Daemon {
         }
     }
 
-    /// Locks: wipes keys, runs on-lock backups, unmounts volumes, tells the phone.
-    pub async fn lock(&self, reason: &str, no_backup: bool, force: bool) -> Value {
-        // SPEC 6.5 step 1: the session closes and its keys leave the shared state before
-        // anything slow runs, so nothing is handed out while backups and unmounts go on, and a
-        // second lock meanwhile finds the session Locked. The backups get their keys and
-        // credentials here; everything else taken is wiped when it drops.
-        let (was_open, store_key, keys, channel) = {
+    /// Locks: wipes keys, runs on-lock backups, unmounts volumes, tells the phone (SPEC 6.5).
+    /// Waits for the slow steps, and for those of any lock still running before them.
+    pub async fn lock(self: &Arc<Self>, reason: &str, no_backup: bool, force: bool) -> Value {
+        let c = self.close(reason, no_backup, false, |_| true);
+        match c {
+            Some(c) => tokio::spawn(self.clone().finish(c, force))
+                .await
+                .unwrap_or_else(|_| json!({"lines": [], "busy": 0})),
+            None => json!({"lines": [], "busy": 0}),
+        }
+    }
+
+    /// Locks at once if `when` holds for the state (checked under the same lock), and runs the
+    /// slow steps in the background. `reset_credit` at the hard stop. Returns whether it locked.
+    fn lock_soon(
+        self: &Arc<Self>,
+        reason: &str,
+        no_backup: bool,
+        reset_credit: bool,
+        when: impl FnOnce(&State) -> bool,
+    ) -> bool {
+        match self.close(reason, no_backup, reset_credit, when) {
+            Some(c) => {
+                tokio::spawn(self.clone().finish(c, false));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// SPEC 6.5 step 1: the session closes and its keys leave the shared state before anything
+    /// slow runs, so nothing is handed out while backups and unmounts go on, and a second lock
+    /// meanwhile finds the session Locked. The backups get their keys and credentials here;
+    /// everything else taken is wiped when it drops. `None` when `when` does not hold.
+    fn close(
+        &self,
+        reason: &str,
+        no_backup: bool,
+        reset_credit: bool,
+        when: impl FnOnce(&State) -> bool,
+    ) -> Option<Closing> {
+        let (turn, was_open, store_key, keys, channel) = {
             let mut st = self.st();
+            if !when(&st) {
+                return None;
+            }
             st.allowed.clear();
             st.answers_parts.clear();
             let was_open = std::mem::replace(&mut st.open, false);
@@ -903,17 +980,30 @@ impl Daemon {
                 "place" => Some("Locked: your phone left the place".into()),
                 _ => None,
             };
+            // at the hard stop the credit goes with the session it ends, not with whatever
+            // session the phone approves while this lock's backups run
+            if reset_credit {
+                st.saved.reset_credit();
+            }
             save_saved(&st.saved);
             st.status_dirty = true;
+            st.locks_begun += 1;
+            let channel = st.channel.take().map(|h| {
+                let id = h.id();
+                st.closing.push(h);
+                id
+            });
             (
+                st.locks_begun,
                 was_open,
                 st.store_key.take(),
                 std::mem::take(&mut st.keys),
-                st.channel.take(),
+                channel,
             )
         };
+        let backups = was_open && !no_backup && reason != "words" && reason != "unpaired";
         let mut jobs = Vec::new();
-        if was_open && !no_backup && reason != "words" && reason != "unpaired" {
+        if backups {
             for b in Backup::list().unwrap_or_default() {
                 if !b.policy.on_lock {
                     continue;
@@ -925,17 +1015,40 @@ impl Daemon {
                 jobs.push((b, key, env));
             }
         }
-        drop(store_key);
-        drop(keys);
+        Some(Closing {
+            turn,
+            was_open,
+            backups,
+            jobs,
+            channel,
+        })
+    }
+
+    /// SPEC 6.5 steps 2 to 5, after the locks before this one finished theirs: a second lock
+    /// never unmounts under the first one's backups, and an exit waits for both.
+    async fn finish(self: Arc<Self>, c: Closing, force: bool) -> Value {
+        /// Marks this lock finished however its task ends.
+        struct Done<'a>(&'a tokio::sync::watch::Sender<u64>, u64);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                let turn = self.1;
+                self.0.send_modify(|d| *d = (*d).max(turn));
+            }
+        }
+        let _done = Done(&self.locks_done, c.turn);
+        let mut rx = self.locks_done.subscribe();
+        let _ = rx.wait_for(|d| *d + 1 >= c.turn).await;
+        // a mount in progress ends first: the backups read the volumes, step 3 closes them
+        drop(self.volumes.lock().await);
         let mut lines = Vec::new();
         let mut busy = Vec::new();
         // step 2: on-lock backups, at most 15 minutes in total
         #[cfg(test)]
-        if was_open && !no_backup && reason != "words" && reason != "unpaired" {
+        if c.backups {
             self.t.backup.pass("backup", &self.t).await;
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
-        for (b, key, env) in jobs {
+        for (b, key, env) in c.jobs {
             let name = b.name.clone();
             let r = tokio::time::timeout_at(
                 deadline,
@@ -950,14 +1063,23 @@ impl Daemon {
                 )),
             }
         }
-        // unmount
+        // step 3: unmount, unless the phone approved a new session meanwhile: the volumes are
+        // that session's now
+        let volumes = self.volumes.lock().await;
+        let reopened = self.st().open;
         #[cfg(test)]
-        self.t.event(format!("unmount{}", if force { " force" } else { "" }));
-        let mounted: Vec<Volume> = Volume::list()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|v| !v.manual || self.st().mounted.contains(&v.name))
-            .collect();
+        if !reopened {
+            self.t.event(format!("unmount{}", if force { " force" } else { "" }));
+        }
+        let mounted: Vec<Volume> = if reopened {
+            Vec::new()
+        } else {
+            Volume::list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| !v.manual || self.st().mounted.contains(&v.name))
+                .collect()
+        };
         for v in mounted {
             let name = v.name.clone();
             let mp = v.mountpoint.clone();
@@ -983,7 +1105,9 @@ impl Daemon {
                 Err(_) => {}
             }
         }
-        {
+        drop(volumes);
+        // step 4
+        let channel = {
             let mut st = self.st();
             // Unless the phone approved a new session meanwhile, wipe what came in during the
             // lock: a key or agent use approved by a request that started before it.
@@ -994,12 +1118,17 @@ impl Daemon {
                 st.mounted.clear();
             }
             st.status_dirty = true;
-        }
-        if was_open && !self.inproc {
+            let i = c
+                .channel
+                .and_then(|id| st.closing.iter().position(|h| h.id() == id));
+            i.map(|i| st.closing.remove(i))
+        };
+        // step 5
+        if c.was_open && !self.inproc {
             let _ = self.send_status(&busy).await;
         }
-        if let Some(c) = channel {
-            c.abort();
+        if let Some(h) = channel {
+            h.abort();
         }
         json!({"lines": lines, "busy": busy.len()})
     }
@@ -1143,23 +1272,31 @@ impl Daemon {
         Ok(())
     }
 
-    fn start_channel(self: &Arc<Self>) {
+    /// Starts the machine channel of session `generation`, if it is still Open. A channel left
+    /// by a lock still running stops now: two sockets on one machine key evict each other.
+    fn start_channel(self: &Arc<Self>, generation: u64) {
         let me = self.clone();
+        let mut st = self.st();
+        if !st.open || st.generation != generation {
+            return;
+        }
         #[cfg(test)]
-        if self.t.offline() {
+        let h = if self.t.offline() {
             // the real channel sends a status first, then waits for messages
-            let h = tokio::spawn(async move {
+            tokio::spawn(async move {
                 let _stopped = testing::Stopped(me.clone());
                 let _ = me.send_status(&[]).await;
                 std::future::pending::<()>().await;
-            });
-            if let Some(old) = self.st().channel.replace(h) {
-                old.abort();
-            }
-            return;
-        }
+            })
+        } else {
+            tokio::spawn(async move { channel::run(me).await })
+        };
+        #[cfg(not(test))]
         let h = tokio::spawn(async move { channel::run(me).await });
-        if let Some(old) = self.st().channel.replace(h) {
+        for old in st.closing.drain(..) {
+            old.abort();
+        }
+        if let Some(old) = st.channel.replace(h) {
             old.abort();
         }
     }
@@ -1188,10 +1325,10 @@ impl Daemon {
         use sealctl_core::wire::MessageKind;
         match msg.kind {
             MessageKind::Lock { reason } => {
-                let opened_at = self.st().opened_at;
-                if msg.time >= opened_at && self.st().open {
-                    self.lock(&reason, reason == "words", false).await;
-                }
+                // the channel goes on taking messages while the lock runs its slow steps
+                self.lock_soon(&reason, reason == "words", false, |st| {
+                    st.open && msg.time >= st.opened_at
+                });
             }
             MessageKind::Answers { answers, more } => {
                 // a long list comes in parts; the list is replaced when the last part arrives
@@ -1311,13 +1448,9 @@ impl Daemon {
             (st.open, lock_now, due)
         };
         if lock_now {
+            // the tick goes on (status, the next session's timers) while backups run
             let hard = self.st().saved.past_hard_stop(n);
-            self.lock("idle", false, false).await;
-            if hard {
-                let mut st = self.st();
-                st.saved.reset_credit();
-                save_saved(&st.saved);
-            }
+            self.lock_soon("idle", false, hard, |st| st.open);
             return;
         }
         if open && status_due && !self.inproc {
@@ -1339,11 +1472,15 @@ impl Daemon {
         !st.open && st.clients == 0 && n.saturating_sub(st.last_client) > 10 * 60 * 1000
     }
 
-    /// The daemon is about to exit: it locks as any exit does (SPEC 6.3).
-    async fn on_exit(&self) {
+    /// The daemon is about to exit: it locks as any exit does (SPEC 6.3), and first lets any
+    /// lock still running finish its backups and unmounts.
+    async fn on_exit(self: &Arc<Self>) {
         if self.st().open {
             self.lock("cli", true, false).await;
         }
+        let begun = self.st().locks_begun;
+        let mut rx = self.locks_done.subscribe();
+        let _ = rx.wait_for(|d| *d >= begun).await;
     }
 
     /// Handles one socket request.
