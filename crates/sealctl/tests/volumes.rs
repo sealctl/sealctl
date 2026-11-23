@@ -71,9 +71,20 @@ fn hdiutil_opens(bundle: &std::path::Path, pass: &str) -> bool {
         .filter(|s| s.starts_with("/dev/disk"))
         .collect();
     if let Some(d) = devs.iter().min_by_key(|d| d.len()) {
-        let _ = Command::new("/usr/bin/hdiutil")
-            .args(["detach", "-quiet", d])
-            .status();
+        // never left attached: a detach refused right after the attach is tried again, then forced
+        let detached = (0..3).any(|i| {
+            if i > 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-quiet", d])
+                .status()
+                .is_ok_and(|s| s.success())
+        }) || Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-quiet", "-force", d])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(detached, "{d} is still attached");
     }
     true
 }
@@ -210,13 +221,9 @@ fn sparse_bundle_volume_with_backup_lock_and_unseal() {
     }
 }
 
-/// `volume open` succeeds only when the volume is mounted at its mount point: a bundle left
-/// attached but not mounted is reported, not taken for an open volume with an empty mount point.
+/// A sparse bundle volume `u` with a file in it, created and mounted at `mnt/u`.
 #[cfg(target_os = "macos")]
-#[test]
-fn volume_open_of_a_bundle_attached_but_not_mounted_says_so() {
-    let mut env = Env::new();
-    env.pair();
+fn bundle_with_a_file(env: &Env) -> (std::path::PathBuf, String) {
     let bundle = env.h().join("u.sparsebundle");
     let mnt = env.h().join("mnt/u");
     let marker = canary();
@@ -237,24 +244,76 @@ fn volume_open_of_a_bundle_attached_but_not_mounted_says_so() {
     });
     assert_eq!(code, 0, "{err}");
     std::fs::write(mnt.join("keep.txt"), &marker).unwrap();
-    // the file system unmounted, the image still attached
-    let out = Command::new("diskutil")
-        .arg("unmount")
-        .arg(&mnt)
-        .output()
-        .unwrap();
+    (mnt, marker)
+}
+
+/// `diskutil unmount`: the file system unmounted, the image still attached.
+#[cfg(target_os = "macos")]
+fn unmount(mnt: &std::path::Path) {
+    let out = Command::new("diskutil").arg("unmount").arg(mnt).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(!mnt.join("keep.txt").exists());
-    let ((code, out, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "u"]));
-    assert_ne!(code, 0, "an empty mount point is not an open volume: {out}");
-    assert!(err.contains("not mounted at"), "{err}");
-    // closed and opened again, its files are there
-    let (code, _, err) = env.run(&["volume", "close", "u"]);
-    assert_eq!(code, 0, "{err}");
+}
+
+/// A bundle attached with nothing mounted from it (a key check that could not detach, a mount
+/// that did not finish) is not taken for an open volume with an empty mount point: `volume open`
+/// detaches it and opens the volume, and its files are there.
+#[cfg(target_os = "macos")]
+#[test]
+fn volume_open_of_a_bundle_attached_with_nothing_mounted_opens_it() {
+    let mut env = Env::new();
+    env.pair();
+    let (mnt, marker) = bundle_with_a_file(&env);
+    unmount(&mnt);
     let ((code, out, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "u"]));
     assert_eq!(code, 0, "{err}");
     assert_eq!(out.trim(), mnt.to_str().unwrap());
     assert_eq!(std::fs::read_to_string(mnt.join("keep.txt")).unwrap(), marker);
+    let (code, _, err) = env.run(&["volume", "close", "u"]);
+    assert_eq!(code, 0, "{err}");
+}
+
+/// A bundle mounted somewhere other than its mount point may be in use there: `volume open`
+/// says so and leaves it, instead of reporting an empty mount point as open.
+#[cfg(target_os = "macos")]
+#[test]
+fn volume_open_of_a_bundle_mounted_elsewhere_says_so() {
+    let mut env = Env::new();
+    env.pair();
+    let (mnt, marker) = bundle_with_a_file(&env);
+    unmount(&mnt);
+    // the image's file system device: the last /dev entry of its `hdiutil info` block
+    let info = Command::new("hdiutil").arg("info").output().unwrap();
+    let info = String::from_utf8_lossy(&info.stdout);
+    let block = info
+        .split("================================================")
+        .find(|b| b.contains("u.sparsebundle"))
+        .expect("the bundle is attached");
+    let dev = block
+        .lines()
+        .rfind(|l| l.starts_with("/dev/"))
+        .and_then(|l| l.split('\t').next())
+        .unwrap()
+        .trim()
+        .to_string();
+    let other = env.h().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    let out = Command::new("diskutil")
+        .args(["mount", "-mountPoint"])
+        .arg(&other)
+        .arg(&dev)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(other.join("keep.txt")).unwrap(), marker);
+    let ((code, out, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "u"]));
+    assert_ne!(code, 0, "an empty mount point is not an open volume: {out}");
+    assert!(err.contains("not mounted at"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(other.join("keep.txt")).unwrap(),
+        marker,
+        "left as it was"
+    );
     let (code, _, err) = env.run(&["volume", "close", "u"]);
     assert_eq!(code, 0, "{err}");
 }
