@@ -165,6 +165,9 @@ struct State {
     generation: u64,
     /// Locks begun; each runs its slow steps after the one before it has finished.
     locks_begun: u64,
+    /// Locks asked for: every lock begun, and a lock message that found no session Open. An
+    /// `open` approved after one serves only the command that asked.
+    lock_asks: u64,
     /// Busy-volume retries started (only the newest goes on).
     busy_retries: u64,
     status_dirty: bool,
@@ -572,7 +575,11 @@ impl Daemon {
         body.keys = items.clone();
         body.uses = uses;
         body.ctx = Some(ctx);
-        body.work = Some(self.st().saved.worked);
+        let (work, lock_asks) = {
+            let st = self.st();
+            (st.saved.worked, st.lock_asks)
+        };
+        body.work = Some(work);
         if self.is_exiting() {
             return Err(fail(
                 exit::ERROR,
@@ -593,9 +600,10 @@ impl Daemon {
             let n = self.now();
             let generation = {
                 let mut st = self.st();
-                // Checked under the same lock that opens the session: an exit that began while
-                // the phone was asked leaves the keys with this command only (as `once`).
-                if self.is_exiting() {
+                // Checked under the same lock that opens the session: a lock asked for while
+                // the phone was asked (`sealctl lock`, a lock message), or an exit, leaves the
+                // keys with this command only (as `once`).
+                if self.is_exiting() || st.lock_asks != lock_asks {
                     return Ok((false, KeySet(set)));
                 }
                 st.open = true;
@@ -1102,6 +1110,7 @@ impl Daemon {
             save_saved(&st.saved);
             st.status_dirty = true;
             st.locks_begun += 1;
+            st.lock_asks += 1;
             let channel = st.channel.take().map(|h| {
                 let id = h.id();
                 st.closing.push(h);
@@ -1542,9 +1551,16 @@ impl Daemon {
                 // A lock made before this session started is old (protocol.md); the phone's clock
                 // may be behind the machine's, so "before" leaves a minute. The channel goes on
                 // taking messages while the lock runs its slow steps.
-                self.lock_soon(&reason, reason == "words", |st| {
+                let locked = self.lock_soon(&reason, reason == "words", |st| {
                     (st.open && msg.time.saturating_add(LOCK_SKEW_MS) >= st.opened_at).then_some(false)
                 });
+                // none Open: an `open` the phone is asked meanwhile stays with its command
+                if !locked {
+                    let mut st = self.st();
+                    if !st.open {
+                        st.lock_asks += 1;
+                    }
+                }
             }
             MessageKind::Answers { answers, more } => {
                 // a long list comes in parts; the list is replaced when the last part arrives

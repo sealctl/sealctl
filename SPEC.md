@@ -282,7 +282,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 | Service missing (containers, dev boxes without a user systemd) | The CLI starts `sealctl daemon --spawned` detached (`setsid`, stdio to `/dev/null`). It exits after 10 minutes Locked with no client and no request waiting for the phone |
 | `SEALCTL_NO_DAEMON=1` (CI runners) | No daemon. Each command asks the phone itself; keys live as long as that process. No Open session, no SSH agent |
 
-- Any exit locks first (SPEC 6.5), whether asked over the socket, by a version mismatch, by Ctrl-C, or by SIGTERM from the service manager (logout, `launchctl bootout`, `systemctl stop`), and waits for a lock still running.
+- Any exit locks first (SPEC 6.5), whether asked over the socket, by a version mismatch, by Ctrl-C, or by SIGTERM from the service manager (logout, `launchctl bootout`, `systemctl stop`), and waits for a lock still running. Once an exit begins, no session opens (a request that still reaches the daemon, such as an SSH signature, is refused) and on-lock backups still running stop, so the unmount and the last status come within the service's stop timeout: 60 seconds (launchd `ExitTimeOut`, systemd `TimeoutStopSec` with `KillMode=mixed`, so the daemon stops its own restic).
 - The CLI and the daemon are the same binary. Every socket request carries the CLI version; on a mismatch the daemon answers, then exits, and the service manager (or the next CLI call) starts the new binary. `brew upgrade` therefore needs no step.
 
 ### 6.2 Socket
@@ -316,6 +316,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 - **Waiting** is a sub-state: the daemon is Locked or Open and a request is on the phone. There is one pending `open` at a time; other callers that need the same session join it. A caller whose need the pending request does not cover (another agent use, an own-approval secret) gets its own request after the pending one is answered.
 - `grant: once` hands the keys to the waiting command only; the session stays Locked.
 - A `grant: session` answer (keys, agent uses) is kept only by the session that asked. When that session locked while the phone was asked, the waiting command still gets what was approved, but the keys and uses are not kept for a later session.
+- A lock asked for while the phone is asked to `open` (`sealctl lock`, a lock message) leaves the approval with the waiting command only, as `grant: once`: the session stays Locked. The same holds for an approval that arrives while the daemon exits.
 - On Open the daemon holds the store key, the keys of auto volumes it mounted, and the backup keys of configured backups (all asked for in the same `open`).
 
 ### 6.4 Timers and credit
@@ -334,7 +335,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 On any lock the daemon, in this order:
 
 1. wipes the store key, decrypted SSH keys, own-approval keys and the per-agent session allowances;
-2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total: restic still running at the limit is stopped, since it holds the backup key and the storage credentials;
+2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total: restic still running at the limit, or when the daemon exits, is stopped, since it holds the backup key and the storage credentials (SIGINT, so it removes its repository lock, then SIGKILL after 10 seconds);
 3. unmounts volumes; a busy volume is reported with the process holding it (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux) and retried every 60 seconds until it closes or a session opens, with a status each time the busy list changes; `sealctl lock --force` force-unmounts;
 4. wipes the backup and volume keys;
 5. sends a status (`locked`, with any busy volumes) and closes the machine socket. When that status fails, the daemon sends it again every minute until the phone has heard the session is Locked.

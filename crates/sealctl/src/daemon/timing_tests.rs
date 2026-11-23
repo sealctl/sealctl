@@ -796,3 +796,38 @@ async fn a_session_that_runs_out_while_a_request_waits_its_turn_hands_out_no_val
     );
     assert!(!d.st().open);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_lock_while_the_phone_is_asked_to_open_leaves_the_approval_with_its_command() {
+    let (d, _) = testing::daemon(DEAD);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    d.t.answer(session_reply(&store_items()), Some(gate.clone()));
+    let asking = tokio::spawn({
+        let d = d.clone();
+        async move {
+            d.open_with(
+                store_items(),
+                STORE,
+                vec![],
+                RequestContext::default(),
+                &ev(),
+                false,
+                |_, _| Ok(()),
+            )
+            .await
+            .map(|(session, set)| (session, set.0.len()))
+        }
+    });
+    settle().await;
+    // `sealctl lock` while the phone shows the request; then it is approved
+    d.lock("cli", true, false).await;
+    gate.add_permits(1);
+    let (session, keys) = asking.await.unwrap().unwrap();
+    assert!(!session, "the approval serves the waiting command only");
+    assert_eq!(keys, 1);
+    assert!(!d.st().open);
+    assert!(d.st().store_key.is_none());
+    // the next open is a session again
+    open(&d, &store_items()).await;
+    assert!(d.st().open);
+}
