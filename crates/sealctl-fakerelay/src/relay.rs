@@ -531,7 +531,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                             sealed: Some(sealed),
                             created,
                             release_at,
-                            expires: release_at + 900_000,
+                            expires: release_at + DELAYED_KEEP_MS,
                             cancelled: None,
                         },
                     );
@@ -714,7 +714,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                     sealed: None,
                     created,
                     release_at,
-                    expires: release_at + 900_000,
+                    expires: release_at + DELAYED_KEEP_MS,
                     cancelled: None,
                 },
             );
@@ -725,7 +725,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             }
             ok(
                 201,
-                json!({"id": id, "releaseAt": release_at, "expires": release_at + 900_000}),
+                json!({"id": id, "releaseAt": release_at, "expires": release_at + DELAYED_KEEP_MS}),
             )
         }
         (Method::GET, ["delayed"]) => {
@@ -767,6 +767,8 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             if d.cancelled.is_none() {
                 d.cancelled = Some((by.clone(), now_ms()));
                 d.sealed = None;
+                // kept through the plan window (nb + 30 min) and the signature window twice
+                d.expires = d.expires.max(d.release_at + CANCELLED_KEEP_MS);
                 let note = json!({"type": "cancelled", "id": id, "by": by}).to_string();
                 for t in p.phone_sockets.iter().chain(p.machine_sockets.values()) {
                     let _ = t.send(Out::Text(note.clone()));
@@ -795,6 +797,11 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         _ => err(403, "forbidden"),
     }
 }
+
+/// How long a delayed record stays after `releaseAt` (protocol.md, Delayed approvals).
+const DELAYED_KEEP_MS: u64 = 900_000;
+/// A cancelled one: the plan window (30 min from `nb`) plus the 300 s signature window twice.
+const CANCELLED_KEEP_MS: u64 = 2_400_000;
 
 /// A delay in seconds: a whole number from 1 to 7200 (`60.0` too, as JSON numbers go).
 fn valid_delay(v: &Value) -> Option<u64> {
