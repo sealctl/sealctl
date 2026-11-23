@@ -212,13 +212,11 @@ async fn the_daemon_exits_only_after_a_running_lock_unmounted() {
         async move { d.lock("phone", false, false).await }
     });
     settle().await;
+    // the backup stops at the exit; the exit waits for the lock's unmount
     let exiting = tokio::spawn({
         let d = d.clone();
         async move { d.on_exit().await }
     });
-    settle().await;
-    assert!(!exiting.is_finished(), "the exit waits for the lock");
-    d.t.backup.release();
     exiting.await.unwrap();
     assert!(d.t.events().contains(&"unmount".to_string()));
     locking.await.unwrap();
@@ -670,4 +668,79 @@ async fn unit_tests_keep_their_files_out_of_home() {
     d.lock("cli", true, false).await;
     assert!(paths::session_file().unwrap().starts_with(&root));
     assert!(paths::session_file().unwrap().exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exit_stops_running_backups_and_opens_no_session() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.backup.hold();
+    open(&d, &store_items()).await;
+    let locking = tokio::spawn({
+        let d = d.clone();
+        async move { d.lock("idle", false, false).await }
+    });
+    settle().await;
+    // the service manager stops the daemon while the on-lock backup runs
+    let exiting = tokio::spawn({
+        let d = d.clone();
+        async move { d.on_exit().await }
+    });
+    tokio::task::yield_now().await;
+    // an SSH signature asks for a session meanwhile, and the phone approves
+    d.t.answer(session_reply(&store_items()), None);
+    let r = d
+        .open_with(
+            store_items(),
+            STORE,
+            vec![],
+            RequestContext::default(),
+            &ev(),
+            false,
+            |_, _| Ok(()),
+        )
+        .await;
+    assert!(r.is_err(), "no session opens while the daemon exits");
+    tokio::time::timeout(Duration::from_secs(5), exiting)
+        .await
+        .expect("the exit does not wait out the backups")
+        .unwrap();
+    locking.await.unwrap();
+    let e = d.t.events();
+    assert!(at(&e, "backup stopped") < at(&e, "unmount"), "{e:?}");
+    assert!(!d.st().open);
+    assert_eq!(*d.locks_done.borrow(), d.st().locks_begun);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_approval_that_arrives_during_the_exit_opens_no_session() {
+    let (d, _) = testing::daemon(DEAD);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    d.t.answer(session_reply(&store_items()), Some(gate.clone()));
+    let asking = tokio::spawn({
+        let d = d.clone();
+        async move {
+            d.open_with(
+                store_items(),
+                STORE,
+                vec![],
+                RequestContext::default(),
+                &ev(),
+                false,
+                |_, _| Ok(()),
+            )
+            .await
+            .map(|(session, set)| (session, set.0.len()))
+        }
+    });
+    settle().await;
+    d.on_exit().await;
+    // the phone answers after the exit's lock
+    gate.add_permits(1);
+    let (session, keys) = asking.await.unwrap().unwrap();
+    assert!(!session, "the keys go to the waiting command only");
+    assert_eq!(keys, 1);
+    settle().await;
+    assert!(!d.st().open);
+    assert!(d.st().store_key.is_none());
+    assert!(!d.t.events().iter().any(|e| e.starts_with("mount")));
 }

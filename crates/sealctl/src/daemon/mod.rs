@@ -189,6 +189,12 @@ pub struct Daemon {
     locks_done: tokio::sync::watch::Sender<u64>,
     /// Held while volumes are mounted or a lock runs its backups and unmounts.
     volumes: tokio::sync::Mutex<()>,
+    /// Set when the daemon begins to exit: no session opens any more, and on-lock backups
+    /// still running stop, so the exit's unmount and last status come within the service
+    /// manager's stop timeout.
+    exiting: tokio::sync::watch::Sender<bool>,
+    /// The same for restic, which runs on a blocking thread.
+    stop_backups: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     t: testing::Hooks,
 }
@@ -318,6 +324,8 @@ impl Daemon {
             shutdown: tokio::sync::Notify::new(),
             locks_done: tokio::sync::watch::channel(0).0,
             volumes: tokio::sync::Mutex::new(()),
+            exiting: tokio::sync::watch::channel(false).0,
+            stop_backups: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             t: testing::Hooks::default(),
         })
@@ -556,6 +564,12 @@ impl Daemon {
         body.uses = uses;
         body.ctx = Some(ctx);
         body.work = Some(self.st().saved.worked);
+        if self.is_exiting() {
+            return Err(fail(
+                exit::ERROR,
+                "The sealctl daemon is stopping. Run the command again.",
+            ));
+        }
         let asked_at = self.now();
         let reply = self.ask(body, ev, notify).await?;
         let keys = approve::keys_from(&reply, &items)?;
@@ -570,6 +584,11 @@ impl Daemon {
             let n = self.now();
             let generation = {
                 let mut st = self.st();
+                // Checked under the same lock that opens the session: an exit that began while
+                // the phone was asked leaves the keys with this command only (as `once`).
+                if self.is_exiting() {
+                    return Ok((false, KeySet(set)));
+                }
                 st.open = true;
                 st.opened_at = asked_at;
                 // past the hard stop, or saved while the clock was ahead: a new day of credit
@@ -1122,18 +1141,33 @@ impl Daemon {
         drop(self.volumes.lock().await);
         let mut lines = Vec::new();
         let mut busy = Vec::new();
-        // step 2: on-lock backups, at most 15 minutes in total
+        // step 2: on-lock backups, at most 15 minutes in total, and stopped when the daemon
+        // exits
         #[cfg(test)]
         if c.backups {
-            self.t.backup.pass("backup", &self.t).await;
+            let mut exiting = self.exiting.subscribe();
+            tokio::select! {
+                _ = self.t.backup.pass("backup", &self.t) => {}
+                _ = exiting.wait_for(|e| *e) => self.t.event("backup stopped"),
+            }
         }
         // restic is stopped at the limit: it holds the backup key and the storage credentials,
         // and would otherwise run on (and keep volumes busy) after the lock gave up on it
-        let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
+        let limit = crate::backup::Limit {
+            deadline: std::time::Instant::now() + Duration::from_secs(15 * 60),
+            stop: self.stop_backups.clone(),
+        };
         for (b, key, env) in c.jobs {
             let name = b.name.clone();
+            if self.is_exiting() {
+                lines.push(format!(
+                    "Backup {name} skipped; run sealctl backup run {name} later."
+                ));
+                continue;
+            }
+            let limit = limit.clone();
             let r = tokio::task::spawn_blocking(move || {
-                crate::backup::run_one_until(&b, &key, env, true, Some(deadline))
+                crate::backup::run_one_until(&b, &key, env, true, Some(&limit))
             })
             .await;
             match r {
@@ -1676,15 +1710,34 @@ impl Daemon {
             && n.saturating_sub(st.last_client) > 10 * 60 * 1000
     }
 
-    /// The daemon is about to exit: it locks as any exit does (SPEC 6.3), and first lets any
-    /// lock still running finish its backups and unmounts.
+    /// Whether the daemon has begun to exit.
+    fn is_exiting(&self) -> bool {
+        *self.exiting.borrow()
+    }
+
+    /// From now on no session opens, and on-lock backups still running stop.
+    fn begin_exit(&self) {
+        self.exiting.send_replace(true);
+        self.stop_backups.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The daemon is about to exit: it locks as any exit does (SPEC 6.3), and lets any lock
+    /// still running finish its unmounts (its backups stop). Returns once the session is
+    /// Locked with no lock running.
     async fn on_exit(self: &Arc<Self>) {
-        if self.st().open {
-            self.lock("cli", true, false).await;
+        self.begin_exit();
+        loop {
+            if self.st().open {
+                self.lock("cli", true, false).await;
+            }
+            let begun = self.st().locks_begun;
+            let mut rx = self.locks_done.subscribe();
+            let _ = rx.wait_for(|d| *d >= begun).await;
+            let st = self.st();
+            if !st.open && st.locks_begun == begun {
+                return;
+            }
         }
-        let begun = self.st().locks_begun;
-        let mut rx = self.locks_done.subscribe();
-        let _ = rx.wait_for(|d| *d >= begun).await;
     }
 
     /// Handles one socket request.
@@ -1733,6 +1786,7 @@ impl Daemon {
             }
             "store" => self.op_store(&req, &ev).await,
             "exit" => {
+                self.begin_exit();
                 self.lock("cli", true, false).await;
                 self.shutdown.notify_one();
                 Ok(json!({}))
