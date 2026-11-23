@@ -124,6 +124,35 @@ pub fn maybe_ask() {
     c.save();
 }
 
+/// A checkout link from the relay, if it is one to open: `https://`, nothing but visible
+/// ASCII (no spaces, no control characters).
+fn checkout_link(url: &str) -> Option<&str> {
+    let ok = url.len() > "https://".len()
+        && url.starts_with("https://")
+        && url.bytes().all(|b| b.is_ascii_graphic());
+    ok.then_some(url)
+}
+
+/// The seat codes in a licence answer.
+fn codes_of(v: &Value) -> Vec<Value> {
+    v["codes"].as_array().cloned().unwrap_or_default()
+}
+
+/// A code in `v` that is not in `before` (codes from earlier purchases stay in the answer).
+fn new_code(v: &Value, before: &[String]) -> Option<Value> {
+    codes_of(v)
+        .into_iter()
+        .rev()
+        .find(|c| c["code"].as_str().is_some_and(|s| !before.iter().any(|b| b == s)))
+}
+
+/// A seat code fit to print: letters, digits and `-` only.
+fn printable_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect()
+}
+
 fn open_link(url: &str) {
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -204,6 +233,20 @@ pub fn buy(seats: Option<u32>, code: Option<String>, relay_flag: Option<&str>) -
             }
         }
     };
+    // codes bought before: the wait below looks for a new one
+    let before: Vec<String> = if n > 1 {
+        let v = rt
+            .block_on(fetch(&relay, &paired))
+            .ok()
+            .or_else(|| Cache::load().answer)
+            .unwrap_or(Value::Null);
+        codes_of(&v)
+            .iter()
+            .filter_map(|c| c["code"].as_str().map(String::from))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let a = rt.block_on(relay.request(
         Some(&paired.keys),
         "POST",
@@ -213,7 +256,16 @@ pub fn buy(seats: Option<u32>, code: Option<String>, relay_flag: Option<&str>) -
     if !a.ok() {
         return Err(checkout_error(&a, n));
     }
-    let url = a.body["url"].as_str().unwrap_or("").to_string();
+    let url = a.body["url"]
+        .as_str()
+        .and_then(checkout_link)
+        .map(String::from)
+        .ok_or_else(|| {
+            fail(
+                exit::RELAY,
+                "The relay sent a checkout link that is not https; nothing opened.",
+            )
+        })?;
     match choice {
         3 => {
             let copied = copy(&url);
@@ -243,8 +295,7 @@ pub fn buy(seats: Option<u32>, code: Option<String>, relay_flag: Option<&str>) -
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(5)).await;
             if let Ok(v) = fetch(&relay, &paired).await {
-                let codes = v["codes"].as_array().cloned().unwrap_or_default();
-                if (n == 1 && v["licence"] == "paid") || (n > 1 && !codes.is_empty()) {
+                if (n == 1 && v["licence"] == "paid") || (n > 1 && new_code(&v, &before).is_some()) {
                     return Some(v);
                 }
             }
@@ -258,12 +309,8 @@ pub fn buy(seats: Option<u32>, code: Option<String>, relay_flag: Option<&str>) -
             c.fetched = machine::now_ms();
             c.save();
             if n > 1 {
-                let code = v["codes"]
-                    .as_array()
-                    .and_then(|a| a.last())
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let code_s = code["code"].as_str().unwrap_or("");
+                let code = new_code(&v, &before).unwrap_or(Value::Null);
+                let code_s = printable_code(code["code"].as_str().unwrap_or(""));
                 eprintln!(
                     "Seat code {code_s} ({n} seats, {} used by you). Each developer runs: sealctl buy --code {code_s}",
                     code["claimed"].as_u64().unwrap_or(1)
@@ -286,5 +333,40 @@ fn refresh_now(rt: &tokio::runtime::Runtime, relay: &Relay, paired: &Paired) {
         c.answer = Some(v);
         c.fetched = machine::now_ms();
         c.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkout_links() {
+        assert_eq!(
+            checkout_link("https://pay.example.com/c/abc?x=1"),
+            Some("https://pay.example.com/c/abc?x=1")
+        );
+        for bad in [
+            "",
+            "https://",
+            "http://pay.example.com/",
+            "file:///Applications/Calculator.app",
+            "smb://host/share",
+            "-a Terminal",
+            "https://pay.example.com/\x1b]0;x\x07",
+            "https://pay.example.com/a b",
+        ] {
+            assert_eq!(checkout_link(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_wait_takes_only_a_new_code() {
+        let v = json!({"codes": [{"code": "AAAA-BBBB", "seats": 5}]});
+        assert!(new_code(&v, &["AAAA-BBBB".into()]).is_none());
+        let v = json!({"codes": [{"code": "CCCC-DDDD", "seats": 10}, {"code": "AAAA-BBBB", "seats": 5}]});
+        assert_eq!(new_code(&v, &["AAAA-BBBB".into()]).unwrap()["code"], "CCCC-DDDD");
+        assert_eq!(new_code(&v, &[]).unwrap()["code"], "AAAA-BBBB");
+        assert_eq!(printable_code("AB\x1b[2JCD-12"), "AB2JCD-12");
     }
 }

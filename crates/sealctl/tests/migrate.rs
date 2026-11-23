@@ -317,6 +317,9 @@ fn re_encryption_copies_under_new_keys() {
     let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "w"]));
     assert_eq!(code, 0, "{err}");
     assert_eq!(std::fs::read_to_string(mnt.join("keep.txt")).unwrap(), marker);
+    // the old bundle, set aside during the swap, is gone with the copy's name
+    assert!(!env.h().join(".w.old.sparsebundle").exists());
+    assert!(!env.h().join(".w.migrating.sparsebundle").exists());
     let (code, out, err) = env.run(&["backup", "snapshots", "wb", "--json"]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(
