@@ -157,7 +157,7 @@ pub async fn run(d: Arc<Daemon>) {
                         "delayed" => d.on_delayed_note(
                             v["id"].as_str().unwrap_or(""),
                             v["machine"].as_str(),
-                            v["releaseAt"].as_u64().unwrap_or(0),
+                            v["releaseAt"].as_u64(),
                         ),
                         "cancelled" => d.on_cancelled_note(v["id"].as_str().unwrap_or("")),
                         "error" => {

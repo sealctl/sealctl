@@ -321,6 +321,11 @@ impl Relay {
 
     /// Sends one sealed request on a new wait socket and waits for its end, at most until
     /// `deadline`. Pings every 30 seconds.
+    ///
+    /// `deadline` is on the monotonic clock, which stands still while the machine sleeps; the
+    /// relay's expiry does not. So the wait also ends once the same time has passed on the wall
+    /// clock (checked every second): after a sleep past it, the request is gone from the relay,
+    /// and the socket may be a half-open one that would never say so.
     pub async fn wait(
         &self,
         keys: &MachineKeys,
@@ -330,6 +335,11 @@ impl Relay {
         ttl: u64,
         deadline: tokio::time::Instant,
     ) -> Result<WaitEnd> {
+        let wall_end = wall_ms().saturating_add(
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis() as u64,
+        );
         let mut ws = self.socket(keys, &format!("/v1/phones/{phone}/wait")).await?;
         let msg = json!({"type": "request", "id": id, "sealed": sealed, "ttl": ttl});
         ws.send(Message::text(msg.to_string()))
@@ -337,11 +347,18 @@ impl Relay {
             .map_err(|e| self.unreachable(e))?;
         let mut ping = tokio::time::interval(Duration::from_secs(30));
         ping.tick().await;
+        let mut wall = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
                     let _ = ws.close(None).await;
                     return Ok(WaitEnd::Expired);
+                }
+                _ = wall.tick() => {
+                    if wall_ms() >= wall_end {
+                        let _ = ws.close(None).await;
+                        return Ok(WaitEnd::Expired);
+                    }
                 }
                 _ = ping.tick() => {
                     let _ = ws.send(Message::text("ping")).await;
@@ -380,6 +397,21 @@ impl Relay {
             }
         }
     }
+}
+
+/// The wall clock, Unix ms, as a request wait reads it.
+///
+/// Tests only (`test-hooks`): a number in the file `test-clock-ahead-ms` in the state folder is
+/// added, as a machine asleep that long would see it (the monotonic clock did not move).
+fn wall_ms() -> u64 {
+    let n = crate::machine::now_ms();
+    #[cfg(feature = "test-hooks")]
+    let n = n + crate::paths::state_dir()
+        .ok()
+        .and_then(|d| std::fs::read_to_string(d.join("test-clock-ahead-ms")).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    n
 }
 
 /// Seconds to wait for a `429` of the relay's short-term limits (`scope` `network` or `key`,

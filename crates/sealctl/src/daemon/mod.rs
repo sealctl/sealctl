@@ -42,6 +42,69 @@ const MOUNT_LIMIT: Duration = Duration::from_secs(120);
 /// How far the phone's clock may be behind the machine's for a `lock` message.
 const LOCK_SKEW_MS: u64 = 60_000;
 
+/// How long after its `releaseAt` a delayed action can still be pending: the relay deletes
+/// the record 15 minutes after it (protocol.md, Delayed approvals).
+const DELAYED_EXPIRES_MS: u64 = 15 * 60_000;
+
+/// The longest delay of a delayed action (protocol.md, Delayed approvals): one announced
+/// without its `releaseAt` takes effect by then.
+const DELAYED_MAX_MS: u64 = 2 * 3_600_000;
+
+/// When a delayed action announced at `now` takes effect, and how to say so.
+fn delayed_at(at: Option<u64>, now: u64) -> (u64, String) {
+    match at {
+        Some(at) => (at, format!("at {}", session::hhmm(at))),
+        None => (now + DELAYED_MAX_MS, "within 2 hours".into()),
+    }
+}
+
+tokio::task_local! {
+    /// Set while a socket request is handled: becomes `true` when its client closed the
+    /// connection (Ctrl-C), which withdraws what it waits for on the phone.
+    static GONE: tokio::sync::watch::Receiver<bool>;
+}
+
+/// Resolves once the client of the request being handled has gone; never outside a socket
+/// request (the SSH agent, `SEALCTL_NO_DAEMON`, unit tests).
+async fn caller_gone() {
+    match GONE.try_with(Clone::clone) {
+        Ok(mut g) => {
+            let _ = g.wait_for(|gone| *gone).await;
+        }
+        Err(_) => std::future::pending().await,
+    }
+}
+
+fn caller_is_gone() -> bool {
+    GONE.try_with(|g| *g.borrow()).unwrap_or(false)
+}
+
+fn caller_left() -> anyhow::Error {
+    fail(exit::ERROR, "The command stopped waiting for your phone.")
+}
+
+/// Tests only (`test-hooks`): with a file `test-hold-<point>` in the state folder the daemon
+/// stops at that point: it writes `test-held-<point>` there and goes on once the test removes
+/// the first file, removing `test-held-<point>` as it goes (so each hold is seen afresh). A
+/// race between two events at a known point, for the integration tests. Points: `reply` (an
+/// answer from the phone in hand, before the caller checks it against locks) and `open-turn`
+/// (`open` has its turn and has not looked at the session yet).
+#[allow(unused_variables)]
+async fn test_hold(point: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(dir) = paths::state_dir() {
+        let hold = dir.join(format!("test-hold-{point}"));
+        if hold.exists() {
+            let held = dir.join(format!("test-held-{point}"));
+            let _ = std::fs::write(&held, b"");
+            while hold.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let _ = std::fs::remove_file(&held);
+        }
+    }
+}
+
 /// Set in the daemon process (the rewrap after a phone key change starts from there).
 pub static IN_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -192,6 +255,11 @@ struct State {
     /// Locks asked for: every lock begun, and a lock message that found no session Open. An
     /// `open` approved after one serves only the command that asked.
     lock_asks: u64,
+    /// Opens the phone answered (or let time out) so far, and the last of them when the phone
+    /// refused it: `(number, exit code, message)`. Callers that joined that open end the same
+    /// way instead of asking again at once.
+    open_tries: u64,
+    open_refused: Option<(u64, i32, String)>,
     /// Busy-volume retries started (only the newest goes on).
     busy_retries: u64,
     status_dirty: bool,
@@ -399,22 +467,42 @@ impl Daemon {
     /// and is told it is waiting for the phone, like the caller that asked. On an Open session the
     /// other holder usually needs the turn only for a moment, so the caller is told only when the
     /// phone is being asked or the turn has not come within half a second.
-    async fn join_open(&self, ev: &Events) -> tokio::sync::MutexGuard<'_, ()> {
+    ///
+    /// A caller that joined a pending open (the session was Locked) ends with it when the phone
+    /// refused it (declined, no answer) instead of asking again at once; after a `once` grant,
+    /// a withdrawn request or a relay error it goes on and asks for itself. A caller that found
+    /// the session Open waited for no request: it goes on whatever happened meanwhile. A caller
+    /// whose client leaves (Ctrl-C) while it waits stops waiting.
+    async fn join_open(&self, ev: &Events) -> Result<tokio::sync::MutexGuard<'_, ()>> {
         if let Ok(g) = self.opening.try_lock() {
-            return g;
+            return Ok(g);
         }
-        let phone = {
+        let (pending, phone, tries) = {
             let st = self.st();
-            !st.open || st.waiting_since.is_some()
+            (!st.open, !st.open || st.waiting_since.is_some(), st.open_tries)
         };
-        if !phone {
-            let soon = tokio::time::timeout(Duration::from_millis(500), self.opening.lock());
-            if let Ok(g) = soon.await {
-                return g;
+        let g = 'turn: {
+            if !phone {
+                let soon = tokio::time::timeout(Duration::from_millis(500), self.opening.lock());
+                if let Ok(g) = soon.await {
+                    break 'turn g;
+                }
+            }
+            ev(json!({"event": "waiting"}));
+            tokio::select! {
+                g = self.opening.lock() => g,
+                () = caller_gone() => return Err(caller_left()),
+            }
+        };
+        if pending {
+            let st = self.st();
+            if let Some((n, code, msg)) = &st.open_refused {
+                if *n == st.open_tries && *n > tries {
+                    return Err(fail(*code, msg.clone()));
+                }
             }
         }
-        ev(json!({"event": "waiting"}));
-        self.opening.lock().await
+        Ok(g)
     }
 
     /// Asks the phone; one request at a time.
@@ -424,14 +512,51 @@ impl Daemon {
         ev: &Events,
         notify: bool,
     ) -> Result<ReplyBody> {
-        let _turn = self.asking.lock().await;
+        let turn = self.turn(ev).await?;
+        self.ask_in_turn(&turn, body, ev, notify).await
+    }
+
+    /// The turn to ask the phone. A caller that finds another request on the phone waits for
+    /// the phone too, and is told so; its client leaving (Ctrl-C) ends the wait.
+    async fn turn(&self, ev: &Events) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        match self.asking.try_lock() {
+            Ok(t) => Ok(t),
+            Err(_) => {
+                ev(json!({"event": "waiting"}));
+                tokio::select! {
+                    t = self.asking.lock() => Ok(t),
+                    () = caller_gone() => Err(caller_left()),
+                }
+            }
+        }
+    }
+
+    /// [`Daemon::ask`] with the turn already taken. The client closing its connection (Ctrl-C)
+    /// withdraws the request: dropping the wait closes its socket, and the relay takes the
+    /// request off the phone, so an answer that still comes grants nothing.
+    async fn ask_in_turn(
+        self: &Arc<Self>,
+        _turn: &tokio::sync::MutexGuard<'_, ()>,
+        body: sealctl_core::wire::RequestBody,
+        ev: &Events,
+        notify: bool,
+    ) -> Result<ReplyBody> {
+        if caller_is_gone() {
+            return Err(caller_left());
+        }
         self.st().waiting_since = Some(self.now());
         self.st().status_dirty = true;
         ev(json!({"event": "waiting"}));
         if notify && crate::guard::ai_agent().is_none() {
             util::notify("sealctl: waiting for your phone");
         }
-        let r = self.send_ask(body).await;
+        let r = tokio::select! {
+            r = self.send_ask(body) => r,
+            () = caller_gone() => Err(caller_left()),
+        };
+        if r.is_ok() {
+            test_hold("reply").await;
+        }
         let told_waiting = {
             let mut st = self.st();
             st.waiting_since = None;
@@ -619,7 +744,23 @@ impl Daemon {
             ));
         }
         let asked_at = self.now();
-        let reply = self.ask(body, ev, notify).await?;
+        let reply = self.ask(body, ev, notify).await;
+        {
+            // the end of this open, for the callers that joined it
+            let mut st = self.st();
+            let answered = match &reply {
+                Ok(_) => true,
+                Err(e) => matches!(exit::code_of(e), exit::DECLINED | exit::NO_ANSWER),
+            };
+            if answered {
+                st.open_tries += 1;
+                st.open_refused = match &reply {
+                    Ok(_) => None,
+                    Err(e) => Some((st.open_tries, exit::code_of(e), exit::message_of(e))),
+                };
+            }
+        }
+        let reply = reply?;
         let keys = approve::keys_from(&reply, &items)?;
         let words = reply.w.clone().unwrap_or_default();
         let mut set = BTreeMap::new();
@@ -782,7 +923,8 @@ impl Daemon {
     /// `open`.
     pub async fn op_open(self: &Arc<Self>, ctx: RequestContext, ev: &Events, notify: bool) -> Result<Value> {
         self.expire();
-        let _opening = self.join_open(ev).await;
+        let _opening = self.join_open(ev).await?;
+        test_hold("open-turn").await;
         if !self.st().open {
             let (session, _) = self.open_session(vec![], vec![], ctx, ev, notify).await?;
             if !session {
@@ -822,61 +964,99 @@ impl Daemon {
         ctx_n.names = req.names.iter().take(10).cloned().collect();
         // what is not covered yet is judged after any pending open: a caller that joined it may
         // find its uses granted for the session already
-        let opening = self.join_open(ev).await;
+        let opening = self.join_open(ev).await?;
         // the waits before (the context, the turn) may have taken the session past its time
         self.expire();
-        let remembered = load_answers();
-        // what the session covers and whether it is Open, read together: a lock in between
-        // would leave uses counted as covered for the `open` that follows
-        let (was_open, mut generation, uncovered) = {
-            let st = self.st();
-            let uncovered: Vec<String> = match &req.agent {
-                Some(a) => req
-                    .names
-                    .iter()
-                    .filter(|n| {
-                        let al = Allowed {
-                            agent: a.clone(),
-                            repo: repo.clone(),
-                            name: (*n).clone(),
-                        };
-                        !st.allowed.contains(&al) && !remembered.contains(&al)
-                    })
-                    .cloned()
-                    .collect(),
-                None => vec![],
-            };
-            (st.open, st.generation, uncovered)
-        };
-        let uses = match &req.agent {
-            Some(a) if !uncovered.is_empty() => vec![AgentUse {
+        // the uses this agent has neither for the session (`st`, read under the state lock with
+        // whatever goes with it) nor remembered
+        let needed = |st: &State, remembered: &[Allowed]| -> Vec<AgentUse> {
+            let Some(a) = &req.agent else { return vec![] };
+            let names: Vec<String> = req
+                .names
+                .iter()
+                .filter(|n| {
+                    let al = Allowed {
+                        agent: a.clone(),
+                        repo: repo.clone(),
+                        name: (*n).clone(),
+                    };
+                    !st.allowed.contains(&al) && !remembered.contains(&al)
+                })
+                .cloned()
+                .collect();
+            if names.is_empty() {
+                return vec![];
+            }
+            vec![AgentUse {
                 agent: a.clone(),
                 repository: repo.clone(),
-                names: uncovered.clone(),
-            }],
-            _ => vec![],
+                names,
+            }]
+        };
+        // what the session covers and whether it is Open, read together: a lock in between
+        // would leave uses counted as covered for the `open` that follows
+        let remembered = load_answers();
+        let (was_open, mut generation, uses) = {
+            let st = self.st();
+            (st.open, st.generation, needed(&st, &remembered))
         };
         let mut once_store_key: Option<ObjectKey> = None;
-        // Agent uses are kept for the session only when the phone granted `session`; a `once`
-        // answer covers this call and nothing after it.
-        let mut session_uses = false;
+        // Agent uses are kept for the session only when the phone granted `session`, and only
+        // by the session that was asked: one that locked meanwhile does not hand them to the
+        // next. A `once` answer covers this call and nothing after it.
+        let keep_uses = |uses: &[AgentUse], generation: u64| {
+            let mut st = self.st();
+            if !st.open || st.generation != generation {
+                return;
+            }
+            for u in uses {
+                for n in &u.names {
+                    st.allowed.insert(Allowed {
+                        agent: u.agent.clone(),
+                        repo: u.repository.clone(),
+                        name: n.clone(),
+                    });
+                }
+            }
+        };
         if !was_open {
             let (session, set) = self
                 .open_session(vec![], uses.clone(), ctx_n.clone(), ev, req.notify)
                 .await?;
-            session_uses = session;
             generation = self.st().generation;
-            if !session {
+            if session {
+                // kept before the turn passes on, so a caller that joined this open finds these
+                // uses covered
+                keep_uses(&uses, generation);
+            } else {
                 once_store_key = set.get("secrets", &store.id);
             }
         }
         drop(opening);
-        if was_open && !uses.is_empty() {
+        // judged again once it is this caller's turn: an answer to another request of the same
+        // agent meanwhile may cover these uses for the session
+        let turn = if was_open && !uses.is_empty() {
+            Some(self.turn(ev).await?)
+        } else {
+            None
+        };
+        let uses = match &turn {
+            Some(_) => {
+                let remembered = load_answers();
+                let st = self.st();
+                generation = st.generation;
+                needed(&st, &remembered)
+            }
+            None => uses,
+        };
+        if let (Some(turn), false) = (&turn, uses.is_empty()) {
             let mut body = approve::body("agent");
             body.uses = uses.clone();
             body.ctx = Some(ctx_n.clone());
-            let reply = self.ask(body, ev, req.notify).await?;
-            session_uses = reply.grant.as_deref() == Some("session");
+            let reply = self.ask_in_turn(turn, body, ev, req.notify).await?;
+            if reply.grant.as_deref() == Some("session") {
+                keep_uses(&uses, generation);
+            }
             if reply.remember == Some(true) {
                 let mut a = load_answers();
                 for u in &uses {
@@ -893,21 +1073,7 @@ impl Daemon {
                 save_answers(&a);
             }
         }
-        if session_uses {
-            let mut st = self.st();
-            // kept only by the session that was asked: one that locked meanwhile does not hand
-            // them to the next
-            let same = st.open && st.generation == generation;
-            for u in uses.iter().filter(|_| same) {
-                for n in &u.names {
-                    st.allowed.insert(Allowed {
-                        agent: u.agent.clone(),
-                        repo: u.repository.clone(),
-                        name: n.clone(),
-                    });
-                }
-            }
-        }
+        drop(turn);
         let store_key = match once_store_key {
             Some(k) => k,
             None => self.session_store_key()?,
@@ -983,7 +1149,7 @@ impl Daemon {
             return Ok(h);
         }
         let ctx = self.context(None, "", "", subject).await;
-        let opening = self.join_open(ev).await;
+        let opening = self.join_open(ev).await?;
         if !self.st().open {
             let (_, set) = self.open_session(items.clone(), vec![], ctx, ev, notify).await?;
             let keys = items
@@ -1029,7 +1195,7 @@ impl Daemon {
         crate::store::check_name(&name)?;
         // a `once` key serves this write only; it never goes into the session's state
         let mut once_key: Option<ObjectKey> = None;
-        let opening = self.join_open(ev).await;
+        let opening = self.join_open(ev).await?;
         if !self.st().open {
             let ctx = self
                 .context(None, "", "", Some(("secret".into(), name.clone())))
@@ -1472,8 +1638,10 @@ impl Daemon {
 
     /// `status`.
     pub fn status(&self) -> Value {
-        let st = self.st();
+        let mut st = self.st();
         let n = self.now();
+        // past its relay record's expiry, a delayed action is done or gone
+        st.pending.retain(|p| p.at.saturating_add(DELAYED_EXPIRES_MS) > n);
         let state = if st.waiting_since.is_some() {
             "waiting"
         } else if st.open {
@@ -1708,10 +1876,9 @@ impl Daemon {
             .unwrap_or_default();
         match n.state.as_str() {
             "pending" => {
-                let at = n.at.unwrap_or(0);
+                let (at, when) = delayed_at(n.at, self.now());
                 util::notify(&format!(
-                    "sealctl: your phone approved {what}{on} away from a trusted place. It takes effect at {}. Not you? Run: sealctl cancel",
-                    session::hhmm(at)
+                    "sealctl: your phone approved {what}{on} away from a trusted place. It takes effect {when}. Not you? Run: sealctl cancel"
                 ));
                 if let Some(id) = &n.delay {
                     let mut st = self.st();
@@ -1731,6 +1898,9 @@ impl Daemon {
                 }
             }
             "done" => {
+                if let Some(id) = &n.delay {
+                    self.st().pending.retain(|p| &p.id != id);
+                }
                 if let Some(r) = &n.report {
                     util::notify(&format!(
                         "sealctl: {} handed back {} objects ({}). {} failed.",
@@ -1746,10 +1916,10 @@ impl Daemon {
     }
 
     /// A relay `delayed` note.
-    pub fn on_delayed_note(&self, id: &str, machine: Option<&str>, at: u64) {
+    pub fn on_delayed_note(&self, id: &str, machine: Option<&str>, at: Option<u64>) {
+        let (at, when) = delayed_at(at, self.now());
         util::notify(&format!(
-            "sealctl: a sensitive action was approved on your phone. It takes effect at {}. Not you? Run: sealctl cancel",
-            session::hhmm(at)
+            "sealctl: a sensitive action was approved on your phone. It takes effect {when}. Not you? Run: sealctl cancel"
         ));
         let mut st = self.st();
         if !st.pending.iter().any(|p| p.id == id) {
@@ -2029,7 +2199,9 @@ async fn serve_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) {
         });
         let version_ok = req["cli"].as_str() == Some(VERSION);
         let d2 = d.clone();
-        let work = tokio::spawn(async move {
+        // the client closing its connection (Ctrl-C) withdraws its request (SPEC 6.3)
+        let (gone_tx, gone_rx) = tokio::sync::watch::channel(false);
+        let work = tokio::spawn(GONE.scope(gone_rx, async move {
             if !version_ok {
                 return Err(fail(
                     exit::ERROR,
@@ -2037,12 +2209,20 @@ async fn serve_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) {
                 ));
             }
             d2.handle(req, ev).await
-        });
+        }));
         tokio::pin!(work);
+        let mut reading = true;
         let result = loop {
             tokio::select! {
                 Some(e) = rx.recv() => {
                     let _ = w.write_all(format!("{e}\n").as_bytes()).await;
+                }
+                l = lines.next_line(), if reading => {
+                    // one request per connection: anything more is ignored; the end is Ctrl-C
+                    if !matches!(l, Ok(Some(_))) {
+                        reading = false;
+                        let _ = gone_tx.send(true);
+                    }
                 }
                 r = &mut work => break r,
             }
