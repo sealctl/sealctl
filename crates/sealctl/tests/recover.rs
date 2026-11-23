@@ -31,6 +31,8 @@ fn recover(home: &Path, target: &str, words: Option<&[String]>) -> (i32, String,
     pty.wait(Duration::from_secs(120))
 }
 
+/// A name for a test volume or container (the APFS tests only: LUKS files are named by path).
+#[cfg(target_os = "macos")]
 fn random_name(prefix: &str) -> String {
     let mut b = [0u8; 3];
     getrandom::fill(&mut b).unwrap();
