@@ -151,6 +151,23 @@ fn run_masked(mut cmd: Command, prog: &str, secrets: Vec<Vec<u8>>) -> Result<()>
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| fail(127, format!("Cannot start {prog}: {e}")))?;
+    // sealctl stays until the program exits, so its last output still passes the filter.
+    // Ctrl-C, Ctrl-\ and a terminal hangup reach the whole foreground group, the program too, so
+    // they are not sent again (a second interrupt makes some programs quit without cleaning up);
+    // one sent to sealctl's pid alone does not reach the program. SIGTERM is passed on, as it is
+    // usually sent to sealctl alone; one sent to the whole group or tree (timeout(1), kill of a
+    // process group) then reaches the program twice.
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGQUIT, SIGTERM, SIGHUP]) {
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                if sig == SIGTERM {
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+                }
+            }
+        });
+    }
     let out = child.stdout.take().context("stdout")?;
     let err = child.stderr.take().context("stderr")?;
     let s2 = secrets.clone();
