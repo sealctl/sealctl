@@ -1521,17 +1521,6 @@ fn send_report(c: &mut Ctx<'_>) -> bool {
 fn run_step(c: &mut Ctx<'_>, s: &Step) -> Result<String> {
     match s.kind.as_str() {
         "secrets" => {
-            if c.plan.target == Target::Secrets && !c.plan.keep_store {
-                // an earlier attempt handed every value back and moved the store into the run
-                // folder, then stopped before the setting was cleared
-                let mut cfg = crate::config::Config::load()?;
-                let gone = cfg.store_path()?.is_some_and(|d| !d.exists());
-                if gone && c.run.dir.join("kept/store").exists() {
-                    cfg.store = None;
-                    cfg.save()?;
-                    return Ok("handed back by the earlier attempt; the store is in the folder.".into());
-                }
-            }
             let store = Store::configured()?;
             let names: Vec<String> = store.list()?.into_iter().map(|l| l.name).collect();
             let n = hand_back_secrets(c, &store, &names)?;

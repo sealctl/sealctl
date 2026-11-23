@@ -207,6 +207,24 @@ pub fn rewrap_one(
                     .context("restic key")?;
                 let new_id = oldr.key_add(new.hex().as_bytes(), "sealctl", &format!("sealctl-{fp}"))?;
                 newr.key_remove(&old_id, &new_id)?;
+            } else if oldr.opens().unwrap_or(false) {
+                // an earlier rewrap added the new key and stopped before the old one went: the
+                // old words must not keep opening the repository
+                let old_id = oldr
+                    .keys()?
+                    .into_iter()
+                    .find(|k| k.3)
+                    .map(|k| k.0)
+                    .context("restic key")?;
+                let new_id = newr
+                    .keys()?
+                    .into_iter()
+                    .find(|k| k.3)
+                    .map(|k| k.0)
+                    .context("restic key")?;
+                if old_id != new_id {
+                    newr.key_remove(&old_id, &new_id)?;
+                }
             }
             let mut nb = b.clone();
             nb.words = fp.into();
@@ -435,10 +453,6 @@ fn load_job_at(p: &Path) -> Option<Job> {
     std::fs::read(p)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-}
-
-fn save_job(j: &Job) -> Result<()> {
-    save_job_at(&job_path()?, j)
 }
 
 fn save_job_at(p: &Path, j: &Job) -> Result<()> {
@@ -721,11 +735,46 @@ pub fn run(o: Opts) -> Result<()> {
             return Ok(());
         }
     }
-    save_job(&Job {
-        items: candidates,
-        request: None,
-    })?;
+    start_new_job(&paths::state_dir()?, candidates)?;
     start_job(o.foreground)
+}
+
+/// Writes a new job, unless a runner is at work on the one on file (it would go on with item
+/// ids the new file no longer has). An unfinished item of the job on file keeps its new id and
+/// old repository: what an earlier run made under that id is used, not left behind.
+fn start_new_job(state: &Path, mut items: Vec<JobItem>) -> Result<()> {
+    let p = state.join("migrate.json");
+    let _held = lock_job_file(&p)?;
+    if runner_running(state)? {
+        return Err(fail(
+            exit::BUSY,
+            "The re-encryption job is running. Progress: sealctl migrate --status",
+        ));
+    }
+    if let Some(old) = load_job_at(&p) {
+        for it in &mut items {
+            if let Some(o) = old
+                .items
+                .iter()
+                .find(|o| o.kind == it.kind && o.name == it.name && o.state != "done")
+            {
+                it.new_id = o.new_id.clone();
+                it.old = o.old.clone();
+            }
+        }
+    }
+    save_job_at(&p, &Job { items, request: None })
+}
+
+/// Whether a runner holds `migrate.lock`.
+fn runner_running(state: &Path) -> Result<bool> {
+    let Ok(f) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(state.join("migrate.lock"))
+    else {
+        return Ok(false);
+    };
+    Ok(nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock).is_err())
 }
 
 fn report_outcome(out: &Outcome) {
@@ -880,6 +929,15 @@ fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
     let (key, fp) = new_key("volume", &new_id, paths::tilde(&old_path))?;
     if v.is_open() {
         volume::close(&v, false)?;
+    }
+    if new_path.exists()
+        && old_path.exists()
+        && !volume::sparsebundle::verify(&new_path, key.hex().as_bytes())?
+        && volume::sparsebundle::verify(&old_path, old_key.hex().as_bytes())?
+    {
+        // a copy from a job started over under another id: the original opens with its key,
+        // and the copy is made again under this one
+        std::fs::remove_dir_all(&new_path)?;
     }
     if !new_path.exists() {
         let out = util::run_with_stdin(

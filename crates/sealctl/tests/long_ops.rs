@@ -231,6 +231,7 @@ fn seal_backup_stopped_after_the_old_key_went_keeps_its_definition() {
     }
 }
 
+#[cfg(feature = "test-hooks")]
 fn run_dir(env: &Env) -> PathBuf {
     std::fs::read_dir(env.h())
         .unwrap()
@@ -245,6 +246,7 @@ fn run_dir(env: &Env) -> PathBuf {
         .expect("run folder")
 }
 
+#[cfg(feature = "test-hooks")]
 fn password_in(run: &Path, name: &str) -> String {
     std::fs::read_to_string(run.join("passwords.txt"))
         .unwrap()
@@ -612,4 +614,216 @@ fn two_seals_of_one_bundle_leave_a_marker_that_opens_it() {
         defs[0]["id"].as_str(),
         "the marker names the id of the key that opens it:\n{screen1}\n{screen2}"
     );
+}
+
+/// `sealctl migrate` asked to start again while the job's runner is at work: refused, and the
+/// job on file (with the new ids the runner is using) stays as it is.
+#[test]
+fn a_new_re_encryption_never_replaces_a_running_job() {
+    if !have("restic") {
+        return;
+    }
+    let mut env = Env::new();
+    env.pair();
+    backup_with_snapshot(&env);
+    let state = env.h().join("s/sealctl");
+    std::fs::create_dir_all(&state).unwrap();
+    let job = serde_json::json!({"items": [{"kind": "backup", "name": "b", "state": "running", "new_id": "in-use", "note": ""}]});
+    std::fs::write(state.join("migrate.json"), job.to_string()).unwrap();
+    // the runner's lock, held as a running job holds it
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("migrate.lock"))
+        .unwrap();
+    let held = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["migrate", "--yes"]));
+    drop(held);
+    assert_ne!(code, 0, "refused while the job runs: {err}");
+    let on_file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("migrate.json")).unwrap()).unwrap();
+    assert_eq!(on_file["items"][0]["new_id"], "in-use", "{on_file}");
+}
+
+/// A sparse bundle copy left beside the original by a job that was started over (under
+/// another new id): the job makes the copy again instead of stopping on a copy its key does
+/// not open.
+#[cfg(target_os = "macos")]
+#[test]
+fn re_encryption_makes_a_stale_copy_again() {
+    use std::io::Write;
+    let mut env = Env::new();
+    env.pair();
+    let bundle = env.h().join("w.sparsebundle");
+    let mnt = env.h().join("mnt/w");
+    let marker = canary();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&[
+            "volume",
+            "create",
+            "w",
+            "--kind",
+            "sparsebundle",
+            "--size",
+            "32m",
+            "--path",
+            bundle.to_str().unwrap(),
+            "--mountpoint",
+            mnt.to_str().unwrap(),
+        ])
+    });
+    assert_eq!(code, 0, "{err}");
+    std::fs::write(mnt.join("keep.txt"), &marker).unwrap();
+    env.run(&["lock"]);
+    // the copy an earlier job made under its own new id
+    let stale = env.h().join(".w.migrating.sparsebundle");
+    let mut c = Command::new("/usr/bin/hdiutil")
+        .args([
+            "create",
+            "-quiet",
+            "-size",
+            "32m",
+            "-type",
+            "SPARSEBUNDLE",
+            "-fs",
+            "APFS",
+            "-encryption",
+            "AES-256",
+            "-stdinpass",
+            "-volname",
+            "w",
+        ])
+        .arg(&stale)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(canary().as_bytes()).unwrap();
+    assert!(c.wait().unwrap().success());
+    let ((code, _, err), _) =
+        env.with_phone(Answer::Session, || env.run(&["migrate", "--yes", "--foreground"]));
+    assert_eq!(code, 0, "{err}");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "w"]));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(std::fs::read_to_string(mnt.join("keep.txt")).unwrap(), marker);
+    env.run(&["lock"]);
+}
+
+/// A rewrap of a restic repository stopped (power cut) right after the key of the new words
+/// was added: the next rewrap removes the old words' key too, so the old words no longer open
+/// the repository.
+#[test]
+fn a_rewrap_stopped_after_the_new_key_was_added_still_removes_the_old_one() {
+    if !have("restic") {
+        return;
+    }
+    let mut env = Env::new();
+    let m = env.pair();
+    let repos = backup_with_snapshot(&env);
+    env.run(&["lock"]);
+    let def: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.h().join(".config/sealctl/backups/b.toml")).unwrap())
+            .unwrap();
+    let repo_id = def["repo_id"].as_str().unwrap().to_string();
+    let repo = repos.join(&repo_id);
+    let a = env.phone.clone();
+    let old_pw = sealctl_core::ObjectKey::derive(&a.root(), sealctl_core::Purpose::Backup, &repo_id)
+        .unwrap()
+        .hex()
+        .to_string();
+    assert!(restic(&repo, &old_pw, &["cat", "config"]).status.success());
+    let b = Arc::new(Phone::new(&env.origin));
+    env.block(b.move_from(&a, &m)).unwrap();
+    let rewrap = |w: Option<&Path>| {
+        let a2 = a.clone();
+        let phone = Scripted::start(b.clone(), move |req| match req.kind() {
+            RequestKind::Rewrap => Act::Rewrap(a2.clone()),
+            _ => Act::Answer(Answer::Session),
+        });
+        let mut c = env.cmd();
+        if let Some(w) = w {
+            c.env("SEALCTL_RESTIC", w);
+        }
+        c.args(["migrate", "--depth", "rewrap"]);
+        let pty = Pty::spawn(c);
+        let r = pty.wait(Duration::from_secs(180));
+        drop(phone);
+        r
+    };
+    let w = wrapper(
+        &env,
+        "restic-dies-after-key-add",
+        "\"$REAL\" \"$@\"; rc=$?\ncase \" $* \" in *\" key add \"*) [ $rc -eq 0 ] && kill -9 $PPID;; esac\nexit $rc",
+    );
+    let (code, _, screen) = rewrap(Some(&w));
+    assert_ne!(code, 0, "stopped after the key was added: {screen}");
+    let (code, _, screen) = rewrap(None);
+    assert_eq!(code, 0, "{screen}");
+    assert!(
+        !restic(&repo, &old_pw, &["cat", "config"]).status.success(),
+        "the old words no longer open the repository: {screen}"
+    );
+    let new_pw = sealctl_core::ObjectKey::derive(&b.root(), sealctl_core::Purpose::Backup, &repo_id)
+        .unwrap()
+        .hex()
+        .to_string();
+    assert!(restic(&repo, &new_pw, &["cat", "config"]).status.success());
+}
+
+/// `unseal secrets` stopped (power cut) after every value was handed back and the store folder
+/// moved into the run folder, before the store setting was cleared: `--resume` finishes.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn unseal_secrets_resumed_after_the_store_moved_finishes() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut env = Env::new();
+    env.pair();
+    let value = canary();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run_in(&["secret", "set", "shop/key"], value.as_bytes())
+    });
+    assert_eq!(code, 0, "{err}");
+    env.run(&["lock"]);
+    let cfg_file = env.h().join(".config/sealctl/config.toml");
+    let cfg_before = std::fs::read_to_string(&cfg_file).unwrap();
+    let mut c = env.cmd();
+    c.env("SEALCTL_TEST_KILL", "done:secrets")
+        .args(["unseal", "secrets"]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("y");
+    let start = Instant::now();
+    let status = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(start.elapsed() < Duration::from_secs(120), "not killed");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.signal(), Some(9));
+    drop(phone);
+    let run = run_dir(&env);
+    assert!(run.join("kept/store").exists());
+    // the state just before the setting was cleared: the store setting as it was, and no
+    // `done` line for the step
+    std::fs::write(&cfg_file, &cfg_before).unwrap();
+    let journal = std::fs::read_to_string(run.join("journal.jsonl")).unwrap();
+    let kept: String = journal
+        .lines()
+        .filter(|l| !(l.contains("\"state\":\"done\"") && l.contains("\"step\":\"secrets:")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(run.join("journal.jsonl"), kept).unwrap();
+
+    let mut c = env.cmd();
+    c.args(["unseal", "--resume"]);
+    let pty = Pty::spawn(c);
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    assert!(run.join("done").exists());
+    let env_file = std::fs::read_to_string(run.join("secrets.env")).unwrap();
+    assert!(env_file.contains(&value));
 }
