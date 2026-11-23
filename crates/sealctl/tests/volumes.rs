@@ -255,6 +255,121 @@ fn unmount(mnt: &std::path::Path) {
     assert!(!mnt.join("keep.txt").exists());
 }
 
+/// Polls `f` every 100 ms for up to `secs` seconds.
+#[cfg(feature = "test-hooks")]
+fn until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..secs * 10 {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    f()
+}
+
+/// Whether `hdiutil info` lists an image at `bundle`.
+#[cfg(feature = "test-hooks")]
+fn attached(bundle: &std::path::Path) -> bool {
+    let real = std::fs::canonicalize(bundle).unwrap();
+    let info = Command::new("hdiutil").arg("info").output().unwrap();
+    let info = String::from_utf8_lossy(&info.stdout);
+    info.lines().any(|l| {
+        l.strip_prefix("image-path")
+            .and_then(|r| r.split_once(':'))
+            .is_some_and(|(_, p)| {
+                let p = std::path::Path::new(p.trim());
+                p == bundle || p == real
+            })
+    })
+}
+
+/// Detaches the test's bundle however the test ends, so nothing stays attached.
+#[cfg(feature = "test-hooks")]
+struct Detach<'a>(&'a Env, std::path::PathBuf, std::path::PathBuf);
+
+#[cfg(feature = "test-hooks")]
+impl Drop for Detach<'_> {
+    fn drop(&mut self) {
+        if attached(&self.1) {
+            let _ = self.0.run(&["volume", "close", "r", "--force"]);
+        }
+        if attached(&self.1) {
+            let _ = Command::new("hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.2)
+                .output();
+        }
+    }
+}
+
+/// A lock while an `open` is mounting an auto volume (SPEC 6.5): the lock's unmount waits for
+/// that mount, so the volume is closed and detached once the lock is done. The `mount` hold
+/// point (`test-hooks`) stops the daemon just before it mounts, the session checked Open.
+#[cfg(all(target_os = "macos", feature = "test-hooks"))]
+#[test]
+fn a_lock_while_an_open_mounts_a_volume_leaves_it_closed() {
+    let mut env = Env::new();
+    env.pair();
+    let bundle = env.h().join("r.sparsebundle");
+    let mnt = env.h().join("mnt/r");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&[
+            "volume",
+            "create",
+            "r",
+            "--kind",
+            "sparsebundle",
+            "--size",
+            "32m",
+            "--path",
+            bundle.to_str().unwrap(),
+            "--mountpoint",
+            mnt.to_str().unwrap(),
+        ])
+    });
+    assert_eq!(code, 0, "{err}");
+    let _detach = Detach(&env, bundle.clone(), mnt.clone());
+    std::fs::write(mnt.join("keep.txt"), canary()).unwrap();
+    let (code, _, err) = env.run(&["lock"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!attached(&bundle), "closed by the lock");
+
+    let state = env.h().join("s/sealctl");
+    let hold = state.join("test-hold-mount");
+    let held = state.join("test-held-mount");
+    let _ = std::fs::remove_file(&held);
+    std::fs::write(&hold, b"").unwrap();
+    let spawn = |args: &[&str]| {
+        let mut c = env.cmd();
+        c.args(args).stdin(Stdio::null());
+        std::thread::spawn(move || c.output().unwrap())
+    };
+    let ((), _) = env.with_phone(Answer::Session, || {
+        let open = spawn(&["open"]);
+        assert!(until(60, || held.exists()), "the daemon stopped before the mount");
+        let lock = spawn(&["lock"]);
+        let locked = until(20, || {
+            let (_, out, _) = env.run(&["status", "--json"]);
+            serde_json::from_str::<serde_json::Value>(&out).is_ok_and(|v| v["state"] == "locked")
+        });
+        assert!(locked, "the session locked while the mount waited");
+        // the mount goes on after the lock began
+        std::fs::remove_file(&hold).unwrap();
+        let lock = lock.join().unwrap();
+        assert!(lock.status.success(), "{}", String::from_utf8_lossy(&lock.stderr));
+        open.join().unwrap();
+    });
+    assert!(
+        !mnt.join("keep.txt").exists(),
+        "the volume is not mounted after the lock"
+    );
+    assert!(!attached(&bundle), "the image is detached after the lock");
+    let (_, out, _) = env.run(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["state"], "locked", "{out}");
+    assert_eq!(v["volumes"][0]["mounted"], false, "{out}");
+}
+
 /// A bundle attached with nothing mounted from it (a key check that could not detach, a mount
 /// that did not finish) is not taken for an open volume with an empty mount point: `volume open`
 /// detaches it and opens the volume, and its files are there.
