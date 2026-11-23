@@ -22,6 +22,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   a wait for the phone no longer holds up lock messages and statuses; the phone hears of an
   Open session before the next request; lock messages allow a minute of clock skew; busy
   volumes are retried every minute; on-lock backups stop at 15 minutes; SIGTERM locks.
+- Daemon exit: once it begins, no session opens and on-lock backups still running stop
+  (restic gets SIGINT first, so it removes its repository lock), so the unmount and the last
+  status fit the service's stop timeout, now 60 seconds (launchd `ExitTimeOut`, systemd
+  `TimeoutStopSec` with `KillMode=mixed`) for services installed from this version on. A hung mount no longer holds up locks for more than 2 minutes, or an exit at all.
+- Key requests check the timers again after waiting; a `sealctl lock` or lock message while
+  the phone is asked to open leaves that approval with its command only; statuses while
+  Locked carry the busy volumes and are sent again after a failure, also after a restart.
 
 ## 0.7.0
 
