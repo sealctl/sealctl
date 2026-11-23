@@ -488,3 +488,26 @@ async fn a_lock_whose_status_failed_tells_the_phone_later() {
     d.tick().await;
     assert_eq!(sent(&d), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connecting_the_machine_socket_does_not_hold_up_requests() {
+    // a relay that takes the connection and never answers the upgrade
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let (conn, _) = listener.accept().unwrap();
+        let _ = tx.send(());
+        std::thread::sleep(Duration::from_secs(30));
+        drop(conn);
+    });
+    let (d, _) = testing::daemon(&origin);
+    open(&d, &store_items()).await;
+    let channel = tokio::spawn(super::channel::run(d.clone()));
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(d.paired.try_lock().is_ok(), "the pairing is free while the socket connects");
+    channel.abort();
+}

@@ -76,16 +76,19 @@ pub async fn run(d: Arc<Daemon>) {
     }
     let mut wait = Reconnect::default();
     loop {
-        let (keys_path, sock) = {
+        // the pairing is not held while connecting (up to 10 s): requests and statuses go on
+        let (keys_path, keys) = {
             let paired = d.paired.lock().await;
             let path = format!(
                 "/v1/phones/{}/machines/{}/socket",
                 paired.phone_id(),
                 paired.file.machine
             );
-            let s = d.relay.socket(&paired.keys, &path).await;
-            (path, s)
+            let keys = sealctl_core::MachineKeys::from_bytes(&paired.keys.to_bytes()).expect("64 bytes");
+            (path, keys)
         };
+        let sock = d.relay.socket(&keys, &keys_path).await;
+        drop(keys);
         let mut ws = match sock {
             Ok(ws) => ws,
             Err(e) => {
