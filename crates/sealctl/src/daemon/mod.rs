@@ -352,6 +352,15 @@ impl Daemon {
         idle_input_secs()
     }
 
+    /// The secret store (a test may give its own).
+    fn store(&self) -> Result<Store> {
+        #[cfg(test)]
+        if let Some(dir) = self.t.store.lock().unwrap().clone() {
+            return Store::at(&dir);
+        }
+        Store::configured()
+    }
+
     fn st(&self) -> std::sync::MutexGuard<'_, State> {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -671,6 +680,18 @@ impl Daemon {
         }
     }
 
+    /// The Open session's store key, after the timers are checked again: the request may have
+    /// waited (for the phone, the pairing, its turn) since its first check.
+    fn session_store_key(self: &Arc<Self>) -> Result<ObjectKey> {
+        self.expire();
+        self.st().store_key.as_ref().map(copy_key).ok_or_else(|| {
+            fail(
+                exit::ERROR,
+                "The session locked while this command waited. Run it again.",
+            )
+        })
+    }
+
     /// `open`.
     pub async fn op_open(self: &Arc<Self>, ctx: RequestContext, ev: &Events, notify: bool) -> Result<Value> {
         self.expire();
@@ -692,7 +713,7 @@ impl Daemon {
         ev: &Events,
     ) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
         self.expire();
-        let store = Store::configured()?;
+        let store = self.store()?;
         let mut headers = Vec::new();
         for n in &req.names {
             headers.push((n.clone(), store.header(n)?));
@@ -715,6 +736,8 @@ impl Daemon {
         // what is not covered yet is judged after any pending open: a caller that joined it may
         // find its uses granted for the session already
         let opening = self.join_open(ev).await;
+        // the waits before (the context, the turn) may have taken the session past its time
+        self.expire();
         let remembered = load_answers();
         // what the session covers and whether it is Open, read together: a lock in between
         // would leave uses counted as covered for the `open` that follows
@@ -800,12 +823,7 @@ impl Daemon {
         }
         let store_key = match once_store_key {
             Some(k) => k,
-            None => self
-                .st()
-                .store_key
-                .as_ref()
-                .map(copy_key)
-                .ok_or_else(|| fail(exit::ERROR, "The session has no store key."))?,
+            None => self.session_store_key()?,
         };
         // own-approval secrets: an `own` request every time
         let own: Vec<RequestItem> = headers
@@ -889,7 +907,9 @@ impl Daemon {
             return Ok((keys, w));
         }
         drop(opening);
-        // the session was opened while this request waited for that open
+        // the session was opened while this request waited for that open (and its time has
+        // not run out since)
+        self.expire();
         if let Some(h) = held() {
             return Ok(h);
         }
@@ -916,7 +936,7 @@ impl Daemon {
     /// `store`: write or rename a secret with the store key.
     pub async fn op_store(self: &Arc<Self>, req: &Value, ev: &Events) -> Result<Value> {
         self.expire();
-        let store = Store::configured()?;
+        let store = self.store()?;
         let action = req["action"].as_str().unwrap_or("");
         let name = req["name"].as_str().unwrap_or("").to_string();
         crate::store::check_name(&name)?;
@@ -937,12 +957,7 @@ impl Daemon {
         drop(opening);
         let key = match once_key {
             Some(k) => k,
-            None => self
-                .st()
-                .store_key
-                .as_ref()
-                .map(copy_key)
-                .ok_or_else(|| fail(exit::ERROR, "No store key."))?,
+            None => self.session_store_key()?,
         };
         let words = store.id_file()?.map(|f| f.words).unwrap_or_default();
         match action {

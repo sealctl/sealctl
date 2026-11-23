@@ -78,6 +78,8 @@ pub struct Hooks {
     pub vol_busy: Mutex<VecDeque<bool>>,
     /// Statuses that fail before the rest go out.
     pub status_failures: Mutex<u32>,
+    /// The secret store's folder; unset: none.
+    pub store: Mutex<Option<std::path::PathBuf>>,
     /// Statuses are recorded, not sent; the machine channel is a stand-in that sends one
     /// status when it starts, as the real one does.
     pub offline: AtomicBool,
@@ -224,4 +226,13 @@ pub fn item(purpose: &str, id: &str) -> sealctl_core::wire::RequestItem {
         words: Some("qHWf".into()),
         ..Default::default()
     }
+}
+
+/// Gives `d` a secret store of its own (under the unit tests' folder); returns its id.
+pub fn with_store(d: &Daemon) -> String {
+    let id = sealctl_core::ids::new_uuid().unwrap();
+    let dir = crate::paths::unit_test_root().join("stores").join(&id);
+    crate::paths::ensure_private_dir(&dir).unwrap();
+    *d.t.store.lock().unwrap() = Some(dir);
+    id
 }

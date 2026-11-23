@@ -744,3 +744,55 @@ async fn an_approval_that_arrives_during_the_exit_opens_no_session() {
     assert!(d.st().store_key.is_none());
     assert!(!d.t.events().iter().any(|e| e.starts_with("mount")));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_session_that_runs_out_while_a_request_waits_its_turn_hands_out_no_value() {
+    let (d, _) = testing::daemon(DEAD);
+    let id = testing::with_store(&d);
+    let items = vec![item("secrets", &id)];
+    d.t.answer(session_reply(&items), None);
+    d.open_with(
+        items.clone(),
+        &id,
+        vec![],
+        RequestContext::default(),
+        &ev(),
+        false,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let store = d.store().unwrap();
+    let key = super::copy_key(d.st().store_key.as_ref().unwrap());
+    store
+        .write(
+            "API",
+            sealctl_core::sealed::Mode::StoreKey,
+            &key,
+            "qHWf",
+            b"value",
+            None,
+        )
+        .unwrap();
+    // a status holds the pairing (up to 10 s) while a request reads its context
+    let paired = d.paired.lock().await;
+    let asking = tokio::spawn({
+        let d = d.clone();
+        async move {
+            let req = super::ValuesReq {
+                names: vec!["API".into()],
+                ..Default::default()
+            };
+            d.op_values(req, &ev()).await.is_ok()
+        }
+    });
+    settle().await;
+    // the machine sleeps past the idle allowance meanwhile
+    d.t.advance(ALLOWANCE_MS + 60_000);
+    drop(paired);
+    assert!(
+        !asking.await.unwrap(),
+        "no value from a session whose time ran out"
+    );
+    assert!(!d.st().open);
+}
