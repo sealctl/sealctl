@@ -409,6 +409,87 @@ fn tokens_in_text(out: &str) -> Vec<u32> {
     ids
 }
 
+/// Is `path` a LUKS file? (Its header starts with the LUKS magic.)
+pub fn is_luks(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 6];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == *b"LUKS\xba\xbe"
+}
+
+/// The LUKS UUID of a file, in lower case: the volume id (`cryptsetup luksUUID`, no root).
+pub fn uuid_of(path: &Path) -> Result<String> {
+    let out = check(
+        crate::util::system_cmd("cryptsetup")
+            .arg("luksUUID")
+            .arg(path)
+            .output()
+            .context("running cryptsetup (is it installed?)")?,
+        "cryptsetup luksUUID",
+    )?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_lowercase())
+}
+
+/// The words marker of a LUKS file: its `sealctl` token, read without root when the file is
+/// readable, else through `sudo`. `None` when there is none (its import is best effort).
+pub fn read_marker(path: &Path) -> Option<sealctl_core::ids::IdFile> {
+    let dump = |mut c: Command| {
+        c.args(["luksDump", "--dump-json-metadata"])
+            .arg(path)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    let out = dump(crate::util::system_cmd("cryptsetup")).or_else(|| {
+        let mut c = sudo();
+        c.arg("cryptsetup");
+        dump(c)
+    })?;
+    marker_in_json(&out.stdout)
+}
+
+/// The first `sealctl` token of `luksDump --dump-json-metadata` as an `.id` object.
+fn marker_in_json(out: &[u8]) -> Option<sealctl_core::ids::IdFile> {
+    let v: serde_json::Value = serde_json::from_slice(out).ok()?;
+    let id = tokens_in_json(out)?.into_iter().next()?;
+    let token = v.get("tokens")?.get(id.to_string())?;
+    sealctl_core::ids::IdFile::parse(&token.to_string()).ok()
+}
+
+/// Opens the LUKS file under the device-mapper name `mapper` and mounts it at `mountpoint`
+/// (`recover`); a failed mount closes the device again.
+pub fn open_at(path: &Path, mapper: &str, mountpoint: &Path, passphrase: &[u8]) -> Result<()> {
+    check(
+        run_with_stdin(
+            sudo()
+                .args(["cryptsetup", "open", "--type", "luks2", "--key-file=-"])
+                .arg(path)
+                .arg(mapper),
+            passphrase,
+        )?,
+        "cryptsetup open",
+    )?;
+    let mounted = std::fs::create_dir_all(mountpoint)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| {
+            check(
+                sudo()
+                    .arg("mount")
+                    .arg(format!("/dev/mapper/{mapper}"))
+                    .arg(mountpoint)
+                    .output()?,
+                "mount",
+            )
+        });
+    if let Err(e) = mounted {
+        let _ = sudo().args(["cryptsetup", "close", mapper]).output();
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Does `passphrase` open the LUKS file? (`cryptsetup open --test-passphrase`.)
 pub fn verify(path: &Path, passphrase: &[u8]) -> Result<bool> {
     let out = run_with_stdin(
@@ -428,6 +509,12 @@ mod tests {
         assert_eq!(super::tokens_in_json(json), Some(vec![1, 3]));
         assert_eq!(super::tokens_in_json(br#"{"tokens":{}}"#), Some(vec![]));
         assert_eq!(super::tokens_in_json(b"not json"), None);
+        let marker = br#"{"tokens":{"0":{"type":"systemd-tpm2","keyslots":["0"]},"2":{"type":"sealctl","keyslots":[],"sealctl":1,"kind":"volume","id":"6f1c2a4e-1111-4222-8333-444455556666","words":"qHWf","check":"abc","created":"2026-11-23T00:00:00Z","volume":"luks"}}}"#;
+        let m = super::marker_in_json(marker).unwrap();
+        assert_eq!(m.words, "qHWf");
+        assert_eq!(m.check, "abc");
+        assert_eq!(m.id, "6f1c2a4e-1111-4222-8333-444455556666");
+        assert!(super::marker_in_json(br#"{"tokens":{}}"#).is_none());
         let text = "LUKS header information\nVersion:       \t2\n\nKeyslots:\n  0: luks2\n\tKey:        512 bits\nTokens:\n  0: systemd-tpm2\n\tKeyslot:    0\n  2: sealctl\n  5: sealctl\nDigests:\n  0: pbkdf2\n";
         assert_eq!(super::tokens_in_text(text), vec![2, 5]);
         assert_eq!(

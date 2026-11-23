@@ -182,7 +182,7 @@ enum Cmd {
     Unseal(UnsealArgs),
     /// Open an object with the 24 words alone (no phone, no relay).
     Recover {
-        /// Store folder, .sealed file, sparse bundle or restic repository.
+        /// Store folder, .sealed file, sparse bundle, LUKS file, APFS volume UUID or restic repository.
         target: String,
         /// Write every secret into this folder.
         #[arg(long)]
