@@ -334,7 +334,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 On any lock the daemon, in this order:
 
 1. wipes the store key, decrypted SSH keys, own-approval keys and the per-agent session allowances;
-2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total;
+2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total: restic still running at the limit is stopped, since it holds the backup key and the storage credentials;
 3. unmounts volumes; a busy volume is reported with the process holding it (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux) and retried every 60 seconds until it closes or a session opens, with a status each time the busy list changes; `sealctl lock --force` force-unmounts;
 4. wipes the backup and volume keys;
 5. sends a status (`locked`, with any busy volumes) and closes the machine socket. When that status fails, the daemon sends it again every minute until the phone has heard the session is Locked.

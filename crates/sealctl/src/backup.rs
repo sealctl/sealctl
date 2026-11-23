@@ -261,15 +261,26 @@ impl Repo {
 
     /// Runs restic with output shown (stdout optional).
     pub fn run(&self, args: &[&str], quiet: bool) -> Result<()> {
-        let status = self.run_status(args, quiet)?;
+        self.run_until(args, quiet, None)
+    }
+
+    /// [`Repo::run`], stopping restic at `deadline` (the on-lock time limit): it holds the
+    /// backup key and the storage credentials, so it does not run on after the lock's limit.
+    pub fn run_until(&self, args: &[&str], quiet: bool, deadline: Option<std::time::Instant>) -> Result<()> {
+        let status = self.run_status(args, quiet, deadline)?;
         if !status.success() {
             bail!("restic {} failed ({status})", args.first().unwrap_or(&""));
         }
         Ok(())
     }
 
-    /// The same, returning how restic exited.
-    pub fn run_status(&self, args: &[&str], quiet: bool) -> Result<std::process::ExitStatus> {
+    /// [`Repo::run_until`], returning how restic exited.
+    pub fn run_status(
+        &self,
+        args: &[&str],
+        quiet: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<std::process::ExitStatus> {
         let mut c = self.command();
         c.args(args).stdin(Stdio::piped());
         if quiet {
@@ -283,7 +294,7 @@ impl Repo {
             let mut i = child.stdin.take().context("stdin")?;
             i.write_all(self.password.as_bytes())?;
         }
-        Ok(child.wait()?)
+        wait_until(&mut child, deadline)
     }
 
     /// Does the password open the repository?
@@ -479,6 +490,27 @@ pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Resu
     Ok((b, key))
 }
 
+/// Waits for `child`, killing it at `deadline`.
+fn wait_until(
+    child: &mut std::process::Child,
+    deadline: Option<std::time::Instant>,
+) -> Result<std::process::ExitStatus> {
+    let Some(deadline) = deadline else {
+        return Ok(child.wait()?);
+    };
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("stopped at the time limit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Runs one backup now, then `forget` with the policy (`--prune` at most weekly). `Some` is a
 /// warning: the snapshot was made but is missing something.
 pub fn run_one(
@@ -486,6 +518,17 @@ pub fn run_one(
     key: &ObjectKey,
     env: BTreeMap<String, Zeroizing<String>>,
     quiet: bool,
+) -> Result<Option<String>> {
+    run_one_until(b, key, env, quiet, None)
+}
+
+/// [`run_one`], with restic stopped at `deadline`.
+pub fn run_one_until(
+    b: &Backup,
+    key: &ObjectKey,
+    env: BTreeMap<String, Zeroizing<String>>,
+    quiet: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Option<String>> {
     if key.check() != b.check {
         return Err(fail(
@@ -532,7 +575,7 @@ pub fn run_one(
         args.push("--quiet");
     }
     // restic exits 3 when it made the snapshot but could not read some files (it lists them)
-    let r = match repo.run_status(&args, quiet) {
+    let r = match repo.run_status(&args, quiet, deadline) {
         Ok(s) if s.success() => Ok(None),
         Ok(s) if s.code() == Some(3) => Ok(Some("some files could not be read".to_string())),
         Ok(s) => Err(anyhow::anyhow!("restic backup failed ({s})")),
@@ -562,7 +605,7 @@ pub fn run_one(
             if prune {
                 fargs.push("--prune");
             }
-            if repo.run(&fargs, true).is_ok() && prune {
+            if repo.run_until(&fargs, true, deadline).is_ok() && prune {
                 st.last_prune = Some(now_secs());
             }
         }
@@ -603,4 +646,22 @@ pub fn schedule_install(every_minutes: u64) -> Result<()> {
 /// Removes the schedule.
 pub fn schedule_uninstall() -> Result<()> {
     crate::service::uninstall(crate::service::BACKUP_LABEL)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_process_past_its_deadline_is_stopped() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let started = Instant::now();
+        let r = super::wait_until(&mut child, Some(started + Duration::from_millis(300)));
+        assert!(r.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some(), "killed and reaped");
+        // without a deadline it is waited for
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        assert!(super::wait_until(&mut child, None).unwrap().success());
+    }
 }

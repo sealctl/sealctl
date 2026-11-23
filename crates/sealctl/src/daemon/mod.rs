@@ -562,9 +562,7 @@ impl Daemon {
                 st.open = true;
                 st.opened_at = asked_at;
                 // past the hard stop, or saved while the clock was ahead: a new day of credit
-                if expired(&st.saved, n) == Some(true)
-                    || st.saved.first_open.is_some_and(|f| f > n)
-                {
+                if expired(&st.saved, n) == Some(true) || st.saved.first_open.is_some_and(|f| f > n) {
                     st.saved.reset_credit();
                 }
                 if st.saved.first_open.is_none() {
@@ -1112,17 +1110,18 @@ impl Daemon {
         if c.backups {
             self.t.backup.pass("backup", &self.t).await;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        // restic is stopped at the limit: it holds the backup key and the storage credentials,
+        // and would otherwise run on (and keep volumes busy) after the lock gave up on it
+        let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
         for (b, key, env) in c.jobs {
             let name = b.name.clone();
-            let r = tokio::time::timeout_at(
-                deadline,
-                tokio::task::spawn_blocking(move || crate::backup::run_one(&b, &key, env, true)),
-            )
+            let r = tokio::task::spawn_blocking(move || {
+                crate::backup::run_one_until(&b, &key, env, true, Some(deadline))
+            })
             .await;
             match r {
-                Ok(Ok(Ok(None))) => lines.push(format!("Backed up {name}.")),
-                Ok(Ok(Ok(Some(warning)))) => lines.push(format!("Backed up {name} ({warning}).")),
+                Ok(Ok(None)) => lines.push(format!("Backed up {name}.")),
+                Ok(Ok(Some(warning))) => lines.push(format!("Backed up {name} ({warning}).")),
                 _ => lines.push(format!(
                     "Backup {name} failed; run sealctl backup run {name} later."
                 )),
@@ -1134,7 +1133,8 @@ impl Daemon {
         let reopened = self.st().open;
         #[cfg(test)]
         if !reopened {
-            self.t.event(format!("unmount{}", if force { " force" } else { "" }));
+            self.t
+                .event(format!("unmount{}", if force { " force" } else { "" }));
         }
         if !reopened {
             let (l, b) = self.close_volumes(None, force).await;
@@ -1373,7 +1373,11 @@ impl Daemon {
         };
         #[cfg(test)]
         if self.t.offline() {
-            let s = status.state.as_ref().map(|s| s.session.clone()).unwrap_or_default();
+            let s = status
+                .state
+                .as_ref()
+                .map(|s| s.session.clone())
+                .unwrap_or_default();
             if self.t.fail_status() {
                 self.t.event(format!("status {s} failed"));
                 return Err(anyhow::anyhow!("test: relay down"));
@@ -1465,8 +1469,7 @@ impl Daemon {
                 // may be behind the machine's, so "before" leaves a minute. The channel goes on
                 // taking messages while the lock runs its slow steps.
                 self.lock_soon(&reason, reason == "words", |st| {
-                    (st.open && msg.time.saturating_add(LOCK_SKEW_MS) >= st.opened_at)
-                        .then_some(false)
+                    (st.open && msg.time.saturating_add(LOCK_SKEW_MS) >= st.opened_at).then_some(false)
                 });
             }
             MessageKind::Answers { answers, more } => {
@@ -1623,13 +1626,17 @@ impl Daemon {
     /// does not get a key, or count as work, before the tick has run. Returns whether it locked.
     fn expire(self: &Arc<Self>) -> bool {
         let n = self.now();
-        self.lock_soon("idle", false, |st| {
-            if st.open {
-                expired(&st.saved, n)
-            } else {
-                None
-            }
-        })
+        self.lock_soon(
+            "idle",
+            false,
+            |st| {
+                if st.open {
+                    expired(&st.saved, n)
+                } else {
+                    None
+                }
+            },
+        )
     }
 
     /// A spawned daemon exits after 10 minutes Locked with no client (SPEC 6.1). A request
