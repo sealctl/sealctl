@@ -331,8 +331,9 @@ async fn the_end_of_a_wait_is_told_to_the_phone() {
         async move { d.ask(approve::body("agent"), &ev(), false).await.is_ok() }
     });
     settle().await;
-    // a status goes out while the phone is asked
+    // a status goes out while the phone is asked; the one at the end of the wait fails
     d.send_status(&[]).await.unwrap();
+    *d.t.status_failures.lock().unwrap() = 1;
     gate.add_permits(1);
     assert!(asking.await.unwrap());
     let before = d.t.events().len();
@@ -510,4 +511,35 @@ async fn connecting_the_machine_socket_does_not_hold_up_requests() {
         .unwrap();
     assert!(d.paired.try_lock().is_ok(), "the pairing is free while the socket connects");
     channel.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_next_request_after_a_wait_finds_the_phone_told() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    d.t.answer(testing::grant("once", &[]), Some(gate.clone()));
+    d.t.answer(testing::grant("once", &[]), None);
+    let first = tokio::spawn({
+        let d = d.clone();
+        async move { d.ask(approve::body("agent"), &ev(), false).await.is_ok() }
+    });
+    settle().await;
+    // the periodic status goes out while the phone is asked
+    d.send_status(&[]).await.unwrap();
+    gate.add_permits(1);
+    assert!(first.await.unwrap());
+    // the next request follows at once
+    d.ask(approve::body("keys"), &ev(), false).await.unwrap();
+    let e = d.t.events();
+    let waiting = at(&e, "status waiting");
+    let open_again = e[waiting..]
+        .iter()
+        .position(|x| x == "status open")
+        .map(|i| i + waiting);
+    assert!(
+        open_again.is_some_and(|o| o < at(&e, "ask keys")),
+        "the phone knows the session is Open when the next request comes: {e:?}"
+    );
 }

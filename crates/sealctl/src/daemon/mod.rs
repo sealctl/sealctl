@@ -385,7 +385,18 @@ impl Daemon {
             util::notify("sealctl: waiting for your phone");
         }
         let r = self.send_ask(body).await;
-        self.st().waiting_since = None;
+        let told_waiting = {
+            let mut st = self.st();
+            st.waiting_since = None;
+            st.open && st.sent_state == "waiting"
+        };
+        // A status went out during the wait and said `waiting`: the phone hears the session is
+        // Open again before this caller's next request (or the next caller's) reaches it.
+        if told_waiting && !self.inproc {
+            if let Err(e) = self.send_status(&[]).await {
+                log::info!("status: {e:#}");
+            }
+        }
         match r {
             Ok(Some(reply)) if reply.ok => {
                 if let Some(w) = &reply.w {
