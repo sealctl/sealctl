@@ -1061,3 +1061,25 @@ async fn an_unpaired_answer_holds_up_no_other_request() {
     settle().await;
     assert_eq!(*d.locks_done.borrow(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_exit_does_not_wait_for_a_hung_mount() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.mount.hold();
+    let opening = tokio::spawn({
+        let d = d.clone();
+        async move { open(&d, &store_items()).await }
+    });
+    settle().await;
+    // the service manager gives the exit 60 seconds
+    tokio::time::timeout(Duration::from_secs(10), d.on_exit())
+        .await
+        .expect("the exit unmounts without waiting out the mount");
+    opening.await.unwrap();
+    assert!(!d.st().open);
+    assert!(d.t.events().contains(&"unmount".to_string()));
+    d.t.mount.release();
+    settle().await;
+    let e = d.t.events();
+    assert!(at(&e, "mount end") < at(&e, "close safe"), "{e:?}");
+}

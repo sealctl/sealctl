@@ -703,7 +703,7 @@ impl Daemon {
         for v in vols {
             let key = {
                 let st = self.st();
-                if !st.open || st.generation != generation {
+                if !st.open || st.generation != generation || self.is_exiting() {
                     return;
                 }
                 st.keys.get(&key_name("volume", &v.id)).map(copy_key)
@@ -723,20 +723,26 @@ impl Daemon {
     }
 
     /// Mounts one volume (`job` gives whether it mounted it). A mount that hangs (a password
-    /// prompt nobody sees, a stuck disk image) holds up the locks' unmounts and the daemon's
-    /// exit for [`MOUNT_LIMIT`] at most; if it finishes later, after the session locked, the
-    /// volume is closed again.
+    /// prompt nobody sees, a stuck disk image) holds up the locks' unmounts for [`MOUNT_LIMIT`]
+    /// at most, and the daemon's exit not at all; if it finishes later, after the session
+    /// locked, the volume is closed again.
     async fn mount_one(
         self: &Arc<Self>,
         name: String,
         job: impl std::future::Future<Output = Result<bool>> + Send + 'static,
     ) {
         let mut job = tokio::spawn(job);
-        match tokio::time::timeout(MOUNT_LIMIT, &mut job).await {
-            Ok(Ok(Ok(true))) => self.st().mounted.push(name),
-            Ok(Ok(Ok(false))) | Ok(Err(_)) => {}
-            Ok(Ok(Err(e))) => log::warn!("mounting {name}: {e:#}"),
-            Err(_) => {
+        let mut exiting = self.exiting.subscribe();
+        // the daemon's exit does not wait for it either: the service manager gives it a minute
+        let done = tokio::select! {
+            r = tokio::time::timeout(MOUNT_LIMIT, &mut job) => r.ok(),
+            _ = exiting.wait_for(|e| *e) => None,
+        };
+        match done {
+            Some(Ok(Ok(true))) => self.st().mounted.push(name),
+            Some(Ok(Ok(false))) | Some(Err(_)) => {}
+            Some(Ok(Err(e))) => log::warn!("mounting {name}: {e:#}"),
+            None => {
                 log::warn!("mounting {name} did not finish in {} s", MOUNT_LIMIT.as_secs());
                 let me = self.clone();
                 tokio::spawn(async move {
