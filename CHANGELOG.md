@@ -12,6 +12,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   cargo-about (`scripts/notices.sh`) and shipped in every tarball, .deb, .rpm, PKGBUILD,
   Homebrew and Nix package.
 
+### Fixed
+
+- Session daemon timing: locks take turns and run their backups and unmounts in the
+  background (the hard stop no longer clears a session approved during them, and nothing is
+  unmounted under a running backup); the idle allowance and hard stop are checked before an
+  input sample counts as work and before any key is handed out (time asleep counts as idle);
+  a clock set back locks; the hard stop takes the second 02:00 on the night clocks go back;
+  a wait for the phone no longer holds up lock messages and statuses; the phone hears of an
+  Open session before the next request; lock messages allow a minute of clock skew; busy
+  volumes are retried every minute; on-lock backups stop at 15 minutes; SIGTERM locks.
+
 ## 0.7.0
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes
