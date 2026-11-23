@@ -112,6 +112,11 @@ pub trait Backend {
     fn is_mounted(&self, v: &Volume) -> Result<bool> {
         self.is_unlocked(v)
     }
+    /// Attached (decrypted) with nothing mounted from it anywhere: nothing can be in use through
+    /// it. Only a sparse bundle can tell this apart.
+    fn is_attached_unmounted(&self, _v: &Volume) -> Result<bool> {
+        Ok(false)
+    }
     /// Replaces the passphrase.
     fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()>;
     /// Destroys the encrypted data.
@@ -449,17 +454,23 @@ pub fn open_with(vol: &Volume, key: &ObjectKey, wait: Option<std::time::Duration
         if be.is_mounted(vol)? {
             return Ok(());
         }
-        // no open is under way (this command holds the lock): attached or decrypted, but not
-        // mounted at its mount point
-        return Err(exit::fail(
-            exit::ERROR,
-            format!(
-                "Volume {} is open but not mounted at {}. Close it (sealctl volume close {}), then open it again.",
-                vol.name,
-                vol.mountpoint.display(),
-                vol.name
-            ),
-        ));
+        if !be.is_attached_unmounted(vol)? {
+            // no open is under way (this command holds the lock): mounted somewhere else, or
+            // decrypted but not mounted
+            return Err(exit::fail(
+                exit::ERROR,
+                format!(
+                    "Volume {} is open but not mounted at {}. Close it (sealctl volume close {}), then open it again.",
+                    vol.name,
+                    vol.mountpoint.display(),
+                    vol.name
+                ),
+            ));
+        }
+        // attached with nothing mounted anywhere (a key check that could not detach, a mount
+        // that did not finish): nothing is in use through it, so it is detached and opened as
+        // usual
+        be.lock(vol, false)?;
     }
     be.unlock(vol, key.hex().as_bytes())?;
     write_inner_id(vol);
