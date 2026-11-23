@@ -15,8 +15,12 @@ updates:
       semver-major-days: 30
       semver-minor-days: 14
       semver-patch-days: 7
+    # One PR for all minor and patch updates; each major update gets a PR of its own (it
+    # matches no group), since majors need a changelog read and often code changes.
     groups:
       minor-and-patch:
+        applies-to: version-updates
+        patterns: ["*"]
         update-types: [minor, patch]
     open-pull-requests-limit: 5
 
@@ -27,12 +31,16 @@ updates:
     # actions are pinned to commit SHAs with a version comment; Dependabot updates both
     cooldown:
       default-days: 14
+    # Same split as Cargo: minor and patch together, each major separately.
     groups:
-      actions:
+      actions-minor-and-patch:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: [minor, patch]
     open-pull-requests-limit: 5
 
-  # rust-toolchain.toml (the pinned release compiler)
+  # rust-toolchain.toml (the pinned release compiler): a single dependency, so one PR per update
+  # without a group.
   - package-ecosystem: rust-toolchain
     directory: /
     schedule:
@@ -41,7 +49,7 @@ updates:
       default-days: 7
     open-pull-requests-limit: 5
 
-  # flake.lock (nixpkgs for `nix build` / `nix profile install`)
+  # flake.lock (nixpkgs for `nix build` / `nix profile install`): a single input, no group needed.
   - package-ecosystem: nix
     directory: /
     schedule:
