@@ -428,6 +428,20 @@ mod tests {
     }
 
     #[test]
+    fn hex_forms_are_masked() {
+        let token: &[u8] = b"ghp_token-value/with+chars";
+        let lower: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        let upper = lower.to_ascii_uppercase();
+        for (form, split) in [(&lower, 7), (&upper, 30)] {
+            let line = format!("dump: {form} end");
+            assert_eq!(run(&[token], line.as_bytes(), split), "dump: **** end", "{form}");
+        }
+        // mixed case is not a form a program prints; it passes as it is
+        let mixed = format!("{}{}", &lower[..10], &upper[10..]);
+        assert_eq!(run(&[token], mixed.as_bytes(), 3), mixed);
+    }
+
+    #[test]
     fn fuzz_never_leaks() {
         // random secrets and random text containing them, random chunking: no secret survives
         let mut seed = 12345u64;
