@@ -165,6 +165,8 @@ struct State {
     generation: u64,
     /// Locks begun; each runs its slow steps after the one before it has finished.
     locks_begun: u64,
+    /// Busy-volume retries started (only the newest goes on).
+    busy_retries: u64,
     status_dirty: bool,
     last_status: u64,
     /// The session state the last status told the phone (`open`, `waiting`, `locked`).
@@ -1134,39 +1136,10 @@ impl Daemon {
         if !reopened {
             self.t.event(format!("unmount{}", if force { " force" } else { "" }));
         }
-        let mounted: Vec<Volume> = if reopened {
-            Vec::new()
-        } else {
-            Volume::list()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|v| !v.manual || self.st().mounted.contains(&v.name))
-                .collect()
-        };
-        for v in mounted {
-            let name = v.name.clone();
-            let mp = v.mountpoint.clone();
-            let r = tokio::task::spawn_blocking(move || {
-                if !v.is_open() {
-                    return Ok(false);
-                }
-                crate::volume::close(&v, force).map(|_| true)
-            })
-            .await;
-            match r {
-                Ok(Ok(true)) => lines.push(format!("Volume {name} closed.")),
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
-                    let holder = crate::volume::holder(&mp);
-                    busy.push(sealctl_core::wire::BusyVolume {
-                        name: name.clone(),
-                        process: holder.as_ref().map(|h| h.0.clone()).unwrap_or_default(),
-                        pid: holder.map(|h| h.1),
-                    });
-                    lines.push(exit::message_of(&e));
-                }
-                Err(_) => {}
-            }
+        if !reopened {
+            let (l, b) = self.close_volumes(None, force).await;
+            lines.extend(l);
+            busy = b;
         }
         drop(volumes);
         // step 4
@@ -1193,7 +1166,103 @@ impl Daemon {
         if let Some(h) = channel {
             h.abort();
         }
+        if !busy.is_empty() && !self.inproc {
+            let me = {
+                let mut st = self.st();
+                st.busy_retries += 1;
+                st.busy_retries
+            };
+            tokio::spawn(self.clone().retry_busy(me, busy.clone()));
+        }
         json!({"lines": lines, "busy": busy.len()})
+    }
+
+    /// Closes the auto volumes and those the session mounted (or only the volumes named
+    /// `only`). Returns the lines to show and the volumes still busy.
+    async fn close_volumes(
+        &self,
+        only: Option<&[String]>,
+        force: bool,
+    ) -> (Vec<String>, Vec<sealctl_core::wire::BusyVolume>) {
+        let mut lines = Vec::new();
+        let mut busy = Vec::new();
+        #[cfg(test)]
+        if let Some(b) = self.t.vol_busy.lock().unwrap().pop_front() {
+            // one simulated volume, `safe`
+            if b {
+                self.t.event("close safe busy");
+                busy.push(sealctl_core::wire::BusyVolume {
+                    name: "safe".into(),
+                    process: "test".into(),
+                    pid: None,
+                });
+            } else {
+                self.t.event("close safe");
+            }
+            return (lines, busy);
+        }
+        let mounted: Vec<Volume> = Volume::list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| match only {
+                Some(names) => names.contains(&v.name),
+                None => !v.manual || self.st().mounted.contains(&v.name),
+            })
+            .collect();
+        for v in mounted {
+            let name = v.name.clone();
+            let mp = v.mountpoint.clone();
+            let r = tokio::task::spawn_blocking(move || {
+                if !v.is_open() {
+                    return Ok(false);
+                }
+                crate::volume::close(&v, force).map(|_| true)
+            })
+            .await;
+            match r {
+                Ok(Ok(true)) => lines.push(format!("Volume {name} closed.")),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    let holder = crate::volume::holder(&mp);
+                    busy.push(sealctl_core::wire::BusyVolume {
+                        name: name.clone(),
+                        process: holder.as_ref().map(|h| h.0.clone()).unwrap_or_default(),
+                        pid: holder.map(|h| h.1),
+                    });
+                    lines.push(exit::message_of(&e));
+                }
+                Err(_) => {}
+            }
+        }
+        (lines, busy)
+    }
+
+    /// SPEC 6.5 step 3: a busy volume is tried again every 60 seconds while the session stays
+    /// Locked, until it closes; the phone hears each change. Ends when a session opens (the
+    /// volumes are its own then) or a later lock starts its own retries.
+    async fn retry_busy(self: Arc<Self>, me: u64, mut busy: Vec<sealctl_core::wire::BusyVolume>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let volumes = self.volumes.lock().await;
+            {
+                let st = self.st();
+                if st.open || st.busy_retries != me {
+                    return;
+                }
+            }
+            let names: Vec<String> = busy.iter().map(|b| b.name.clone()).collect();
+            let (_, now_busy) = self.close_volumes(Some(&names), false).await;
+            drop(volumes);
+            if now_busy != busy {
+                busy = now_busy;
+                if !self.inproc {
+                    let _ = self.send_status(&busy).await;
+                }
+            }
+            if busy.is_empty() {
+                return;
+            }
+        }
     }
 
     /// Storage credentials of a backup, read with the session's store key.
@@ -1305,7 +1374,15 @@ impl Daemon {
         #[cfg(test)]
         if self.t.offline() {
             let s = status.state.as_ref().map(|s| s.session.clone()).unwrap_or_default();
-            self.t.event(format!("status {s}"));
+            if self.t.fail_status() {
+                self.t.event(format!("status {s} failed"));
+                return Err(anyhow::anyhow!("test: relay down"));
+            }
+            if busy.is_empty() {
+                self.t.event(format!("status {s}"));
+            } else {
+                self.t.event(format!("status {s} busy {}", busy.len()));
+            }
             drop(paired);
             let mut st = self.st();
             st.status_dirty = false;
@@ -1505,7 +1582,7 @@ impl Daemon {
         // `ioreg` runs outside the state lock
         let idle = if self.st().open { self.idle_input() } else { None };
         let n = self.now();
-        let (open, status_due) = {
+        let status_due = {
             let mut st = self.st();
             if st.open && idle.is_some_and(|s| s < 60) {
                 st.saved.work(n);
@@ -1520,9 +1597,16 @@ impl Daemon {
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
                     || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000)
                     || (changed && n.saturating_sub(st.last_status) >= 10 * 1000));
-            (st.open, due)
+            // A Locked session whose last status still said Open (the lock's own status
+            // failed) tells the phone again every minute, once no lock is running.
+            let idle_locks = *self.locks_done.borrow() >= st.locks_begun;
+            let unsent_lock = !st.open
+                && idle_locks
+                && matches!(st.sent_state.as_str(), "open" | "waiting")
+                && n.saturating_sub(st.last_status) > 60 * 1000;
+            due || unsent_lock
         };
-        if open && status_due && !self.inproc {
+        if status_due && !self.inproc {
             if let Err(e) = self.send_status(&[]).await {
                 log::info!("status: {e:#}");
                 // A failed status (refused, rate limited, relay down) is tried again in a

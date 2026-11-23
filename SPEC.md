@@ -335,9 +335,9 @@ On any lock the daemon, in this order:
 
 1. wipes the store key, decrypted SSH keys, own-approval keys and the per-agent session allowances;
 2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total;
-3. unmounts volumes; a busy volume is reported with the process holding it (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux) and retried every 60 seconds; `sealctl lock --force` force-unmounts;
+3. unmounts volumes; a busy volume is reported with the process holding it (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux) and retried every 60 seconds until it closes or a session opens, with a status each time the busy list changes; `sealctl lock --force` force-unmounts;
 4. wipes the backup and volume keys;
-5. sends a status (`locked`, with any busy volumes) and closes the machine socket.
+5. sends a status (`locked`, with any busy volumes) and closes the machine socket. When that status fails, the daemon sends it again every minute until the phone has heard the session is Locked.
 
 Step 1 happens at once; at the hard stop it also resets the credit there, so it never touches a session approved later. Steps 2 to 5 run in the background: the 15-second sampling, status and lock messages go on meanwhile. Locks take turns: a lock that begins while another is in steps 2 to 5 (a lock message, `sealctl lock --force`) does step 1 at once and waits for the other to finish before its own steps 2 to 5, so nothing is unmounted under a running backup. If the phone approves a new session before step 3, the volumes stay mounted for it, and the old machine socket closes as soon as the new session opens its own. A lock during the mount of an `open` unmounts after that mount, and the machine socket of that session is not opened. A daemon exit waits for any lock still running.
 

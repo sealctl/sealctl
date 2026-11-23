@@ -438,3 +438,53 @@ async fn a_spawned_daemon_does_not_exit_while_the_phone_is_asked() {
     gate.add_permits(1);
     assert!(asking.await.unwrap());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_busy_volume_is_tried_again_every_minute() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.vol_busy
+        .lock()
+        .unwrap()
+        .extend([true, true, false]);
+    open(&d, &store_items()).await;
+    d.lock("cli", true, false).await;
+    let e = d.t.events();
+    assert!(e.contains(&"status locked busy 1".to_string()), "{e:?}");
+    let tries = |d: &Daemon| d.t.events().iter().filter(|x| x.starts_with("close safe")).count();
+    assert_eq!(tries(&d), 1);
+    tokio::time::sleep(Duration::from_secs(59)).await;
+    assert_eq!(tries(&d), 1);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(tries(&d), 2, "tried again after a minute");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let e = d.t.events();
+    assert_eq!(e.last().map(String::as_str), Some("status locked"), "{e:?}");
+    assert!(e.contains(&"close safe".to_string()));
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(tries(&d), 3, "no tries once closed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lock_whose_status_failed_tells_the_phone_later() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    *d.t.status_failures.lock().unwrap() = 1;
+    d.lock("cli", true, false).await;
+    settle().await;
+    let sent = |d: &Daemon| {
+        d.t.events()
+            .iter()
+            .filter(|x| *x == "status locked")
+            .count()
+    };
+    assert!(d.t.events().contains(&"status locked failed".to_string()));
+    assert_eq!(sent(&d), 0);
+    d.t.advance(61_000);
+    d.tick().await;
+    assert_eq!(sent(&d), 1, "the phone took the session as Open: {:?}", d.t.events());
+    // once heard, no more
+    d.t.advance(3_600_000);
+    d.tick().await;
+    assert_eq!(sent(&d), 1);
+}

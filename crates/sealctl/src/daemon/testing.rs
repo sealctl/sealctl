@@ -74,6 +74,10 @@ pub struct Hooks {
     pub mount: Gate,
     /// Answers for `ask`, in order; empty: the real relay.
     pub answers: Mutex<VecDeque<Canned>>,
+    /// Results of closing one simulated volume (`true`: busy); empty: the real volumes.
+    pub vol_busy: Mutex<VecDeque<bool>>,
+    /// Statuses that fail before the rest go out.
+    pub status_failures: Mutex<u32>,
     /// Statuses are recorded, not sent; the machine channel is a stand-in that sends one
     /// status when it starts, as the real one does.
     pub offline: AtomicBool,
@@ -106,6 +110,17 @@ impl Hooks {
 
     pub(super) fn canned(&self) -> Option<Canned> {
         self.answers.lock().unwrap().pop_front()
+    }
+
+    pub(super) fn fail_status(&self) -> bool {
+        let mut n = self.status_failures.lock().unwrap();
+        match n.checked_sub(1) {
+            Some(m) => {
+                *n = m;
+                true
+            }
+            None => false,
+        }
     }
 
     pub(super) fn offline(&self) -> bool {
