@@ -84,8 +84,14 @@ pub async fn run(d: Arc<Daemon>) {
                 paired.phone_id(),
                 paired.file.machine
             );
-            let keys = sealctl_core::MachineKeys::from_bytes(&paired.keys.to_bytes()).expect("64 bytes");
-            (path, keys)
+            (path, paired.keys_copy())
+        };
+        let keys = match keys {
+            Ok(k) => k,
+            Err(e) => {
+                log::warn!("machine channel: {e:#}");
+                return;
+            }
         };
         let sock = d.relay.socket(&keys, &keys_path).await;
         drop(keys);
@@ -192,7 +198,9 @@ pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
                 Ok(i) => i,
                 Err(_) => return true,
             };
-            let keys = sealctl_core::MachineKeys::from_bytes(&paired.keys.to_bytes()).expect("64 bytes");
+            let Ok(keys) = paired.keys_copy() else {
+                return true;
+            };
             sealctl_core::request::seal_request(&paired.keys, &paired.phone, &id, body)
                 .ok()
                 .map(|r| {

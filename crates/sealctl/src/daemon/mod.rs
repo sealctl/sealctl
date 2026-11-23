@@ -460,7 +460,7 @@ impl Daemon {
             }
             return Ok(Some(c.reply));
         }
-        match approve::send_shared(&self.relay, &self.paired, body).await? {
+        match approve::send_shared(&self.relay, &self.paired, body, &mut |_| {}, approve::WAIT).await? {
             Asked::Reply { reply, .. } => Ok(Some(reply)),
             Asked::Delayed { .. } => Ok(None),
         }

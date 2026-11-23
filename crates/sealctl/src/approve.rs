@@ -67,18 +67,61 @@ pub async fn send_for(
     waiting: &mut (dyn FnMut(Option<u8>) + Send),
     wait: Duration,
 ) -> Result<Asked> {
+    send_shared(relay, &tokio::sync::Mutex::new(paired), body, waiting, wait).await
+}
+
+/// A pairing [`send_shared`] locks: the daemon's shared one, or a command's own.
+pub trait PairedMut: Send {
+    /// The pairing.
+    fn get(&mut self) -> &mut Paired;
+}
+
+impl PairedMut for Paired {
+    fn get(&mut self) -> &mut Paired {
+        self
+    }
+}
+
+impl PairedMut for &mut Paired {
+    fn get(&mut self) -> &mut Paired {
+        self
+    }
+}
+
+/// [`send_for`] for a pairing others may use too (the daemon). The pairing is locked only to
+/// seal the request and to follow a move, never while the phone is waited for, so that
+/// statuses and machine messages (a `lock` from the phone) go on during a wait of up to 5
+/// minutes.
+pub async fn send_shared<P: PairedMut>(
+    relay: &Relay,
+    paired: &tokio::sync::Mutex<P>,
+    body: RequestBody,
+    waiting: &mut (dyn FnMut(Option<u8>) + Send),
+    wait: Duration,
+) -> Result<Asked> {
     let mut moved_once = false;
     let mut slowed = 0;
     loop {
-        let id = new_request_id().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let request = seal_request(&paired.keys, &paired.phone, &id, body.clone())
-            .map_err(|e| anyhow::anyhow!("sealing the request: {e}"))?;
+        let (id, request, keys, phone_id, phone_key) = {
+            let mut guard = paired.lock().await;
+            let paired = guard.get();
+            let id = new_request_id().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let request = seal_request(&paired.keys, &paired.phone, &id, body.clone())
+                .map_err(|e| anyhow::anyhow!("sealing the request: {e}"))?;
+            (
+                id,
+                request,
+                paired.keys_copy()?,
+                paired.phone_id().to_string(),
+                paired.phone.identity,
+            )
+        };
         waiting(request.number);
         let deadline = tokio::time::Instant::now() + wait;
         let end = relay
             .wait(
-                &paired.keys,
-                paired.phone_id(),
+                &keys,
+                &phone_id,
                 &id,
                 &request.sealed,
                 wait.as_secs().clamp(1, 300),
@@ -101,7 +144,7 @@ pub async fn send_for(
         match end {
             WaitEnd::Reply(sealed) => {
                 let reply = request
-                    .open_reply(paired.keys.public(), &paired.phone.identity, &sealed)
+                    .open_reply(keys.public(), &phone_key, &sealed)
                     .map_err(|_| {
                         fail(
                             exit::ERROR,
@@ -113,85 +156,7 @@ pub async fn send_for(
             WaitEnd::Delayed { release_at, .. } => return Ok(Asked::Delayed { request, release_at }),
             WaitEnd::Expired => return Err(fail(exit::NO_ANSWER, "No answer from your phone in 5 minutes.")),
             WaitEnd::Error(code) if matches!(code.as_str(), "unpaired" | "moved" | "forbidden") => {
-                if !moved_once && look_up(relay, paired).await? {
-                    moved_once = true;
-                    continue;
-                }
-                return Err(exit::unpaired());
-            }
-            WaitEnd::Error(code) => {
-                return Err(fail(
-                    exit::RELAY,
-                    format!(
-                        "The relay refused the request ({code}). Status: {}",
-                        relay::STATUS_PAGE
-                    ),
-                ))
-            }
-        }
-    }
-}
-
-/// [`send`] for a pairing others use too (the daemon). The pairing is locked only to seal the
-/// request and to follow a move, never while the phone is waited for, so that statuses and
-/// machine messages (a `lock` from the phone) go on during a wait of up to 5 minutes.
-pub async fn send_shared(
-    relay: &Relay,
-    paired: &tokio::sync::Mutex<Paired>,
-    body: RequestBody,
-) -> Result<Asked> {
-    let mut moved_once = false;
-    let mut slowed = 0;
-    loop {
-        let (id, request, keys, phone_id, machine_key, phone_key) = {
-            let paired = paired.lock().await;
-            let id = new_request_id().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let request = seal_request(&paired.keys, &paired.phone, &id, body.clone())
-                .map_err(|e| anyhow::anyhow!("sealing the request: {e}"))?;
-            let keys = sealctl_core::MachineKeys::from_bytes(&paired.keys.to_bytes())
-                .map_err(|e| anyhow::anyhow!("machine keys: {e}"))?;
-            (
-                id,
-                request,
-                keys,
-                paired.phone_id().to_string(),
-                *paired.keys.public(),
-                paired.phone.identity,
-            )
-        };
-        let deadline = tokio::time::Instant::now() + WAIT;
-        let end = relay
-            .wait(&keys, &phone_id, &id, &request.sealed, WAIT.as_secs(), deadline)
-            .await;
-        let end = match end {
-            Ok(e) => e,
-            Err(e) => match relay::refused(&e).cloned() {
-                Some(a) if a.status == 403 => WaitEnd::Error("forbidden".into()),
-                Some(a) if slowed < 3 && relay::backoff(&a).is_some() => {
-                    slowed += 1;
-                    relay::slow_down(relay::backoff(&a).unwrap_or(10)).await;
-                    continue;
-                }
-                Some(a) => return Err(relay::error_for(&a)),
-                None => return Err(e),
-            },
-        };
-        match end {
-            WaitEnd::Reply(sealed) => {
-                let reply = request
-                    .open_reply(&machine_key, &phone_key, &sealed)
-                    .map_err(|_| {
-                        fail(
-                            exit::ERROR,
-                            "The phone's reply did not check out (bad_reply). Nothing was used.",
-                        )
-                    })?;
-                return Ok(Asked::Reply { reply, id, request });
-            }
-            WaitEnd::Delayed { release_at, .. } => return Ok(Asked::Delayed { request, release_at }),
-            WaitEnd::Expired => return Err(fail(exit::NO_ANSWER, "No answer from your phone in 5 minutes.")),
-            WaitEnd::Error(code) if matches!(code.as_str(), "unpaired" | "moved" | "forbidden") => {
-                if !moved_once && look_up(relay, &mut *paired.lock().await).await? {
+                if !moved_once && look_up(relay, paired.lock().await.get()).await? {
                     moved_once = true;
                     continue;
                 }
