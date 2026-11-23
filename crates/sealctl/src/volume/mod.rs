@@ -355,8 +355,15 @@ pub fn create(opts: CreateOpts, new_key: &mut NewKey<'_>) -> Result<Volume> {
     vol.id = vol.id.to_lowercase();
     vol.words = words;
     vol.check = check;
-    write_marker(&vol)?;
+    // the definition first: the volume exists now, and without it a failed marker would leave
+    // a volume sealctl does not know (and a rerun would make a second one)
     vol.save()?;
+    write_marker(&vol).with_context(|| {
+        format!(
+            "volume {} was created and saved, but writing its words marker failed",
+            vol.name
+        )
+    })?;
     be.unlock(&vol, pass.as_bytes())
         .context("mounting the new volume with its key")?;
     write_inner_id(&vol);

@@ -2657,6 +2657,7 @@ dependencies = [
  "qrcode",
  "regex",
  "reqwest",
+ "rsa",
  "rustls",
  "rustls-platform-verifier",
  "sealctl-core",

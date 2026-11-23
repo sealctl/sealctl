@@ -5,8 +5,9 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # rsa (via ssh-key and ssh-agent-lib): Marvin timing attack on RSA *decryption*.
-    # sealctl never decrypts with RSA; SSH keys only sign, and `ssh keygen` makes Ed25519 keys.
+    # rsa (direct, and via ssh-key and ssh-agent-lib): Marvin timing attack on RSA *decryption*.
+    # sealctl uses rsa only to sign with imported RSA SSH keys and never decrypts with RSA;
+    # `ssh keygen` makes Ed25519 keys.
     { id = "RUSTSEC-2023-0071", reason = "no RSA decryption anywhere in sealctl" },
     # crypto-bigint 0.5 (via ssh-key's p256/p384 support): non-constant-time arithmetic.
     # sealctl's own keys are Ed25519 and X25519; only an ECDSA SSH key a user imports with

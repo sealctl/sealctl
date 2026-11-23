@@ -10,7 +10,9 @@ use anyhow::{Context, Result};
 use ssh_agent_lib::agent::{listen, Session};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
-use ssh_key::{Algorithm, LineEnding, PrivateKey, PublicKey, Signature};
+use ssh_key::private::KeypairData;
+use ssh_key::public::KeyData;
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
 use zeroize::Zeroizing;
 
 use crate::daemon::{client, Daemon, Events, ValuesReq};
@@ -153,6 +155,17 @@ impl Session for Agent {
         let PublicCredential::Key(wanted) = &req.credential else {
             return Err(agent_err("unknown key"));
         };
+        // refused before the phone is asked, which would approve a signature nobody can make
+        if let KeyData::Rsa(public) = wanted {
+            if rsa_hash(req.flags).is_none() {
+                return Err(agent_err(
+                    "ssh-rsa (SHA-1) signatures are not supported; use rsa-sha2-256 or rsa-sha2-512",
+                ));
+            }
+            if rsa_bits(&public.n) < MIN_RSA_BITS {
+                return Err(agent_err(RSA_TOO_SHORT));
+            }
+        }
         let name = names()
             .into_iter()
             .find(|n| read_public(n).is_ok_and(|k| k.key_data() == wanted))
@@ -175,9 +188,76 @@ impl Session for Agent {
             .map_err(|e| agent_err(exit::message_of(&e)))?;
         let text = Zeroizing::new(String::from_utf8_lossy(&vals[0].1).into_owned());
         let key = PrivateKey::from_openssh(&*text).map_err(agent_err)?;
-        use signature::Signer;
-        key.try_sign(&req.data).map_err(agent_err)
+        sign_with(&key, &req.data, req.flags).map_err(agent_err)
     }
+}
+
+/// `SSH_AGENT_RSA_SHA2_256` and `SSH_AGENT_RSA_SHA2_512`: the hash an RSA signature uses.
+const RSA_SHA2_256: u32 = 2;
+const RSA_SHA2_512: u32 = 4;
+
+/// The hash a sign request asks of an RSA key; `None` for plain `ssh-rsa` (SHA-1).
+fn rsa_hash(flags: u32) -> Option<HashAlg> {
+    if flags & RSA_SHA2_512 != 0 {
+        Some(HashAlg::Sha512)
+    } else if flags & RSA_SHA2_256 != 0 {
+        Some(HashAlg::Sha256)
+    } else {
+        None
+    }
+}
+
+/// Signs `data` as the request's flags ask: an RSA key with the requested SHA-2 hash, any other
+/// key by its own algorithm.
+fn sign_with(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature> {
+    use signature::{SignatureEncoding, Signer};
+    let KeypairData::Rsa(pair) = key.key_data() else {
+        return Ok(key.try_sign(data)?);
+    };
+    let private = rsa_private_key(pair)?;
+    let (hash, sig) = match rsa_hash(flags) {
+        Some(HashAlg::Sha256) => (
+            HashAlg::Sha256,
+            rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(private)
+                .try_sign(data)?
+                .to_vec(),
+        ),
+        Some(HashAlg::Sha512) => (
+            HashAlg::Sha512,
+            rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(private)
+                .try_sign(data)?
+                .to_vec(),
+        ),
+        _ => anyhow::bail!("ssh-rsa (SHA-1) signatures are not supported"),
+    };
+    Ok(Signature::new(Algorithm::Rsa { hash: Some(hash) }, sig)?)
+}
+
+/// The shortest RSA modulus the agent signs with, as ssh-key's own conversion requires.
+const MIN_RSA_BITS: usize = 2048;
+const RSA_TOO_SHORT: &str = "RSA keys shorter than 2048 bits are not supported";
+
+/// The size of an RSA modulus in bits, counted in whole bytes as ssh-key and the `rsa` crate do.
+fn rsa_bits(n: &ssh_key::Mpint) -> usize {
+    n.as_positive_bytes().map_or(0, |b| b.len() * 8)
+}
+
+/// The `rsa` crate's key for an OpenSSH RSA key pair. Built here from its components: ssh-key
+/// 0.6's own conversion passes `p` twice instead of `p` and `q`, which the `rsa` crate rejects.
+/// Like that conversion, it refuses a modulus under 2048 bits.
+fn rsa_private_key(pair: &ssh_key::private::RsaKeypair) -> Result<rsa::RsaPrivateKey> {
+    use rsa::traits::PublicKeyParts;
+    let big = |m: &ssh_key::Mpint| rsa::BigUint::try_from(m);
+    let key = rsa::RsaPrivateKey::from_components(
+        big(&pair.public.n)?,
+        big(&pair.public.e)?,
+        big(&pair.private.d)?,
+        vec![big(&pair.private.p)?, big(&pair.private.q)?],
+    )?;
+    if key.size().saturating_mul(8) < MIN_RSA_BITS {
+        anyhow::bail!(RSA_TOO_SHORT);
+    }
+    Ok(key)
 }
 
 /// The agent socket.
@@ -209,4 +289,66 @@ pub fn start_agent(daemon: Arc<Daemon>) {
 pub fn setup_text() -> Result<String> {
     let sock = socket_path()?;
     Ok(format!("Host *\n    IdentityAgent {}\n", sock.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use signature::Verifier;
+
+    /// An RSA key signs with the hash the request asks for, and the signature verifies.
+    #[test]
+    fn rsa_signs_with_the_requested_hash() {
+        // ssh-keygen: generating an RSA key in a debug build takes minutes
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k");
+        let made = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "rsa", "-b", "2048", "-N", "", "-f"])
+            .arg(&file)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipped: needs ssh-keygen");
+            return;
+        }
+        let key = PrivateKey::from_openssh(std::fs::read_to_string(&file).unwrap()).unwrap();
+        let data = b"session data";
+        for (flags, want) in [(RSA_SHA2_256, HashAlg::Sha256), (RSA_SHA2_512, HashAlg::Sha512)] {
+            let sig = sign_with(&key, data, flags).unwrap();
+            assert_eq!(sig.algorithm(), Algorithm::Rsa { hash: Some(want) });
+            key.public_key().key_data().verify(data, &sig).unwrap();
+        }
+        assert!(sign_with(&key, data, 0).is_err(), "ssh-rsa (SHA-1) is refused");
+        let KeyData::Rsa(public) = key.public_key().key_data() else {
+            unreachable!()
+        };
+        assert_eq!(rsa_bits(&public.n), 2048);
+    }
+
+    #[test]
+    fn rsa_keys_under_2048_bits_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k");
+        let made = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "rsa", "-b", "1024", "-N", "", "-f"])
+            .arg(&file)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipped: needs ssh-keygen that still makes 1024-bit RSA keys");
+            return;
+        }
+        let key = PrivateKey::from_openssh(std::fs::read_to_string(&file).unwrap()).unwrap();
+        let KeyData::Rsa(public) = key.public_key().key_data() else {
+            unreachable!()
+        };
+        assert!(rsa_bits(&public.n) < MIN_RSA_BITS);
+        let err = sign_with(&key, b"x", RSA_SHA2_256).unwrap_err();
+        assert!(err.to_string().contains("2048"), "{err}");
+    }
+
+    #[test]
+    fn ed25519_ignores_rsa_flags() {
+        let key = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519).unwrap();
+        let sig = sign_with(&key, b"x", 0).unwrap();
+        assert_eq!(sig.algorithm(), Algorithm::Ed25519);
+    }
 }

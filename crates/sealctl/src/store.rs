@@ -164,6 +164,7 @@ impl Store {
     }
 
     fn walk(&self) -> Vec<PathBuf> {
+        const MAX_DEPTH: usize = 64;
         fn go(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             let Ok(rd) = std::fs::read_dir(dir) else { return };
             for e in rd.flatten() {
@@ -172,17 +173,23 @@ impl Store {
                 if n.to_string_lossy().starts_with('.') {
                     continue;
                 }
-                if p.is_dir() {
+                // a symlink is never followed into a folder, so a symlink loop cannot make the
+                // walk grow; a symlink to a sealed file still counts
+                let Ok(ft) = e.file_type() else { continue };
+                if ft.is_dir() {
                     if depth > 0 {
                         go(&p, depth - 1, out);
                     }
+                } else if ft.is_symlink() && p.is_dir() {
+                    continue;
                 } else if p.extension().is_some_and(|x| x == "sealed") {
                     out.push(p);
                 }
             }
         }
+        // as deep as a valid name goes (`a/b/…`: 64 segments in 128 bytes), and no deeper
         let mut out = Vec::new();
-        go(&self.dir, 8, &mut out);
+        go(&self.dir, MAX_DEPTH, &mut out);
         out
     }
 
@@ -203,7 +210,11 @@ impl Store {
             let Ok(rel) = p.strip_prefix(&self.dir) else {
                 continue;
             };
-            let name = rel.to_string_lossy().trim_end_matches(".sealed").to_string();
+            let rel = rel.to_string_lossy();
+            let Some(name) = rel.strip_suffix(".sealed") else {
+                continue;
+            };
+            let name = name.to_string();
             if !sealed::is_valid_name(&name) {
                 continue;
             }
@@ -340,4 +351,62 @@ pub fn own_item(store: &Store, header: &Header) -> Result<RequestItem> {
             size: 0,
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(dir: &Path) -> Store {
+        let d = dir.join("0b7d3c2e-5f4a-4b8e-9c1d-2a3b4c5d6e7f");
+        std::fs::create_dir_all(&d).unwrap();
+        Store::at(&d).unwrap()
+    }
+
+    fn names(s: &Store) -> Vec<String> {
+        s.list().unwrap().into_iter().map(|l| l.name).collect()
+    }
+
+    /// Every valid name is listed: deep ones, and ones that end in `.sealed` themselves.
+    #[test]
+    fn list_shows_every_valid_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let key = ObjectKey::from_bytes(&[7; 16]).unwrap();
+        let deep = (0..64)
+            .map(|i| format!("{}", (b'a' + (i % 26) as u8) as char))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(sealed::is_valid_name(&deep));
+        let wanted = [
+            "a/b/c/d/e/f/g/h/i/j",
+            deep.as_str(),
+            "cfg/app.sealed",
+            "cfg/app",
+            "x.sealed.sealed",
+        ];
+        for n in wanted {
+            s.write(n, Mode::StoreKey, &key, "4kPz", b"v", None).unwrap();
+        }
+        let mut want: Vec<String> = wanted.iter().map(|n| n.to_string()).collect();
+        want.sort();
+        assert_eq!(names(&s), want);
+        for n in wanted {
+            s.header(n).unwrap();
+        }
+    }
+
+    /// Folder symlinks are not followed, so symlinks back into the store end the walk at once.
+    #[test]
+    fn list_does_not_follow_folder_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let key = ObjectKey::from_bytes(&[7; 16]).unwrap();
+        s.write("a/b", Mode::StoreKey, &key, "4kPz", b"v", None).unwrap();
+        let a = s.dir.join("a");
+        for l in ["l1", "l2", "l3"] {
+            std::os::unix::fs::symlink(&s.dir, a.join(l)).unwrap();
+        }
+        assert_eq!(names(&s), ["a/b"]);
+    }
 }

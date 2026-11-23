@@ -26,6 +26,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-platform-verifier = "0.7"
 ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "encryption", "getrandom"] }
+# RSA keys signing rsa-sha2-256 in the agent (ssh-key signs RSA with SHA-512 only); already in the
+# tree through ssh-agent-lib
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.9"
