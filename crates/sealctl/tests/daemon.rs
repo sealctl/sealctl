@@ -970,10 +970,15 @@ fn a_wait_ends_after_the_machine_slept_past_it() {
     let opener = start_open(&env);
     let mut seen = Vec::new();
     let r = next_request(&env, &mut seen);
-    // a short sleep changes nothing
+    // a short sleep changes nothing: a check of the wall clock with it goes on waiting
     let ahead = env.h().join("s/sealctl/test-clock-ahead-ms");
+    let went_on = env.h().join("s/sealctl/test-clock-went-on");
     std::fs::write(&ahead, (4 * 60_000).to_string()).unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        until(10, || std::fs::read_to_string(&went_on)
+            .is_ok_and(|s| s.lines().any(|l| l == "240000"))),
+        "the wait checked the clock 4 minutes on and went on"
+    );
     assert!(listed(&env, &r.id), "still waiting");
     // past the 5 minutes
     std::fs::write(&ahead, (6 * 60_000).to_string()).unwrap();

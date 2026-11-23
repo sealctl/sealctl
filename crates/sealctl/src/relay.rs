@@ -335,7 +335,7 @@ impl Relay {
         ttl: u64,
         deadline: tokio::time::Instant,
     ) -> Result<WaitEnd> {
-        let wall_end = wall_ms().saturating_add(
+        let wall_end = wall_clock().0.saturating_add(
             deadline
                 .saturating_duration_since(tokio::time::Instant::now())
                 .as_millis() as u64,
@@ -355,10 +355,12 @@ impl Relay {
                     return Ok(WaitEnd::Expired);
                 }
                 _ = wall.tick() => {
-                    if wall_ms() >= wall_end {
+                    let (now, ahead) = wall_clock();
+                    if now >= wall_end {
                         let _ = ws.close(None).await;
                         return Ok(WaitEnd::Expired);
                     }
+                    test_clock_went_on(ahead);
                 }
                 _ = ping.tick() => {
                     let _ = ws.send(Message::text("ping")).await;
@@ -399,19 +401,41 @@ impl Relay {
     }
 }
 
-/// The wall clock, Unix ms, as a request wait reads it.
+/// The wall clock, Unix ms, as a request wait reads it, with the test offset in it.
 ///
 /// Tests only (`test-hooks`): a number in the file `test-clock-ahead-ms` in the state folder is
-/// added, as a machine asleep that long would see it (the monotonic clock did not move).
-fn wall_ms() -> u64 {
+/// added, as a machine asleep that long would see it (the monotonic clock did not move); it is
+/// returned too. Always `None` otherwise.
+fn wall_clock() -> (u64, Option<u64>) {
     let n = crate::machine::now_ms();
     #[cfg(feature = "test-hooks")]
-    let n = n + crate::paths::state_dir()
-        .ok()
-        .and_then(|d| std::fs::read_to_string(d.join("test-clock-ahead-ms")).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    n
+    {
+        let ahead = crate::paths::state_dir()
+            .ok()
+            .and_then(|d| std::fs::read_to_string(d.join("test-clock-ahead-ms")).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        (n + ahead.unwrap_or(0), ahead)
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    (n, None)
+}
+
+/// Tests only (`test-hooks`): a wall clock check that left the wait running with the test
+/// offset `ahead` in it appends that offset as a line to `test-clock-went-on` in the state
+/// folder, so a test sees that a check with its offset happened, and that the wait went on.
+#[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))]
+fn test_clock_went_on(ahead: Option<u64>) {
+    #[cfg(feature = "test-hooks")]
+    if let (Some(a), Ok(d)) = (ahead, crate::paths::state_dir()) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(d.join("test-clock-went-on"))
+        {
+            let _ = writeln!(f, "{a}");
+        }
+    }
 }
 
 /// Seconds to wait for a `429` of the relay's short-term limits (`scope` `network` or `key`,
