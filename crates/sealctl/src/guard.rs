@@ -232,10 +232,11 @@ fn percent(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Replaces secret values in a byte stream with `****`: as-is, base64 (e.g. HTTP Basic auth
-/// headers, which also hide `user:value` — that combination is not detected) and URL-encoded;
-/// also when a value is split across reads or overlaps another. Values shorter than 6 bytes
-/// are not masked (too many false hits).
+/// Replaces secret values in a byte stream with `****`: as-is, base64 and base64url (e.g. HTTP
+/// Basic auth headers, which also hide `user:value` — that combination is not detected),
+/// URL-encoded, and hex in lower or upper case (hex dumps, binary tooling); also when a value is
+/// split across reads or overlaps another. Values shorter than 6 bytes are not masked (too many
+/// false hits).
 pub struct Masker {
     secrets: Vec<Vec<u8>>,
     keep: usize,
@@ -256,6 +257,8 @@ impl Masker {
             if p != v {
                 secrets.push(p);
             }
+            secrets.push(hex::encode(&v).into_bytes());
+            secrets.push(hex::encode_upper(&v).into_bytes());
             secrets.push(v);
         }
         secrets.sort();
