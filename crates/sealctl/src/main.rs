@@ -959,6 +959,8 @@ fn main() -> ExitCode {
             .unwrap_or_default();
         eprintln!("sealctl: internal error at {at}. Please report it.");
     }));
+    // SEALCTL_AGENT=0 next to an agent's own variable: said once, whatever the command
+    sealctl::guard::detection_off();
     if let Some(r) = &cli.relay {
         match sealctl::config::validate_origin(r) {
             Ok(_) => {}

@@ -21,7 +21,10 @@ program gets the key while the agent sees only `****`.
    * `secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `project trust`, `scan` and `migrate` refuse
      inside an agent (exit 8; detected by the environment variables agents set: `CLAUDECODE`,
      `CODEX_THREAD_ID`, `GEMINI_CLI`, `QWEN_CODE`, `COPILOT_AGENT_SESSION_ID`, `OPENCODE`,
-     `AI_AGENT`, …; force with `SEALCTL_AGENT=1`).
+     `AI_AGENT`, …; force with `SEALCTL_AGENT=1`). `SEALCTL_AGENT=0` turns detection off,
+     also when those variables are set; it is for you, not the agent (the hooks deny an agent
+     setting it), and sealctl then says on stderr, once per command, that detection is off
+     although an agent is running.
    * The credential helpers (`sealctl git credential`, `sealctl aws credentials`) answer inside
      an agent only when git or the AWS CLI itself started them: sealctl looks at the executables
      of its parent processes (git's transports such as `git-remote-https`, or `git-lfs`,

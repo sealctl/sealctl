@@ -30,6 +30,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - protocol.md, Delayed approvals (planned), matches the relay: a cancel keeps the record until
   `releaseAt` + 2,400 s (900 s when not cancelled), and cancelled records do not count toward
   the 4 per phone but do toward 16 in all. The fake relay keeps cancelled records as long.
+- `SEALCTL_AGENT=0` (agent detection off) is documented, and when an agent's own variable is
+  also set, sealctl says on stderr, once per command, that detection is off although that agent
+  is running.
 
 ### Fixed
 

@@ -296,7 +296,7 @@ pub fn agent_in(chain: &[Proc]) -> Option<&'static str> {
 /// (its variables, or an agent process above this one), only `tool` itself may run the helper.
 /// `SEALCTL_AGENT=0` turns agent detection off, as everywhere.
 pub fn check_helper(tool: Tool, what: &str) -> anyhow::Result<()> {
-    if std::env::var("SEALCTL_AGENT").as_deref() == Ok("0") {
+    if crate::guard::detection_off() {
         return Ok(());
     }
     let chain = ancestors(32);
