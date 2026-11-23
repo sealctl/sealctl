@@ -55,8 +55,11 @@ security-framework = "3"
 core-foundation = "0.10"
 
 [features]
-# Tests only: the keychain service name can be overridden (SEALCTL_TEST_KEYCHAIN_SERVICE), and a
-# run can kill itself at a journal point (SEALCTL_TEST_KILL). Never enabled in release builds.
+# Tests only: the keychain service name can be overridden (SEALCTL_TEST_KEYCHAIN_SERVICE), a run
+# can kill itself at a journal point (SEALCTL_TEST_KILL), the daemon stops at a hold point while
+# a file test-hold-<point> is in the state folder (writing test-held-<point>), and a request's
+# wait reads the wall clock moved on by the milliseconds in test-clock-ahead-ms there (each
+# check that goes on appends them to test-clock-went-on). Never enabled in release builds.
 test-hooks = []
 
 [dev-dependencies]

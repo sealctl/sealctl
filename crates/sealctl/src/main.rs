@@ -73,6 +73,8 @@ enum Cmd {
     },
     /// Cancel a delayed level 3 action approved on the phone.
     Cancel {
+        /// Delayed id (base64url: it may start with '-').
+        #[arg(allow_hyphen_values = true)]
         id: Option<String>,
         #[arg(long)]
         yes: bool,
@@ -966,6 +968,54 @@ fn main() -> ExitCode {
                 eprintln!("sealctl: {msg}");
             }
             ExitCode::from(code as u8)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cancel_args(args: &[&str]) -> (Option<String>, bool) {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        match cli.cmd {
+            Cmd::Cancel { id, yes } => (id, yes),
+            _ => panic!("not cancel"),
+        }
+    }
+
+    #[test]
+    fn cancel_takes_a_delayed_id_that_starts_with_a_hyphen() {
+        // delayed ids are base64url: about one in 64 starts with '-'
+        let id = "-q8Zf3kLmN0pQrStUvWxYz";
+        assert_eq!(
+            cancel_args(&["sealctl", "cancel", id, "--yes"]),
+            (Some(id.to_string()), true)
+        );
+        assert_eq!(
+            cancel_args(&["sealctl", "cancel", "--yes", id]),
+            (Some(id.to_string()), true)
+        );
+        assert_eq!(
+            cancel_args(&["sealctl", "cancel", id]),
+            (Some(id.to_string()), false)
+        );
+        // `--` keeps working, and flags alone are still flags
+        assert_eq!(
+            cancel_args(&["sealctl", "cancel", "--yes", "--", id]),
+            (Some(id.to_string()), true)
+        );
+        assert_eq!(cancel_args(&["sealctl", "cancel", "--yes"]), (None, true));
+        assert_eq!(cancel_args(&["sealctl", "cancel"]), (None, false));
+        assert_eq!(
+            cancel_args(&["sealctl", "-v", "cancel", "AbC", "--yes"]),
+            (Some("AbC".to_string()), true)
+        );
+        for help in ["-h", "--help"] {
+            let e = Cli::try_parse_from(["sealctl", "cancel", help])
+                .err()
+                .expect("help");
+            assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp, "{help}");
         }
     }
 }

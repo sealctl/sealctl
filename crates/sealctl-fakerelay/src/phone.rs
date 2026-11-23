@@ -426,10 +426,16 @@ impl Phone {
 
     /// Sends a machine message (`lock`, `answers`, `notice`).
     pub async fn send_message(&self, m: &Machine, kind: MessageKind) -> Result<bool> {
+        self.send_message_at(m, kind, now_ms()).await
+    }
+
+    /// Sends a machine message stamped with `time` (Unix ms): a phone whose clock is off, or a
+    /// message made a while before it was sent.
+    pub async fn send_message_at(&self, m: &Machine, kind: MessageKind, time: u64) -> Result<bool> {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let msg = MachineMessage {
             version: 1,
-            time: now_ms(),
+            time,
             seq,
             kind,
         };

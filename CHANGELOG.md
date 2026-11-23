@@ -54,6 +54,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `scan` reads a file again before rewriting it (a history that grew is masked as it is now,
   any other changed file is left, exit 13) and replaces zsh and fish histories under the
   shells' own locks.
+- Ctrl-C of a command waiting for the phone withdraws its request; the commands that joined
+  it ask for themselves.
+- A pending open declined on the phone, or left without an answer, ends the commands that
+  joined it too, instead of asking the phone again right after.
+- A command queued behind another request prints `Waiting for your phone`, and an agent use
+  granted for the session meanwhile is not asked for again; if the session locked while it
+  queued, it ends without asking the phone.
+- A request asked before the machine slept past its 5 minutes ends on waking (exit 5) instead
+  of waiting up to 5 more minutes on a connection that may be dead.
+- A delayed action that finished or expired leaves the daemon's pending list; one announced
+  without its time stays listed until it can have taken effect.
+- `sealctl cancel <id>` takes an id that starts with `-`.
 
 ## 0.7.0
 
