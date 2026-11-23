@@ -540,7 +540,7 @@ Message body:
 | `ack` | `ack`: the status `seq` the phone stored |
 | `notice` | `notice`: a level 3 action, for the machine to show: `{"what": "unseal_all" \| "leave" \| "words" \| "delete", "state": "pending" \| "cancelled" \| "done", "machine": <name of the machine it concerns, or null>, "delay": <delayed id, or null>, "at": <releaseAt, or null>, "report": {"done", "failed", "skipped", "to": [<stores>]} or null}` |
 
-A machine ignores a `lock` whose `t` is earlier than the start of its current session, so a lock held for an offline machine does not close tomorrow's session.
+A machine ignores a `lock` whose `t` is earlier than the start of its current session (the time it sent the `open` request) by more than 60 seconds, so a lock held for an offline machine does not close tomorrow's session, while a lock made just after the approval still applies when the phone's clock is a little behind the machine's.
 
 **Transport.** The relay transport for both is planned (see Relay API, Machine channel). Until it ships, an Open machine keeps one `report` request waiting on the relay, renewed when it expires (`ttl` 300). The report carries the status fields, split over several reports when they do not fit in 2,960 bytes; the phone's reply carries `ack` and the waiting messages in `msgs`. A machine opens at most one `report` per 60 seconds, so a quiet Open machine makes at most 288 of these calls a day.
 

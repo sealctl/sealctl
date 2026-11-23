@@ -62,6 +62,12 @@ impl Paired {
     pub fn label(&self) -> String {
         format!("{} #{}", self.file.name, self.file.tag)
     }
+
+    /// A copy of the machine keys, for a call made without holding the pairing.
+    pub fn keys_copy(&self) -> anyhow::Result<sealctl_core::MachineKeys> {
+        sealctl_core::MachineKeys::from_bytes(&self.keys.to_bytes())
+            .map_err(|e| anyhow::anyhow!("machine keys: {e}"))
+    }
 }
 
 impl MachineFile {

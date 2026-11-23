@@ -261,15 +261,26 @@ impl Repo {
 
     /// Runs restic with output shown (stdout optional).
     pub fn run(&self, args: &[&str], quiet: bool) -> Result<()> {
-        let status = self.run_status(args, quiet)?;
+        self.run_until(args, quiet, None)
+    }
+
+    /// [`Repo::run`], stopping restic at `limit` (the on-lock time limit, or the daemon's exit):
+    /// it holds the backup key and the storage credentials, so it does not run on after it.
+    pub fn run_until(&self, args: &[&str], quiet: bool, limit: Option<&Limit>) -> Result<()> {
+        let status = self.run_status(args, quiet, limit)?;
         if !status.success() {
             bail!("restic {} failed ({status})", args.first().unwrap_or(&""));
         }
         Ok(())
     }
 
-    /// The same, returning how restic exited.
-    pub fn run_status(&self, args: &[&str], quiet: bool) -> Result<std::process::ExitStatus> {
+    /// [`Repo::run_until`], returning how restic exited.
+    pub fn run_status(
+        &self,
+        args: &[&str],
+        quiet: bool,
+        limit: Option<&Limit>,
+    ) -> Result<std::process::ExitStatus> {
         let mut c = self.command();
         c.args(args).stdin(Stdio::piped());
         if quiet {
@@ -283,7 +294,7 @@ impl Repo {
             let mut i = child.stdin.take().context("stdin")?;
             i.write_all(self.password.as_bytes())?;
         }
-        Ok(child.wait()?)
+        wait_until(&mut child, limit, STOP_GRACE)
     }
 
     /// Does the password open the repository?
@@ -479,6 +490,57 @@ pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Resu
     Ok((b, key))
 }
 
+/// When restic has to stop: at `deadline`, or as soon as `stop` is set (the daemon exits).
+#[derive(Clone)]
+pub struct Limit {
+    /// The time limit.
+    pub deadline: std::time::Instant,
+    /// Set to stop now.
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Limit {
+    fn reached(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst) || std::time::Instant::now() >= self.deadline
+    }
+}
+
+/// How long restic has after SIGINT to remove its repository lock before it is killed.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for `child`, stopping it at `limit`: SIGINT first, so restic removes its lock from the
+/// repository (other machines would see it held for up to 30 minutes), then SIGKILL once
+/// `grace` has passed.
+fn wait_until(
+    child: &mut std::process::Child,
+    limit: Option<&Limit>,
+    grace: std::time::Duration,
+) -> Result<std::process::ExitStatus> {
+    let Some(limit) = limit else {
+        return Ok(child.wait()?);
+    };
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if limit.reached() {
+            let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+            let until = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < until {
+                if child.try_wait()?.is_some() {
+                    bail!("stopped at the time limit");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("stopped at the time limit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Runs one backup now, then `forget` with the policy (`--prune` at most weekly). `Some` is a
 /// warning: the snapshot was made but is missing something.
 pub fn run_one(
@@ -486,6 +548,17 @@ pub fn run_one(
     key: &ObjectKey,
     env: BTreeMap<String, Zeroizing<String>>,
     quiet: bool,
+) -> Result<Option<String>> {
+    run_one_until(b, key, env, quiet, None)
+}
+
+/// [`run_one`], with restic stopped at `limit`.
+pub fn run_one_until(
+    b: &Backup,
+    key: &ObjectKey,
+    env: BTreeMap<String, Zeroizing<String>>,
+    quiet: bool,
+    limit: Option<&Limit>,
 ) -> Result<Option<String>> {
     if key.check() != b.check {
         return Err(fail(
@@ -532,7 +605,7 @@ pub fn run_one(
         args.push("--quiet");
     }
     // restic exits 3 when it made the snapshot but could not read some files (it lists them)
-    let r = match repo.run_status(&args, quiet) {
+    let r = match repo.run_status(&args, quiet, limit) {
         Ok(s) if s.success() => Ok(None),
         Ok(s) if s.code() == Some(3) => Ok(Some("some files could not be read".to_string())),
         Ok(s) => Err(anyhow::anyhow!("restic backup failed ({s})")),
@@ -562,7 +635,7 @@ pub fn run_one(
             if prune {
                 fargs.push("--prune");
             }
-            if repo.run(&fargs, true).is_ok() && prune {
+            if repo.run_until(&fargs, true, limit).is_ok() && prune {
                 st.last_prune = Some(now_secs());
             }
         }
@@ -603,4 +676,90 @@ pub fn schedule_install(every_minutes: u64) -> Result<()> {
 /// Removes the schedule.
 pub fn schedule_uninstall() -> Result<()> {
     crate::service::uninstall(crate::service::BACKUP_LABEL)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::Limit;
+
+    fn limit(after: Duration) -> Limit {
+        Limit {
+            deadline: Instant::now() + after,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn a_process_past_its_deadline_is_stopped() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let started = Instant::now();
+        let r = super::wait_until(
+            &mut child,
+            Some(&limit(Duration::from_millis(300))),
+            super::STOP_GRACE,
+        );
+        assert!(r.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some(), "killed and reaped");
+        // without a limit it is waited for
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        assert!(super::wait_until(&mut child, None, super::STOP_GRACE)
+            .unwrap()
+            .success());
+    }
+
+    /// A process that notes SIGINT in `mark` and exits, or ignores it.
+    fn interruptible(mark: &std::path::Path, ignore: bool) -> std::process::Child {
+        let handler = if ignore {
+            "trap '' INT".to_string()
+        } else {
+            format!("trap 'echo stopped > \"{}\"; exit 3' INT", mark.display())
+        };
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{handler}; echo ready > \"{}.ready\"; while :; do sleep 0.05; done",
+                mark.display()
+            ))
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_ready(mark: &std::path::Path) {
+        let ready = mark.with_extension("ready");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_stopped_process_gets_sigint_first_and_sigkill_after_the_grace() {
+        let dir = crate::paths::unit_test_root().join("deadline");
+        std::fs::create_dir_all(&dir).unwrap();
+        // restic removes its repository lock on SIGINT
+        let mark = dir.join(format!("int-{}", std::process::id()));
+        let mut child = interruptible(&mark, false);
+        wait_ready(&mark);
+        let l = limit(Duration::from_secs(60));
+        l.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = Instant::now();
+        assert!(super::wait_until(&mut child, Some(&l), Duration::from_secs(5)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(mark.exists(), "the process had its SIGINT");
+        // one that does not stop on SIGINT is killed after the grace
+        let mark = dir.join(format!("ign-{}", std::process::id()));
+        let mut child = interruptible(&mark, true);
+        wait_ready(&mark);
+        let started = Instant::now();
+        let r = super::wait_until(&mut child, Some(&l), Duration::from_millis(300));
+        assert!(r.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(child.try_wait().unwrap().is_some(), "killed and reaped");
+    }
 }

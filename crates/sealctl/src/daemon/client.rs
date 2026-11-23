@@ -79,6 +79,11 @@ fn printer() -> impl FnMut(&Value) {
             shown = true;
             eprintln!("{}", term::waiting_line(None, false));
         }
+        if e["event"] == "lock-waits" {
+            eprintln!(
+                "Locked. Volumes close once the on-lock backups of an earlier lock finish (15 minutes at most)."
+            );
+        }
     }
 }
 

@@ -64,21 +64,37 @@ const SILENT: Duration = Duration::from_secs(75);
 
 /// Runs until the session locks (the task is aborted) or the relay says it has no channel.
 pub async fn run(d: Arc<Daemon>) {
-    if let Err(e) = d.send_status(&[]).await {
-        log::info!("status: {e:#}");
+    // the open sent one already, unless it failed
+    let unsent = {
+        let st = d.st();
+        st.status_dirty || st.sent_state != "open"
+    };
+    if unsent {
+        if let Err(e) = d.send_status().await {
+            log::info!("status: {e:#}");
+        }
     }
     let mut wait = Reconnect::default();
     loop {
-        let (keys_path, sock) = {
+        // the pairing is not held while connecting (up to 10 s): requests and statuses go on
+        let (keys_path, keys) = {
             let paired = d.paired.lock().await;
             let path = format!(
                 "/v1/phones/{}/machines/{}/socket",
                 paired.phone_id(),
                 paired.file.machine
             );
-            let s = d.relay.socket(&paired.keys, &path).await;
-            (path, s)
+            (path, paired.keys_copy())
         };
+        let keys = match keys {
+            Ok(k) => k,
+            Err(e) => {
+                log::warn!("machine channel: {e:#}");
+                return;
+            }
+        };
+        let sock = d.relay.socket(&keys, &keys_path).await;
+        drop(keys);
         let mut ws = match sock {
             Ok(ws) => ws,
             Err(e) => {
@@ -182,7 +198,9 @@ pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
                 Ok(i) => i,
                 Err(_) => return true,
             };
-            let keys = sealctl_core::MachineKeys::from_bytes(&paired.keys.to_bytes()).expect("64 bytes");
+            let Ok(keys) = paired.keys_copy() else {
+                return true;
+            };
             sealctl_core::request::seal_request(&paired.keys, &paired.phone, &id, body)
                 .ok()
                 .map(|r| {

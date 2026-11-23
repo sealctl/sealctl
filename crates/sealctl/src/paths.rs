@@ -18,10 +18,27 @@ pub fn home() -> Result<PathBuf> {
 }
 
 fn xdg(var: &str, fallback: &str) -> Result<PathBuf> {
+    // unit tests run with the developer's HOME: they never touch the real session, volumes or
+    // configuration
+    #[cfg(test)]
+    {
+        let _ = var;
+        Ok(unit_test_root().join(fallback).join("sealctl"))
+    }
+    #[cfg(not(test))]
     match std::env::var_os(var) {
         Some(p) if !p.is_empty() => Ok(PathBuf::from(p).join("sealctl")),
         _ => Ok(home()?.join(fallback).join("sealctl")),
     }
+}
+
+/// Where the unit tests (`cargo test`, with any HOME) keep sealctl's folders: a temporary
+/// folder of their own per test process.
+#[cfg(test)]
+pub fn unit_test_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| std::env::temp_dir().join(format!("sealctl-unit-{}", std::process::id())))
+        .clone()
 }
 
 /// `~/.config/sealctl`.
