@@ -26,6 +26,10 @@ pub struct Saved {
     pub place: Option<String>,
     /// Why the session last locked.
     pub lock_reason: Option<String>,
+    /// The session state the phone last heard (`open`, `waiting`, `locked`), so that a daemon
+    /// started after one whose last status failed tells the phone the session is Locked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub told: Option<String>,
 }
 
 /// `min(cap, base + rate × minutes worked)`, in seconds.

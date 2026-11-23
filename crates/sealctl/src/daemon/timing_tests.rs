@@ -984,3 +984,30 @@ async fn a_lock_that_waits_for_an_earlier_locks_backups_says_so() {
     first.await.unwrap();
     second.await.unwrap().unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_restarted_daemon_tells_the_phone_what_the_last_one_could_not() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    // the exit's status fails (relay down), then the daemon is gone
+    *d.t.status_failures.lock().unwrap() = 1;
+    d.on_exit().await;
+    assert!(d.t.events().contains(&"status locked failed".to_string()));
+    let saved = serde_json::to_vec(&d.st().saved).unwrap();
+    // the next daemon reads session.json
+    let (d2, _) = testing::daemon(DEAD);
+    *d2.st() = super::State::restored(serde_json::from_slice(&saved).unwrap(), t0());
+    d2.tick().await;
+    assert_eq!(
+        d2.t.events(),
+        ["status locked"],
+        "the phone still took the session as Open"
+    );
+    // a daemon whose last status was heard sends nothing
+    let saved = serde_json::to_vec(&d2.st().saved).unwrap();
+    let (d3, _) = testing::daemon(DEAD);
+    *d3.st() = super::State::restored(serde_json::from_slice(&saved).unwrap(), t0());
+    d3.tick().await;
+    assert!(d3.t.events().is_empty());
+}

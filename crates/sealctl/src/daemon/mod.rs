@@ -129,6 +129,27 @@ impl UsageLog {
 }
 
 impl State {
+    /// The state of a daemon starting at `n` with `saved` from `session.json`.
+    fn restored(saved: Saved, n: u64) -> State {
+        State {
+            sent_state: saved.told.clone().unwrap_or_default(),
+            saved,
+            last_client: n,
+            ..State::default()
+        }
+    }
+
+    /// The phone heard `state`.
+    fn told(&mut self, state: String, busy: Vec<sealctl_core::wire::BusyVolume>) {
+        self.status_dirty = false;
+        if self.saved.told.as_deref() != Some(state.as_str()) {
+            self.saved.told = Some(state.clone());
+            save_saved(&self.saved);
+        }
+        self.sent_state = state;
+        self.sent_busy = busy;
+    }
+
     /// The session state as a status tells it.
     fn state_word(&self) -> &'static str {
         if self.waiting_since.is_some() {
@@ -314,13 +335,12 @@ impl Daemon {
     pub fn new(inproc: bool) -> Result<Arc<Daemon>> {
         let paired = machine::load()?;
         let relay = Relay::new(&paired.file.relay)?;
-        let saved = load_saved();
-        let st = State {
-            saved,
-            last_client: now(),
-            ..State::default()
-        };
-        Ok(Self::with(paired, relay, inproc, st))
+        Ok(Self::with(
+            paired,
+            relay,
+            inproc,
+            State::restored(load_saved(), now()),
+        ))
     }
 
     fn with(paired: Paired, relay: Relay, inproc: bool, st: State) -> Arc<Daemon> {
@@ -1524,10 +1544,8 @@ impl Daemon {
             }
             drop(paired);
             let mut st = self.st();
-            st.status_dirty = false;
             st.last_status = self.now();
-            st.sent_state = s;
-            st.sent_busy = busy;
+            st.told(s, busy);
             return Ok(());
         }
         let sealed = sealctl_core::channel::seal_status(&paired.keys, &paired.phone, &status)
@@ -1542,10 +1560,8 @@ impl Daemon {
             .await?;
         drop(paired);
         let mut st = self.st();
-        st.status_dirty = false;
         st.last_status = self.now();
-        st.sent_state = status.state.map(|s| s.session).unwrap_or_default();
-        st.sent_busy = busy;
+        st.told(status.state.map(|s| s.session).unwrap_or_default(), busy);
         Ok(())
     }
 
