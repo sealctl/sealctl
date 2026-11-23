@@ -64,8 +64,15 @@ const SILENT: Duration = Duration::from_secs(75);
 
 /// Runs until the session locks (the task is aborted) or the relay says it has no channel.
 pub async fn run(d: Arc<Daemon>) {
-    if let Err(e) = d.send_status(&[]).await {
-        log::info!("status: {e:#}");
+    // the open sent one already, unless it failed
+    let unsent = {
+        let st = d.st();
+        st.status_dirty || st.sent_state != "open"
+    };
+    if unsent {
+        if let Err(e) = d.send_status(&[]).await {
+            log::info!("status: {e:#}");
+        }
     }
     let mut wait = Reconnect::default();
     loop {

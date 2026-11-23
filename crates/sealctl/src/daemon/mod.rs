@@ -122,6 +122,19 @@ impl UsageLog {
     }
 }
 
+impl State {
+    /// The session state as a status tells it.
+    fn state_word(&self) -> &'static str {
+        if self.waiting_since.is_some() {
+            "waiting"
+        } else if self.open {
+            "open"
+        } else {
+            "locked"
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     open: bool,
@@ -149,6 +162,8 @@ struct State {
     locks_begun: u64,
     status_dirty: bool,
     last_status: u64,
+    /// The session state the last status told the phone (`open`, `waiting`, `locked`).
+    sent_state: String,
     keys_used_month: u64,
 }
 
@@ -400,8 +415,7 @@ impl Daemon {
             }
             return Ok(Some(c.reply));
         }
-        let mut paired = self.paired.lock().await;
-        match approve::send(&self.relay, &mut paired, body, &mut |_| {}).await? {
+        match approve::send_shared(&self.relay, &self.paired, body).await? {
             Asked::Reply { reply, .. } => Ok(Some(reply)),
             Asked::Delayed { .. } => Ok(None),
         }
@@ -563,6 +577,15 @@ impl Daemon {
                 save_saved(&st.saved);
                 st.generation
             };
+            // The phone hears the session is Open before this caller (or one that joined the
+            // open) sends its next request, not when the machine channel gets to it.
+            if !self.inproc {
+                if let Err(e) = self.send_status(&[]).await {
+                    log::info!("status: {e:#}");
+                    // tried again at the next tick
+                    self.st().last_status = 0;
+                }
+            }
             self.mount_auto(generation).await;
             if !self.inproc {
                 self.start_channel(generation);
@@ -1208,13 +1231,7 @@ impl Daemon {
             let mut st = self.st();
             let n = self.now();
             let s = sealctl_core::wire::SessionState {
-                session: if st.waiting_since.is_some() {
-                    "waiting".into()
-                } else if st.open {
-                    "open".into()
-                } else {
-                    "locked".into()
-                },
+                session: st.state_word().into(),
                 left: st.open.then(|| st.saved.left(n)),
                 stop: st.saved.first_open.filter(|_| st.open).map(session::hard_stop),
                 place: st.saved.place.clone(),
@@ -1272,6 +1289,7 @@ impl Daemon {
             let mut st = self.st();
             st.status_dirty = false;
             st.last_status = self.now();
+            st.sent_state = s;
             return Ok(());
         }
         let sealed = sealctl_core::channel::seal_status(&paired.keys, &paired.phone, &status)
@@ -1288,6 +1306,7 @@ impl Daemon {
         let mut st = self.st();
         st.status_dirty = false;
         st.last_status = self.now();
+        st.sent_state = status.state.map(|s| s.session).unwrap_or_default();
         Ok(())
     }
 
@@ -1468,9 +1487,15 @@ impl Daemon {
                 st.saved.work(n);
                 save_saved(&st.saved);
             }
+            // The phone takes the session as Open by its last status (keys and remembered
+            // agent uses go without a tap): a status that went out while it was asked says
+            // `waiting`, so the end of the wait is told at the next sample.
+            let word = st.state_word();
+            let changed = word != "waiting" && st.sent_state != word;
             let due = st.open
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
-                    || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000));
+                    || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000)
+                    || (changed && n.saturating_sub(st.last_status) >= 10 * 1000));
             (st.open, due)
         };
         if open && status_due && !self.inproc {

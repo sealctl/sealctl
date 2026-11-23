@@ -306,3 +306,82 @@ async fn a_first_open_in_the_future_does_not_carry_its_credit() {
     assert_eq!(st.saved.first_open, Some(t0()));
     assert_eq!(st.saved.worked, 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_phone_hears_the_session_is_open_before_the_next_request() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    // an agent asks right after the open
+    d.t.answer(testing::grant("once", &[]), None);
+    d.ask(approve::body("agent"), &ev(), false).await.unwrap();
+    settle().await;
+    let e = d.t.events();
+    assert!(at(&e, "status open") < at(&e, "ask agent"), "{e:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_end_of_a_wait_is_told_to_the_phone() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    d.t.answer(testing::grant("once", &[]), Some(gate.clone()));
+    let asking = tokio::spawn({
+        let d = d.clone();
+        async move { d.ask(approve::body("agent"), &ev(), false).await.is_ok() }
+    });
+    settle().await;
+    // a status goes out while the phone is asked
+    d.send_status(&[]).await.unwrap();
+    gate.add_permits(1);
+    assert!(asking.await.unwrap());
+    let before = d.t.events().len();
+    d.t.advance(15_000);
+    d.tick().await;
+    let e = d.t.events();
+    assert!(
+        e[before..].contains(&"status open".to_string()),
+        "the phone learns the wait ended: {e:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lock_message_is_applied_while_the_phone_is_asked() {
+    use base64::Engine;
+    // a relay that takes the connection and never answers
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let (conn, _) = listener.accept().unwrap();
+        let _ = tx.send(());
+        std::thread::sleep(Duration::from_secs(30));
+        drop(conn);
+    });
+    let (d, phone) = testing::daemon(&origin);
+    open(&d, &store_items()).await;
+    let sealed = {
+        let p = d.paired.lock().await;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        sealctl_core::seal_machine_message(
+            &phone,
+            p.file.machine.clone(),
+            b64.encode(p.keys.box_public()),
+            lock_message(t0() + 1_000, 1, "phone"),
+        )
+        .unwrap()
+    };
+    let asking = tokio::spawn({
+        let d = d.clone();
+        async move { d.ask(approve::body("agent"), &ev(), false).await.is_ok() }
+    });
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), d.on_message(&sealed))
+        .await
+        .expect("the lock message did not wait for the request on the phone");
+    assert!(!d.st().open);
+    asking.abort();
+}
