@@ -856,7 +856,9 @@ mod tests {
         let eval = format!("eval {}; sealctl secret get k", "do ".repeat(100_000));
         assert!(bash(&eval).is_some(), "should deny the eval form");
         let took = started.elapsed();
-        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+        // normally well under a second; the quadratic rescan took tens of seconds. The limit is
+        // the hook's own timeout (15 s), so a loaded CI machine does not fail it by chance
+        assert!(took < std::time::Duration::from_secs(15), "took {took:?}");
         // `case` after keywords still opens a case
         assert!(bash("if case x in a) sealctl secret get k ;; esac").is_some());
     }
@@ -892,7 +894,9 @@ mod tests {
             why.as_deref().is_some_and(|w| w.contains("secret get")),
             "should deny: {why:?}"
         );
-        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+        // the hook's own timeout (15 s), as above: the exponential case took far longer, and a
+        // loaded machine must not fail it by chance
+        assert!(took < std::time::Duration::from_secs(15), "took {took:?}");
         // the chains alone are fine
         assert!(bash(&chains.join(" ; ")).is_none());
 
