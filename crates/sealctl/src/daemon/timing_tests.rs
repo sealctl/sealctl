@@ -527,8 +527,11 @@ async fn connecting_the_machine_socket_does_not_hold_up_requests() {
         .await
         .unwrap()
         .unwrap();
+    // statuses take the pairing for a moment; the connect (up to 10 s) must not
     assert!(
-        d.paired.try_lock().is_ok(),
+        tokio::time::timeout(Duration::from_secs(1), d.paired.lock())
+            .await
+            .is_ok(),
         "the pairing is free while the socket connects"
     );
     channel.abort();
