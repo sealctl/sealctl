@@ -18,7 +18,7 @@ program gets the key while the agent sees only `****`.
 1. **sealctl itself** — works with every agent, no setup:
    * `sealctl run` replaces secret values with `****` in everything the program prints, whenever
      it runs inside an agent or its output isn't a terminal.
-   * `secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `scan` and `migrate` refuse
+   * `secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `project trust`, `scan` and `migrate` refuse
      inside an agent (exit 8; detected by the environment variables agents set: `CLAUDECODE`,
      `CODEX_THREAD_ID`, `GEMINI_CLI`, `QWEN_CODE`, `COPILOT_AGENT_SESSION_ID`, `OPENCODE`,
      `AI_AGENT`, …; force with `SEALCTL_AGENT=1`).
@@ -54,7 +54,7 @@ program gets the key while the agent sees only `****`.
      sealctl run (names: …). Values are never shown.`
 3. **Skill and deny rules** — the `sealctl-secrets` skill (open SKILL.md format) explains the
    workflow; deny rules block the dangerous sealctl commands where the agent supports them
-   (`secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `aws credentials`,
+   (`secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `project trust`, `aws credentials`,
    `git credential`, and `git credential fill`). In Claude Code and Qwen Code they also cover
    reading `.env`, `.env.local`, `.env.production` and the like, which keeps those files out of
    a folder-wide search as well. The skill never mentions the price.

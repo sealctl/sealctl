@@ -31,6 +31,7 @@ pub const DENY: &[&str] = &[
     "Bash(sealctl unpair *)",
     "Bash(sealctl seal *)",
     "Bash(sealctl unseal *)",
+    "Bash(sealctl project trust *)",
     "Read(**/*.sealed)",
     "Read(~/.config/sealctl/machine.json)",
     "Read(~/.local/state/sealctl/**)",

@@ -575,17 +575,13 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
             "env file" => {
                 let dir = file.parent().unwrap_or(Path::new(".")).to_path_buf();
                 let pfile = dir.join(project::FILE);
-                let mut p = if pfile.exists() {
-                    project::load(&pfile)?
-                } else {
-                    project::ProjectFile::default()
-                };
-                for f in &fs {
-                    if let Some(n) = name_of(f) {
-                        p.env.insert(f.source.clone(), n);
+                project::update(&pfile, |p| {
+                    for f in &fs {
+                        if let Some(n) = name_of(f) {
+                            p.env.insert(f.source.clone(), n);
+                        }
                     }
-                }
-                std::fs::write(&pfile, toml::to_string_pretty(&p)?)?;
+                })?;
                 // the assignments of the sealed names, found by the parser (any line ending,
                 // quoted values over several lines), removed byte for byte. A name goes only if
                 // the value in effect (its last assignment) is still the one stored; then its

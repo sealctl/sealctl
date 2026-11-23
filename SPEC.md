@@ -170,6 +170,7 @@ Paths use the XDG variables when set, else these defaults, on macOS and Linux al
 | `~/.local/state/sealctl/inventory.json` | Objects this machine knows (section 15) | No |
 | `~/.local/state/sealctl/licence.json` | Last licence answer and its time; time of the last ask | No |
 | `~/.local/state/sealctl/migrate.json` | Re-encryption job state | No |
+| `~/.local/state/sealctl/projects.json` | Project files trusted on this machine (10.3): canonical path, SHA-256 of the content, time trusted. No names, no values | No |
 | `~/.local/state/sealctl/backup/<name>.toml` | Last backup times and last error | No |
 | `~/.local/state/sealctl/daemon.log` | Daemon log, rotated at 1 MB, 3 files | Must not be |
 | `~/sealctl-unsealed-<date>/` | One `unseal` run: plan, journal, copies of edited files, the hand-back list, objects kept for safety, and with the default `folder` store the new passwords and secrets in plain files (section 18.4). Outside sealctl's own folders so that `unseal --all` can remove those | With the `folder` store: yes (0600 files in a 0700 folder) |
@@ -430,7 +431,7 @@ Exit 5 when the code expires unpaired. The machine gate (`402` on the phone's si
 - Repository: `git rev-parse --show-toplevel` from the working directory; id and name per protocol.md (`ctx.repo`). Outside git, `repo` is `null` and answers are kept per folder path.
 - A person is never asked inside an Open session. An agent is identified only by the environment variables in 5.2; that is a guard against mistakes, not against malware (threat model).
 - Allowed agent uses are kept in daemon memory until the session locks; `remember` answers also go to `answers.json` when the phone sends them.
-- A file in the repository never grants anything: `.sealctl.toml` only names which secrets a command gets.
+- A file in the repository never grants anything: `.sealctl.toml` only names which secrets a command gets, and a person's `sealctl run` uses it only once it is trusted on this machine (10.3).
 - **Confirmation levels** (protocol.md, Confirmation levels): the CLI sets `lvl` to the level of what it is about to do and `match: true` whenever a person at a terminal is shown the number. It prints the number on stderr, once, on the `Waiting for your phone` line. The phone decides the level; the CLI's `lvl` can only raise it.
 
 ## 10. Commands
@@ -520,7 +521,20 @@ sealctl run [-e NAME=secret]... [--no-project] -- <command> [args...]
   DEPLOY_TOKEN = "shop/deploy-token"
   ```
 
-- stderr first lists what the program gets: `sealctl: OPENAI_API_KEY ← shop/openai-api-key` (names only), because a cloned repository can contain a `.sealctl.toml`.
+- **Trusted on first use.** A `.sealctl.toml` can come with a cloned repository, so `sealctl run` uses one only once it is trusted on this machine, identified by its canonical path and the SHA-256 of its content (`projects.json`, section 3). The bytes checked are the bytes used. The first time, and again whenever the content changes, a person at a terminal is asked, with every mapping listed (names only; `[command]` sections say which command):
+
+  ```text
+  sealctl: ~/src/shop/.sealctl.toml is new on this machine. It gives commands run here these secrets:
+    OPENAI_API_KEY ← shop/openai-api-key
+    DEPLOY_TOKEN ← shop/deploy-token  (for npm run deploy)
+  Trust this file? [y/N]
+  ```
+
+  A changed file says `changed since it was trusted on this machine` instead of `is new on this machine`. `y` records the file and runs; anything else exits 1 (`Not trusted; nothing was run. Without it: sealctl run --no-project -- <command>`). Without a terminal (a pipe, CI, a service) nothing is asked: exit 8, `<path> is new on this machine; nothing was run.` and `Check the secrets it names, then trust it once: sealctl project trust <path>`. A file that maps nothing needs no trust, nor does `--no-project` with `-e`.
+- `sealctl project trust [PATH]` trusts the project file as it is now: PATH is the file, or a folder searched upwards as `run` does (default the working directory); it lists the mappings on stderr and records the file. It needs no terminal, so a script or CI runner can trust a file once; it is refused inside an AI agent (exit 8), and exits 9 when there is no project file.
+- Files sealctl writes itself are trusted when written: `seal env` (and `secret import-env`) and `scan`. Not when a project file was there already and not trusted (its mappings came from elsewhere): the write keeps it untrusted, and the next `run` asks about all of its mappings.
+- Inside an AI agent nothing is asked and nothing is recorded: an agent never trusts a file, and its uses go to the phone as `agent` requests (section 9), which show the agent, repository and names.
+- stderr then lists what the program gets: `sealctl: OPENAI_API_KEY ← shop/openai-api-key` (names only).
 - Values come from the daemon (`values`, plus `own` for own-approval secrets), then the program starts with them in its environment only.
 - Masking: inside an agent or when stdout or stderr is not a terminal, the program's output passes through the masker (raw, base64, URL-encoded forms) and values print as `****`. Otherwise `exec` replaces sealctl.
 - Never prints the ask, a price, or any text meant for an agent to pass on.
@@ -606,7 +620,7 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 - **Claude Code hooks** in `~/.claude/settings.json` (events `UserPromptSubmit`, `PreToolUse` for `Bash|Write|Edit|MultiEdit|Read|Grep|NotebookEdit`, `SessionStart`), command `<stable sealctl path> hook claude`, timeout 15 s.
 - **Denials** (all agents with hooks, and Claude Code `permissions.deny`):
   - reading anything under the store folder, `*.sealed`, `machine.json`, `~/.local/state/sealctl/`;
-  - `sealctl secret get`, `sealctl recover`, `sealctl aws credentials`, `sealctl git credential`, the `seal` aliases (`sealctl secret import-env`, `sealctl volume import`, `sealctl ssh import`), `sealctl buy`, `sealctl unpair`, `sealctl seal`, `sealctl unseal`;
+  - `sealctl secret get`, `sealctl recover`, `sealctl aws credentials`, `sealctl git credential`, the `seal` aliases (`sealctl secret import-env`, `sealctl volume import`, `sealctl ssh import`), `sealctl buy`, `sealctl unpair`, `sealctl seal`, `sealctl unseal`, `sealctl project trust`;
   - `git credential fill` and `git credential-<helper> get`, which print a stored token;
   - setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`, `env -u …`);
   - environment dumps, `cat .env`, `printenv VAR`, clipboard reads, credential files;
@@ -1069,7 +1083,7 @@ Choose 1, 2 or 3:
 | Words | Typed only into `sealctl recover`, and into `seal` and `unseal` with `--words`; read without echo; never accepted as an argument, from stdin when it is not a terminal, or from the environment |
 | Levels | `lvl` never lower than the action's level (18.9); `match: true` only when the number is printed to a terminal a person reads; the number is never logged, never in `--json`, never in the journal; a plan reply is used only after its `sig`, `h` and `nb` check, and only inside the plan |
 | Replies | A reply is used only after HPKE open, signature check with the paired phone key, `rq` check and key check against the `.id` file |
-| Agents | `secret get`, `recover`, `seal`, `unseal`, the credential helpers and `buy` refuse inside agents; masking cannot be turned off inside an agent |
+| Agents | `secret get`, `recover`, `seal`, `unseal`, `project trust`, the credential helpers and `buy` refuse inside agents; masking cannot be turned off inside an agent; an agent never trusts a project file (10.3) |
 | Hand-back | `seal` and `unseal` give values and passwords only to the chosen store (stdin, native API or a 0600 file), check them by hash, and write none to the journal, `plan.json`, `handback.json` or the terminal (except the opt-in `show` store) |
 
 ## 21. Engineering safeguards
