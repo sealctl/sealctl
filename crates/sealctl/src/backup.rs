@@ -429,6 +429,7 @@ pub struct InitOpts<'a> {
 /// Makes a repository with a new id and key, and records the definition.
 pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Result<(Backup, ObjectKey)> {
     crate::volume::validate_name(opts.name)?;
+    let _name = lock_name(opts.name)?;
     if Backup::load(opts.name).is_ok() {
         return Err(fail(exit::USAGE, format!("Backup {} exists already.", opts.name)));
     }
@@ -488,6 +489,23 @@ pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Resu
     };
     b.save()?;
     Ok((b, key))
+}
+
+/// The [`crate::util::object_lock`] of a restic repository: held by `backup run`, `seal backup`,
+/// `unseal`, rewrap and re-encryption while they use or change it.
+pub fn lock_repo(url: &str) -> Result<crate::util::ObjectLock> {
+    let key = if url.contains(':') {
+        format!("restic:{url}")
+    } else {
+        crate::util::path_key(std::path::Path::new(url))
+    };
+    crate::util::object_lock(&key, &format!("The restic repository {url}"))
+}
+
+/// The [`crate::util::object_lock`] of a backup name, held from the check that it is free to the
+/// saved definition (`backup init`, `seal backup`).
+pub fn lock_name(name: &str) -> Result<crate::util::ObjectLock> {
+    crate::util::object_lock(&format!("backup-name:{name}"), &format!("Backup {name}"))
 }
 
 /// When restic has to stop: at `deadline`, or as soon as `stop` is set (the daemon exits).
@@ -580,6 +598,22 @@ pub fn run_one_until(
                 None => format!("{} is not there.", b.source.display()),
             },
         ));
+    }
+    // never beside a re-encryption, rewrap or unseal of this repository, and only into the
+    // repository the definition names now: one that moved (re-encrypted) or went (unsealed)
+    // since `b` was read would take a snapshot that is then lost
+    let _lock = lock_repo(&b.repo)?;
+    match Backup::load(&b.name) {
+        Ok(cur) if cur.repo == b.repo && cur.check == b.check => {}
+        _ => {
+            return Err(fail(
+                exit::BUSY,
+                format!(
+                    "Backup {} changed while it was starting (re-encrypted or handed back). Run it again.",
+                    b.name
+                ),
+            ))
+        }
     }
     let repo = Repo::new(&b.repo, key, env);
     let mut st = b.state();

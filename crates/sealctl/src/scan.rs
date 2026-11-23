@@ -449,14 +449,26 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
     for f in findings {
         by_file.entry(f.file.clone()).or_default().push(f);
     }
+    // the files were read before the store was written, which can wait on the phone: one that
+    // changed meanwhile (a shell appending to its history, an edit) is never rewritten from the
+    // old text. A history is masked as it is now; any other file is left as it is
+    let mut changed = Vec::new();
     for (file, fs) in by_file {
         let bytes = &texts[&file];
+        let Ok(now) = std::fs::read(&file).map(Zeroizing::new) else {
+            changed.push(paths::tilde(&file));
+            continue;
+        };
         if fs[0].kind == "history" {
-            let mut t = Zeroizing::new(bytes.to_vec());
+            let mut t = now;
             for f in &fs {
                 t = mask_bytes(&t, f.value.as_bytes());
             }
             rewrite(&file, &t)?;
+            continue;
+        }
+        if *now != **bytes {
+            changed.push(paths::tilde(&file));
             continue;
         }
         let text = Zeroizing::new(String::from_utf8(bytes.to_vec()).map_err(|_| {
@@ -564,6 +576,15 @@ pub fn seal(findings: &[Finding]) -> Result<usize> {
             }
             _ => {}
         }
+    }
+    if !changed.is_empty() {
+        return Err(fail(
+            exit::PARTWAY,
+            format!(
+                "{} changed while sealctl scanned; left as it is (the values are stored). Run sealctl scan again.",
+                changed.join(", ")
+            ),
+        ));
     }
     Ok(stored)
 }

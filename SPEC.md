@@ -542,6 +542,7 @@ Finds keys and moves them into the store, leaving references behind.
 - The list shows file, line, kind and the first 4 characters only. `--dry-run` stops there; otherwise a terminal asks `Seal 6 keys? [y/N]`; `--yes` skips the question.
 - The same value found twice becomes one secret. A name the store or this scan already has with another value gets `-2`, `-3`, … instead of replacing it; one that holds the same value is used as it is. A folder's `.sealctl.toml` maps a variable to one secret, so `.env` files of one folder that give a variable different values (`.env` and `.env.local`) stop the scan before anything is stored, naming the variable and the files. Files keep their mode and are rewritten atomically, byte for byte outside the sealed values (a zsh history need not be UTF-8); a symlinked file is rewritten where the link points, and the link stays. No backup copies are made, since they would hold the keys.
 - Sealing needs the store key (`open` when Locked).
+- Files are read before anything is stored, and storing can wait on the phone. Before a file is rewritten it is read again: a history that grew meanwhile (another shell) is masked as it is now, never rewritten from the earlier read; any other file that changed is left as it is, named in the message, and the scan exits 13 (its values are stored; scanning again finishes it).
 - `--json`: `{"findings": [{"file", "line", "kind", "source", "name"}], "sealed": <count>}`; never values.
 
 ### 10.5 Agents
@@ -619,6 +620,7 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 - A new store: `uuid v4` id, folder `~/.local/share/sealctl/store/<store-id>/`, the key from the first `open` (item without `w`/`c`), `.id` written last.
 - `--own-approval`: a mode 2 file. Its key is asked with a `keys` request at creation and an `own` request at every use; it lives in daemon memory until that command exits. Its check goes into the `.id` file's `own` map.
 - Listing, removing and the names in `SessionStart` read the folder only; they need no key.
+- Writes through the daemon hold `<store>/.sealctl-write.lock` shared and never wait (busy: exit 11); a rewrap (16.1) holds it exclusive from listing the files to writing the new `.id`. A value under the store key is written only with the key whose check the `.id` file names: a session opened before the store moved to new words holds the old key, and such a write is refused (exit 10) rather than sealed where neither the new key nor the words in its header open it.
 - A store folder synced between machines works on all of them: the key depends on the store id and the words only. Two machines writing the same file at once: last rename wins; `secret ls` shows `modified` so the user can see it.
 
 ## 13. Volumes
@@ -642,6 +644,7 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 - Nothing is cached inside the volume: backup keys and credentials are held by the daemon while Open.
 - Schedule and on-lock backups run only while the daemon holds the keys (Open, or during step 2 of a lock).
 - Retention: 7 daily, 4 weekly, 12 monthly, `forget --prune` at most weekly.
+- A backup run (by hand, scheduled, or on lock) holds the repository's object lock (18.1, One change at a time) and runs only into the repository the definition names when it holds it: during a re-encryption, rewrap or unseal of that repository it fails at once with exit 11, and a definition that changed since the run read it (re-encrypted, handed back) stops it with exit 11 too, never a snapshot into a repository that is then removed.
 
 ## 15. Inventory and .id files
 
@@ -707,11 +710,13 @@ A launchd job `com.sealctl.migrate` or systemd user service `sealctl-migrate.ser
 | APFS volume | Check free space ≥ used size (else stop with the needed size). Unmount; add a new APFS volume in the same container; get its key with a `keys` request; mount the old one read-only at a private mountpoint; copy with `ditto` (a resumed copy runs `ditto` again); compare file count and total size, and SHA-256 of 1% of files picked at random; delete the old volume; rename the new one; update the volume config with the new id. The volume cannot be used during the job; `sealctl volume open` says so |
 | Sparse bundle | Same, with a new bundle beside the old one, then the old bundle deleted and the new one renamed |
 | LUKS | Close the volume; `sudo cryptsetup reencrypt --resilience checksum <file>` with the key on a file descriptor (offline, resumable by cryptsetup itself) |
-| Restic repository | New repository id; `restic init --from-repo <old> --copy-chunker-params` with both passwords on fds; `restic copy --from-repo <old>` (skips snapshots already copied); `restic check` on the new one; then delete the old repository's objects (folder: remove the folder; S3-compatible: delete all objects and versions under the prefix); update the backup config. Other restic backends (sftp, rest, rclone): stop before deleting and print what to delete |
+| Restic repository | New repository id (kept in `migrate.json` with the old URL); `restic init --from-repo <old> --copy-chunker-params` with both passwords on fds; `restic copy --from-repo <old>` (skips snapshots already copied); `restic check` on the new one; update the backup config to the new repository; only then delete the old repository's objects (folder: remove the folder; S3-compatible: delete all objects and versions under the prefix). A resumed job whose backup config already names the new id only deletes the old repository, and never the one the config names. Other restic backends (sftp, rest, rclone): stop before deleting and print what to delete |
 
 - Paused while on battery below 20% (macOS `pmset -g batt`; Linux `/sys/class/power_supply/BAT*/capacity` and `status`), resumed at 25% or on mains power.
 - Progress goes to `sealctl migrate --status`, `sealctl status` and the phone (status `migrate`).
 - The job needs the session Open only to get the new object keys; it asks once at the start, with one `keys` request for all new ids.
+- Each object is held with its object lock (18.1) while it is copied and swapped: `volume open`, backup runs, `seal`, `unseal` and rewrap of it are refused meanwhile (exit 11).
+- `--pause`, `--resume` and `--cancel` change only the request in `migrate.json`, read and written under `migrate.json.lock` as the runner's own saves are, so the item states the runner wrote are never replaced by ones read before them.
 
 ### 16.4 `--scan`
 
@@ -762,6 +767,8 @@ The same rules and password stores serve both directions.
 | No phone or relay needed | `unseal` gets keys from the phone when it answers, with `unseal` requests bound to the confirmed plan, at confirmation level 2 (objects) or 3 (`--all`) (18.9). With `--words`, or when the phone or relay cannot be reached, it asks for the 24 words as `recover` does; no level, number or delay applies then |
 | A person at a terminal | stdin and stderr must be terminals; refused inside an AI agent with exit 8. `--all` has no `--yes` |
 | No values shown | Values and passwords go only to the chosen store and are read back to check them by SHA-256 in memory. The only exception is the store `show`, chosen by the user, which writes each new password once to `/dev/tty` |
+| One change at a time | Every command that changes or writes an object's keys or data (`seal`, `unseal`, rewrap, the re-encryption job, `volume create`, `volume open`, `backup init`, `backup run`) holds that object's lock: an exclusive non-blocking `flock` on `~/.local/state/sealctl/locks/<hash>.lock`, keyed by the bundle or LUKS file's real path, `apfs:<uuid>`, or the restic repository (its real path, or its URL); new objects also lock their name from the check that it is free to the saved definition. A second command on the same object exits 11 (`… is busy: another sealctl command is changing it.`) before it asks anything, so a seal whose phone answers late can never write its marker over another's |
+| Definition before the old way in goes | Where the old way in is removed in a step of its own (a LUKS slot, a restic key), the definition (and marker) is saved first: a stop in between leaves an object both open, never one only sealctl's key opens without sealctl knowing it |
 | Nothing deleted that could be needed | Data is never deleted. Replaced files and the old store folder move to the run folder's `kept/`, still encrypted, and the final message says where |
 
 ### 18.2 Commands
@@ -881,7 +888,7 @@ Journal line:
 {"v": 1, "t": "2026-11-21T10:14:02+01:00", "n": 7, "step": "volume:safe", "state": "done", "note": "passphrase changed; verify passed"}
 ```
 
-`state` is `start`, `done`, `failed` or `skipped`; a volume or backup step also writes `password` (its note: where the step's new password went, as in `handback.json`) before the object changes, and `changed` once the object opens only with that password. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed.
+`state` is `start`, `done`, `failed` or `skipped`; a volume or backup step also writes `password` (its note: where the step's new password went, as in `handback.json`) before the object changes, and `changed` (its note: the object's hand-back entry without the password) once the object opens only with that password. The step puts the object on `handback.json` before it removes sealctl's definition; a resumed step that finds the definition gone after a `changed` line finishes from the list (or, if the stop came before the list was written, from the `changed` and `password` notes) instead of failing on the missing definition. A run of `unseal secrets` stopped after the store folder moved to `kept/store` clears the store setting on resume. `note` never holds a value, a password, or a path inside the secret store. Lines are appended and `fsync`ed.
 
 - `--resume` takes the newest run folder that has a `plan.json` and no `done`; without one it exits 9 (`No unfinished run to resume.`).
 - For each step not `done`, the step's check runs first against the object (does the new password already open it? is sealctl's key already gone?), so a step interrupted after it took effect is recorded, not repeated. A resumed volume or backup step reads its new password back from where its `password` line says when sealctl's key no longer opens the object, or when that password already opens it (a LUKS slot or restic key added beside sealctl's). While sealctl's key opens the object and the stored password does not, the object has not changed: the step makes a new password as on a first attempt and says so, so a passphrase typed back for `--to show` is never applied unchecked.

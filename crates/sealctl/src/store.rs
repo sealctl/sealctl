@@ -260,8 +260,66 @@ impl Store {
             .map_err(|_| fail(exit::WRONG_KEY, format!("{name} does not open with this key.")))
     }
 
-    /// Writes a secret. A replaced value keeps its file id; a new one gets a new id.
+    /// The lock between writers and a move to new words: `<store>/.sealctl-write.lock`
+    /// (dot files are not secrets). Writers through the daemon hold it shared and never wait;
+    /// `migrate`'s rewrap holds it exclusive, waiting for writes under way, from the listing of
+    /// the files to the new `.id`.
+    fn lock_with(&self, arg: nix::fcntl::FlockArg) -> Result<StoreLock> {
+        paths::ensure_private_dir(&self.dir)?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(".sealctl-write.lock"))?;
+        let f = nix::fcntl::Flock::lock(f, arg).map_err(|_| {
+            fail(
+                exit::BUSY,
+                "The secret store is moving to new words (sealctl migrate). Try again once it ends.",
+            )
+        })?;
+        Ok(StoreLock { _f: f })
+    }
+
+    /// The writers' side of [`Store::lock_with`]: shared, refused while a rewrap runs.
+    pub fn lock_writes(&self) -> Result<StoreLock> {
+        self.lock_with(nix::fcntl::FlockArg::LockSharedNonblock)
+    }
+
+    /// The rewrap's side of [`Store::lock_with`]: exclusive, after the writes under way.
+    pub fn lock_rewrap(&self) -> Result<StoreLock> {
+        self.lock_with(nix::fcntl::FlockArg::LockExclusive)
+    }
+
+    /// Writes a secret. A replaced value keeps its file id; a new one gets a new id. A value
+    /// under the store key is written only with the key the `.id` file names: a session that
+    /// opened before the store moved to new words holds the old key, and a value sealed with it
+    /// would open with neither the store's key nor the words the file says.
     pub fn write(
+        &self,
+        name: &str,
+        mode: Mode,
+        key: &ObjectKey,
+        words: &str,
+        value: &[u8],
+        file_id: Option<&str>,
+    ) -> Result<()> {
+        if mode == Mode::StoreKey {
+            if let Some(f) = self.id_file()? {
+                if f.check != key.check() {
+                    return Err(fail(
+                        exit::WRONG_KEY,
+                        "The secret store moved to new words since this session opened. Lock \
+                         (sealctl lock) and try again.",
+                    ));
+                }
+            }
+        }
+        self.write_moved(name, mode, key, words, value, file_id)
+    }
+
+    /// [`Store::write`] without the `.id` check: the rewrap, writing the new key's files before
+    /// the `.id` names it.
+    pub fn write_moved(
         &self,
         name: &str,
         mode: Mode,
@@ -337,6 +395,11 @@ impl Store {
     }
 }
 
+/// A held [`Store::lock_writes`] or [`Store::lock_rewrap`]; released when dropped.
+pub struct StoreLock {
+    _f: nix::fcntl::Flock<std::fs::File>,
+}
+
 /// The `keys` item of an own-approval secret.
 pub fn own_item(store: &Store, header: &Header) -> Result<RequestItem> {
     let checks = store.own_checks()?;
@@ -361,6 +424,46 @@ mod tests {
         let d = dir.join("0b7d3c2e-5f4a-4b8e-9c1d-2a3b4c5d6e7f");
         std::fs::create_dir_all(&d).unwrap();
         Store::at(&d).unwrap()
+    }
+
+    /// A session opened before `migrate` moved the store to new words still holds the old store
+    /// key: a write with it after the move is refused instead of sealing a value that neither
+    /// the store's key nor the words named in the file open.
+    #[test]
+    fn a_write_with_the_key_from_before_a_rewrap_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let old = ObjectKey::from_bytes(&[1; 16]).unwrap();
+        let new = ObjectKey::from_bytes(&[2; 16]).unwrap();
+        s.write_id(&s.new_id_file("aaaa", &old)).unwrap();
+        s.write("a/one", Mode::StoreKey, &old, "aaaa", b"one", None)
+            .unwrap();
+        crate::migrate::rewrap_one(&crate::migrate::Obj::Store(s.clone()), &old, &new, "bbbb", None).unwrap();
+        assert_eq!(s.read("a/one", &new).unwrap().as_slice(), b"one");
+        // the daemon's session key from before the move
+        let e = s
+            .write("a/two", Mode::StoreKey, &old, "bbbb", b"two", None)
+            .expect_err("refused");
+        assert_eq!(crate::exit::code_of(&e), exit::WRONG_KEY);
+        assert!(!s.exists("a/two"));
+        s.write("a/two", Mode::StoreKey, &new, "bbbb", b"two", None)
+            .unwrap();
+        assert_eq!(s.read("a/two", &new).unwrap().as_slice(), b"two");
+    }
+
+    /// While a rewrap holds the store, a write through the daemon is refused at once (it would
+    /// carry the old key, or land after the rewrap listed the files); after it, writes go on.
+    #[test]
+    fn writes_wait_out_a_rewrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let held = s.lock_rewrap().unwrap();
+        let e = s.lock_writes().err().expect("busy");
+        assert_eq!(crate::exit::code_of(&e), exit::BUSY);
+        drop(held);
+        let w1 = s.lock_writes().unwrap();
+        let _w2 = s.lock_writes().unwrap();
+        drop(w1);
     }
 
     fn names(s: &Store) -> Vec<String> {

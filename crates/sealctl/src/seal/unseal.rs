@@ -893,6 +893,10 @@ impl Ctx<'_> {
     }
 
     fn done(&mut self, kind: &str, name: &str, to: String, obj: hb::Object) -> Result<()> {
+        // a step run again after a stop replaces what its earlier attempt listed
+        self.handback.retain(|h| !(h.kind == kind && h.name == name));
+        self.objects
+            .retain(|o| !(o.kind == obj.kind && o.name == obj.name));
         self.handback.push(HandbackItem {
             kind: kind.into(),
             name: name.into(),
@@ -985,7 +989,11 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         let _ = base;
         return Ok("credentials go with the backup.".into());
     }
-    let b = Backup::load(name)?;
+    let b = match Backup::load(name) {
+        Ok(b) => b,
+        Err(e) => return finished_before(c, "backup", name).ok_or(e),
+    };
+    let _lock = crate::backup::lock_repo(&b.repo)?;
     let key = c.key("backup", &b.repo_id)?;
     let mut env = BTreeMap::new();
     if !b.credentials.is_empty() {
@@ -1063,6 +1071,15 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             )?;
         }
     }
+    // what the hand-back list says of it, also in the journal's `changed` line: a resumed run
+    // that finds the definition gone finishes the step from there
+    let obj = hb::Object {
+        kind: "backup".into(),
+        name: b.name.clone(),
+        url: Some(b.repo.clone()),
+        credentials: creds,
+        ..Default::default()
+    };
     let own = Repo::with_password(&b.repo, pw.clone(), env.clone());
     let opens_already = own.opens().unwrap_or(false);
     // a resumed step whose earlier attempt removed sealctl's key already has nothing to change
@@ -1093,7 +1110,7 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             ));
         }
         own.key_remove(&ours, &new_id)?;
-        c.run.log(&step, "changed", "")?;
+        c.run.log(&step, "changed", &serde_json::to_string(&obj)?)?;
         if derived.opens()? {
             return Err(fail(
                 exit::ERROR,
@@ -1101,29 +1118,31 @@ fn step_backup(c: &mut Ctx<'_>, name: &str) -> Result<String> {
             ));
         }
     }
-    b.forget()?;
-    if Backup::list()?.is_empty() {
-        let _ = crate::backup::schedule_uninstall();
-    }
+    // the hand-back list names it before its definition goes: a resumed run that finds the
+    // definition gone finishes the step from the list
     let to = loc.describe();
     c.done(
         "backup",
         &b.name,
         to,
         hb::Object {
-            kind: "backup".into(),
-            name: b.name.clone(),
-            url: Some(b.repo.clone()),
             password: Some(loc),
-            credentials: creds,
-            ..Default::default()
+            ..obj
         },
     )?;
+    b.forget()?;
+    if Backup::list()?.is_empty() {
+        let _ = crate::backup::schedule_uninstall();
+    }
     Ok("your password works; sealctl's key is removed.".into())
 }
 
 fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
-    let v = Volume::load(name)?;
+    let v = match Volume::load(name) {
+        Ok(v) => v,
+        Err(e) => return finished_before(c, "volume", name).ok_or(e),
+    };
+    let _lock = v.lock()?;
     let key = c.key("volume", &v.id)?;
     let derived = key.hex();
     let was_open = v.is_open();
@@ -1232,13 +1251,31 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
         // the words marker goes with sealctl's key slot (SPEC 18.2)
         volume::luks::remove_tokens(path.as_ref().context("path")?);
     }
-    c.run.log(&step, "changed", "")?;
+    let obj = hb::Object {
+        kind: "volume".into(),
+        name: v.name.clone(),
+        volume: Some(v.kind.as_str().into()),
+        uuid: Some(v.id.clone()),
+        path: v.path.as_ref().map(|p| paths::tilde(p)),
+        ..Default::default()
+    };
+    c.run.log(&step, "changed", &serde_json::to_string(&obj)?)?;
     if opens(derived.as_bytes())? {
         return Err(fail(
             exit::ERROR,
             format!("sealctl's key still opens volume {}.", v.name),
         ));
     }
+    // the hand-back list names it before its definition goes (see `step_backup`)
+    c.done(
+        "volume",
+        &v.name,
+        loc.describe(),
+        hb::Object {
+            password: Some(loc),
+            ..obj
+        },
+    )?;
     match v.kind {
         Kind::Sparsebundle => {
             if let Some(p) = volume::sparsebundle::id_path(&v) {
@@ -1253,22 +1290,44 @@ fn step_volume(c: &mut Ctx<'_>, name: &str) -> Result<String> {
     let _ = std::fs::remove_dir_all(v.mountpoint.join(".sealctl"));
     let cfg = paths::volumes_dir()?.join(format!("{}.toml", v.name));
     let _ = std::fs::remove_file(cfg);
-    let to = loc.describe();
-    c.done(
-        "volume",
-        &v.name,
-        to,
-        hb::Object {
-            kind: "volume".into(),
-            name: v.name.clone(),
-            volume: Some(v.kind.as_str().into()),
-            uuid: Some(v.id.clone()),
-            path: v.path.as_ref().map(|p| paths::tilde(p)),
-            password: Some(loc),
-            ..Default::default()
-        },
-    )?;
     Ok("your passphrase works; sealctl's is removed.".into())
+}
+
+/// A volume or backup step whose definition is gone: done already when an earlier attempt of
+/// this run changed the object (its journal's `changed` line) and then stopped before the
+/// step's `done` line. The hand-back entry comes from the list, or else from the journal: the
+/// object from `changed`, its password's place from `password`. Anything else stays the error
+/// of the missing definition.
+fn finished_before(c: &mut Ctx<'_>, kind: &str, name: &str) -> Option<String> {
+    let step = format!("{kind}:{name}");
+    let changed = c.run.last_note(&step, "changed")?;
+    let listed = c
+        .objects
+        .iter()
+        .find(|o| o.kind == kind && o.name == name)
+        .cloned();
+    let obj = match listed {
+        Some(o) => o,
+        None => {
+            let mut o: hb::Object = serde_json::from_str(&changed).ok()?;
+            let pw = c.run.last_note(&step, "password")?;
+            o.password = Some(serde_json::from_str(&pw).ok()?);
+            o
+        }
+    };
+    if obj.kind != kind || obj.name != name || obj.password.is_none() {
+        return None;
+    }
+    let to = obj.password.as_ref().map(|l| l.describe()).unwrap_or_default();
+    c.done(kind, name, to, obj).ok()?;
+    Some(format!(
+        "done by the earlier attempt; your {} works.",
+        if kind == "volume" {
+            "passphrase"
+        } else {
+            "password"
+        }
+    ))
 }
 
 /// `<key file>.pub`: the name gets `.pub` added, so `work.laptop` has `work.laptop.pub`, never
@@ -1462,6 +1521,17 @@ fn send_report(c: &mut Ctx<'_>) -> bool {
 fn run_step(c: &mut Ctx<'_>, s: &Step) -> Result<String> {
     match s.kind.as_str() {
         "secrets" => {
+            if c.plan.target == Target::Secrets && !c.plan.keep_store {
+                // an earlier attempt handed every value back and moved the store into the run
+                // folder, then stopped before the setting was cleared
+                let mut cfg = crate::config::Config::load()?;
+                let gone = cfg.store_path()?.is_some_and(|d| !d.exists());
+                if gone && c.run.dir.join("kept/store").exists() {
+                    cfg.store = None;
+                    cfg.save()?;
+                    return Ok("handed back by the earlier attempt; the store is in the folder.".into());
+                }
+            }
             let store = Store::configured()?;
             let names: Vec<String> = store.list()?.into_iter().map(|l| l.name).collect();
             let n = hand_back_secrets(c, &store, &names)?;

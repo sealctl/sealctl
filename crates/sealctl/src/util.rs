@@ -202,6 +202,43 @@ fn clear_script(secs: u64, paste: &str, hash: &str, copy: &str) -> String {
     )
 }
 
+/// A lock on one object (a volume, a restic repository) among sealctl's long operations on
+/// this machine: `seal`, `unseal`, `migrate` (rewrap and re-encryption) and `backup run` each
+/// hold it while they change or write the object, so two of them never interleave on it. An
+/// exclusive `flock` on `<state>/locks/<hash of key>.lock`, released when the value drops (or
+/// the process ends). Never waits: a second command is told the object is busy (exit 11).
+pub struct ObjectLock {
+    _f: nix::fcntl::Flock<std::fs::File>,
+}
+
+/// Takes the [`ObjectLock`] of `key` (a canonical path, or `<kind>:<id>`); `what` names the
+/// object in the message.
+pub fn object_lock(key: &str, what: &str) -> Result<ObjectLock> {
+    let dir = crate::paths::state_dir()?.join("locks");
+    crate::paths::ensure_private_dir(&dir)?;
+    let name = &sha256_hex(key.as_bytes())[..24];
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{name}.lock")))?;
+    let f = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(|_| {
+        crate::exit::fail(
+            crate::exit::BUSY,
+            format!("{what} is busy: another sealctl command is changing it. Try again once it ends."),
+        )
+    })?;
+    Ok(ObjectLock { _f: f })
+}
+
+/// The [`object_lock`] key of a file or folder: its canonical path.
+pub fn path_key(p: &std::path::Path) -> String {
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(data)

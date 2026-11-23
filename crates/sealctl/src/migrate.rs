@@ -101,6 +101,8 @@ pub fn rewrap_one(
 ) -> Result<()> {
     match obj {
         Obj::Store(store) => {
+            // no write through a session's old key between the listing and the new `.id`
+            let _lock = store.lock_rewrap()?;
             for l in store.list()? {
                 let h = store.header(&l.name)?;
                 if h.mode != Mode::StoreKey {
@@ -111,7 +113,7 @@ pub fn rewrap_one(
                     continue;
                 }
                 let v = store.read(&l.name, old)?;
-                store.write(&l.name, Mode::StoreKey, new, fp, &v, Some(&h.file_id))?;
+                store.write_moved(&l.name, Mode::StoreKey, new, fp, &v, Some(&h.file_id))?;
             }
             let mut f = store.id_file()?.context("store .id")?;
             f.words = fp.into();
@@ -120,6 +122,7 @@ pub fn rewrap_one(
         }
         Obj::Own(id, name) => {
             let store = Store::configured()?;
+            let _lock = store.lock_rewrap()?;
             if store.read(name, new).is_err() {
                 let v = store.read(name, old)?;
                 store.write(name, Mode::OwnApproval, new, fp, &v, Some(id))?;
@@ -127,6 +130,7 @@ pub fn rewrap_one(
             store.add_own_check(id, &new.check())
         }
         Obj::Volume(v) => {
+            let _lock = v.lock()?;
             let (o, n) = (old.hex(), new.hex());
             match v.kind {
                 Kind::Sparsebundle => {
@@ -175,6 +179,7 @@ pub fn rewrap_one(
             nv.save()
         }
         Obj::Backup(b) => {
+            let _lock = crate::backup::lock_repo(&b.repo)?;
             let names = b.credential_names();
             let env = match store_old {
                 Some(k) if !names.is_empty() => {
@@ -412,6 +417,10 @@ pub struct JobItem {
     /// The last note.
     #[serde(default)]
     pub note: String,
+    /// The repository the backup had when its new id was made: removed (a folder) only once the
+    /// definition names the new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old: Option<String>,
 }
 
 fn job_path() -> Result<PathBuf> {
@@ -444,9 +453,34 @@ fn save_progress(j: &Job) -> Result<()> {
 }
 
 fn save_progress_at(p: &Path, j: &Job) -> Result<()> {
+    let _held = lock_job_file(p)?;
     let mut j = j.clone();
     j.request = load_job_at(p).and_then(|d| d.request);
     save_job_at(p, &j)
+}
+
+/// `sealctl migrate --pause|--cancel|--resume`: the request on file, the runner's item states
+/// as they are. Read and written under the job file's lock, as the runner's saves are, so a
+/// runner's save in between is never overwritten with the item states read before it.
+fn set_request_at(p: &Path, request: Option<String>) -> Result<Job> {
+    let _held = lock_job_file(p)?;
+    let mut j = load_job_at(p).ok_or_else(|| fail(exit::NOT_FOUND, "No re-encryption job."))?;
+    j.request = request;
+    save_job_at(p, &j)?;
+    Ok(j)
+}
+
+/// The lock around a read and write of `migrate.json` (`migrate.json.lock`); waits, briefly.
+fn lock_job_file(p: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    let dir = p.parent().context("state")?;
+    paths::ensure_private_dir(dir)?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("migrate.json.lock"))?;
+    nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| anyhow::anyhow!("locking the re-encryption job: {e}"))
 }
 
 /// One runner at a time: an exclusive lock on `migrate.lock`, held until the process exits.
@@ -597,9 +631,7 @@ pub fn run(o: Opts) -> Result<()> {
         return run_job();
     }
     if let Some(c) = o.control {
-        let mut j = load_job().ok_or_else(|| fail(exit::NOT_FOUND, "No re-encryption job."))?;
-        j.request = if c == "resume" { None } else { Some(c.clone()) };
-        save_job(&j)?;
+        let j = set_request_at(&job_path()?, if c == "resume" { None } else { Some(c.clone()) })?;
         if c == "resume" && j.items.iter().any(|i| i.state != "done" && i.state != "skipped") {
             start_job(false)?;
         }
@@ -662,6 +694,7 @@ pub fn run(o: Opts) -> Result<()> {
             state: "waiting".into(),
             new_id: String::new(),
             note: String::new(),
+            old: None,
         })
         .collect();
     if candidates.is_empty() {
@@ -810,6 +843,8 @@ fn new_key(kind: &str, id: &str, path: String) -> Result<(ObjectKey, String)> {
 
 fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
     let v = Volume::load(&job.items[i].name)?;
+    // nothing else changes, opens or backs up from the bundle while it is copied and swapped
+    let _lock = v.lock()?;
     let old_path = v.path.clone().context("bundle path")?;
     if job.items[i].new_id.is_empty() {
         job.items[i].new_id = util::new_uuid()?;
@@ -1027,9 +1062,19 @@ fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
     let b = Backup::load(&job.items[i].name)?;
     if job.items[i].new_id.is_empty() {
         job.items[i].new_id = util::new_uuid()?;
+        job.items[i].old = Some(b.repo.clone());
         save_progress(job)?;
     }
     let new_id = job.items[i].new_id.clone();
+    if b.repo_id == new_id {
+        // an earlier run saved the definition on the new repository and stopped before the job
+        // noted it: only the old repository may be left to remove
+        let old = job.items[i].old.clone();
+        let _lock = old.as_deref().map(crate::backup::lock_repo).transpose()?;
+        return remove_old_repo(&b, old.as_deref());
+    }
+    // no backup run, rewrap or unseal of this repository while it is copied
+    let _lock = crate::backup::lock_repo(&b.repo)?;
     let new_url = sibling_repo(&b.repo, &new_id).ok_or_else(|| fail(exit::USAGE, no_place_note(&b.repo)))?;
     let (mut keys, _) = crate::daemon::client::keys(&[b.request_item()], Some(("backup", &b.name)))?;
     let old_key = keys.remove(0);
@@ -1061,23 +1106,44 @@ fn reencrypt_backup(job: &mut Job, i: usize) -> Result<String> {
     run_two(&["copy"])?;
     let out = newr.output(&["check"])?;
     util::check(out, "restic check")?;
-    // the old repository goes: a folder is removed; other back ends are listed for the person
-    let note = if !b.repo.contains(':') && Path::new(&b.repo).is_dir() {
-        std::fs::remove_dir_all(&b.repo)?;
-        "copied to a new repository; the old one is removed".to_string()
-    } else {
-        format!(
-            "copied to {new_url}; delete the old repository {} in its provider's console",
-            b.repo
-        )
-    };
+    if job.items[i].old.is_none() {
+        job.items[i].old = Some(b.repo.clone());
+        save_progress(job)?;
+    }
+    // the definition names the new repository before the old one goes: a stop in between
+    // leaves both, and the resumed job only removes the old one
     let mut nb = b.clone();
     nb.repo = new_url;
     nb.repo_id = new_id;
     nb.words = fp;
     nb.check = key.check();
     nb.save()?;
-    Ok(note)
+    crate::seal::journal::test_kill("reencrypt-backup", "saved");
+    remove_old_repo(&nb, Some(&b.repo))
+}
+
+/// Removes the repository a backup had before its re-encryption: a folder is removed, other
+/// back ends are named for the person. Never the one the definition names now. The caller
+/// holds the old repository's lock.
+fn remove_old_repo(b: &Backup, old: Option<&str>) -> Result<String> {
+    let Some(old) = old.filter(|o| *o != b.repo) else {
+        return Ok("copied to a new repository".into());
+    };
+    if !old.contains(':') && Path::new(old).is_dir() {
+        let same = std::fs::canonicalize(old).ok() == std::fs::canonicalize(&b.repo).ok();
+        if same {
+            return Ok("copied to a new repository".into());
+        }
+        std::fs::remove_dir_all(old)?;
+        Ok("copied to a new repository; the old one is removed".to_string())
+    } else if !old.contains(':') {
+        Ok("copied to a new repository; the old one is removed".to_string())
+    } else {
+        Ok(format!(
+            "copied to {}; delete the old repository {old} in its provider's console",
+            b.repo
+        ))
+    }
 }
 
 /// Why a backup is left out of re-encryption: no place for a new repository beside it.
@@ -1364,6 +1430,7 @@ mod tests {
             state: state.into(),
             new_id: String::new(),
             note: String::new(),
+            old: None,
         };
         for asked in ["pause", "cancel"] {
             // `sealctl migrate --pause` while the item runs
@@ -1388,6 +1455,45 @@ mod tests {
             assert_eq!(on_file.request.as_deref(), Some(asked));
             assert_eq!(on_file.items[0].state, "done");
         }
+    }
+
+    /// `--pause` between the runner's read and its save of an item's end: the item's end is
+    /// kept, and so is the pause. The control waits for a save under way (the lock held here,
+    /// as the runner holds it), and never writes back the item states it read before it.
+    #[test]
+    fn a_pause_never_writes_back_old_item_states() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state").join("migrate.json");
+        let item = |state: &str| JobItem {
+            kind: "backup".into(),
+            name: "b".into(),
+            state: state.into(),
+            new_id: "n".into(),
+            note: String::new(),
+            old: None,
+        };
+        save_job_at(
+            &p,
+            &Job {
+                items: vec![item("running")],
+                request: None,
+            },
+        )
+        .unwrap();
+        let held = lock_job_file(&p).unwrap();
+        let p2 = p.clone();
+        let control = std::thread::spawn(move || set_request_at(&p2, Some("pause".into())).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!control.is_finished(), "the control waits for the save under way");
+        // the runner's save, under its lock
+        let mut j = load_job_at(&p).unwrap();
+        j.items[0].state = "done".into();
+        save_job_at(&p, &j).unwrap();
+        drop(held);
+        control.join().unwrap();
+        let on_file = load_job_at(&p).unwrap();
+        assert_eq!(on_file.items[0].state, "done");
+        assert_eq!(on_file.request.as_deref(), Some("pause"));
     }
 
     #[test]

@@ -1046,6 +1046,8 @@ impl Daemon {
             Some(k) => k,
             None => self.session_store_key()?,
         };
+        // never while `migrate` moves the store to new words (the key may be the old one)
+        let _writing = store.lock_writes()?;
         let words = store.id_file()?.map(|f| f.words).unwrap_or_default();
         match action {
             "set" => {
