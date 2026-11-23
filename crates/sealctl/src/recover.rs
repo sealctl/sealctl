@@ -86,6 +86,9 @@ enum Target {
     Store(PathBuf),
     Sealed(PathBuf, String),
     Bundle(PathBuf),
+    Luks(PathBuf),
+    /// An APFS volume: its UUID in lower case, and its mount point when mounted.
+    Apfs(String, Option<String>),
     Restic(String),
 }
 
@@ -130,13 +133,69 @@ fn classify(target: &str) -> Result<Target> {
             .ok_or_else(|| fail(exit::NOT_FOUND, "This .sealed file is not inside a store folder."))?;
         return Ok(Target::Sealed(store, name));
     }
+    if p.is_file() && crate::volume::luks::is_luks(p) {
+        return Ok(Target::Luks(std::fs::canonicalize(p)?));
+    }
     if target.contains(':') && !p.exists() {
         return Ok(Target::Restic(target.to_string()));
     }
+    if !p.exists() && looks_like_apfs(target) {
+        if !cfg!(target_os = "macos") {
+            return Err(fail(
+                exit::NOT_FOUND,
+                format!("{target}: APFS volumes open on macOS only."),
+            ));
+        }
+        if let Some((uuid, mp)) = crate::volume::apfs::find(target)? {
+            return Ok(Target::Apfs(uuid, mp));
+        }
+        return Err(fail(
+            exit::NOT_FOUND,
+            format!("No APFS volume {target}. Is its disk connected? See diskutil apfs list."),
+        ));
+    }
     Err(fail(
         exit::NOT_FOUND,
-        format!("{target} is not a store, .sealed file, sparse bundle or restic repository."),
+        format!(
+            "{target} is not a store, .sealed file, sparse bundle, LUKS file, APFS volume or \
+             restic repository."
+        ),
     ))
+}
+
+/// A volume UUID (any case) or a disk identifier (`disk3s5`, `/dev/disk3s5`).
+fn looks_like_apfs(target: &str) -> bool {
+    let t = target.strip_prefix("/dev/").unwrap_or(target);
+    sealctl_core::ids::parse_uuid(&t.to_lowercase()).is_some()
+        || t.strip_prefix("disk").is_some_and(|r| {
+            r.split_once('s').is_some_and(|(d, s)| {
+                !d.is_empty()
+                    && !s.is_empty()
+                    && d.bytes().all(|b| b.is_ascii_digit())
+                    && s.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+}
+
+/// A mount point for a recovered LUKS file: `~/Vaults/<file name without .luks>`, which must be
+/// missing or an empty folder.
+fn luks_mountpoint(file: &Path) -> Result<PathBuf> {
+    let stem = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "recovered".into());
+    let mp = paths::home()?.join("Vaults").join(stem);
+    if mp.exists() && std::fs::read_dir(&mp).map_or(true, |mut d| d.next().is_some()) {
+        return Err(fail(
+            exit::USAGE,
+            format!(
+                "{} is in use (not an empty folder). Move it away, then run this again.",
+                mp.display()
+            ),
+        ));
+    }
+    Ok(mp)
 }
 
 fn read_id_file(p: &Path) -> Result<IdFile> {
@@ -259,6 +318,64 @@ pub fn recover(
             let mp = mounts.into_iter().find(|m| !m.is_empty()).unwrap_or_default();
             println!("{mp}");
             eprintln!("Mounted. Eject with: diskutil eject {mp}");
+            Ok(())
+        }
+        Target::Luks(file) => {
+            use crate::volume::luks;
+            // the id is the LUKS UUID; the token, when it is there, names the words and check
+            let id = luks::uuid_of(&file)?;
+            let marker = luks::read_marker(&file);
+            let mapper = format!("sealctl-recover-{}", &id[..8.min(id.len())]);
+            if Path::new("/dev/mapper").join(&mapper).exists() {
+                return Err(fail(
+                    exit::BUSY,
+                    format!("{} is open already (/dev/mapper/{mapper}).", file.display()),
+                ));
+            }
+            let mp = luks_mountpoint(&file)?;
+            let root = read_root()?;
+            if let Some(m) = &marker {
+                check_fingerprint(&root, &m.words)?;
+            }
+            let check = marker.as_ref().map(|m| m.check.as_str());
+            let key = derive_checked(&root, Purpose::Volume, &id, check)?;
+            if !luks::verify(&file, key.hex().as_bytes())? {
+                return Err(fail(
+                    exit::WRONG_KEY,
+                    "The key from these words does not open this volume.",
+                ));
+            }
+            luks::open_at(&file, &mapper, &mp, key.hex().as_bytes())?;
+            println!("{}", mp.display());
+            eprintln!(
+                "Mounted. Close with: sudo umount {} && sudo cryptsetup close {mapper}",
+                mp.display()
+            );
+            Ok(())
+        }
+        Target::Apfs(uuid, Some(mp)) => {
+            println!("{mp}");
+            eprintln!("Mounted already. Lock with: diskutil apfs lockVolume {uuid}");
+            Ok(())
+        }
+        Target::Apfs(uuid, None) => {
+            use crate::volume::apfs;
+            // the id is the volume UUID; the passphrase hint names the words
+            let words = apfs::hint_words(&uuid)?;
+            let root = read_root()?;
+            if let Some(w) = &words {
+                check_fingerprint(&root, w)?;
+            }
+            let key = derive_checked(&root, Purpose::Volume, &uuid, None)?;
+            if !apfs::verify(&uuid, key.hex().as_bytes())? {
+                return Err(fail(
+                    exit::WRONG_KEY,
+                    "The key from these words does not open this volume.",
+                ));
+            }
+            let mp = apfs::unlock_uuid(&uuid, key.hex().as_bytes())?;
+            println!("{mp}");
+            eprintln!("Mounted. Lock with: diskutil apfs lockVolume {uuid}");
             Ok(())
         }
         Target::Restic(url) => {

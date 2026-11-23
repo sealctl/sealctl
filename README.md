@@ -160,6 +160,8 @@ Delete the folder once the new passwords work. `--to keychain|op|bw|show` and
 ```sh
 sealctl recover ~/.local/share/sealctl/store/<store-id> --out ~/recovered
 sealctl recover ~/Vaults/work.sparsebundle
+sealctl recover ~/Vaults/safe.luks         # Linux: mounted at ~/Vaults/safe
+sealctl recover <APFS volume UUID>         # macOS: see diskutil apfs list
 sealctl recover s3:https://…/<repo-id> -- snapshots
 ```
 
