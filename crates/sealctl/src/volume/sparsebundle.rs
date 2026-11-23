@@ -192,6 +192,13 @@ impl Backend for Sparsebundle {
         Ok(!attachments(path)?.is_empty())
     }
 
+    fn is_mounted(&self, v: &Volume) -> Result<bool> {
+        let path = v.path.as_ref().context("sparsebundle needs a path")?;
+        Ok(attached_mounts(path)?
+            .iter()
+            .any(|m| super::same_path(std::path::Path::new(m), &v.mountpoint)))
+    }
+
     fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()> {
         let path = v.path.as_ref().context("sparsebundle needs a path")?;
         let mut input = Zeroizing::new(Vec::with_capacity(old.len() + new.len() + 2));

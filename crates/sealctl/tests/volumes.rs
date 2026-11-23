@@ -210,6 +210,55 @@ fn sparse_bundle_volume_with_backup_lock_and_unseal() {
     }
 }
 
+/// `volume open` succeeds only when the volume is mounted at its mount point: a bundle left
+/// attached but not mounted is reported, not taken for an open volume with an empty mount point.
+#[cfg(target_os = "macos")]
+#[test]
+fn volume_open_of_a_bundle_attached_but_not_mounted_says_so() {
+    let mut env = Env::new();
+    env.pair();
+    let bundle = env.h().join("u.sparsebundle");
+    let mnt = env.h().join("mnt/u");
+    let marker = canary();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&[
+            "volume",
+            "create",
+            "u",
+            "--kind",
+            "sparsebundle",
+            "--size",
+            "32m",
+            "--path",
+            bundle.to_str().unwrap(),
+            "--mountpoint",
+            mnt.to_str().unwrap(),
+        ])
+    });
+    assert_eq!(code, 0, "{err}");
+    std::fs::write(mnt.join("keep.txt"), &marker).unwrap();
+    // the file system unmounted, the image still attached
+    let out = Command::new("diskutil")
+        .arg("unmount")
+        .arg(&mnt)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!mnt.join("keep.txt").exists());
+    let ((code, out, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "u"]));
+    assert_ne!(code, 0, "an empty mount point is not an open volume: {out}");
+    assert!(err.contains("not mounted at"), "{err}");
+    // closed and opened again, its files are there
+    let (code, _, err) = env.run(&["volume", "close", "u"]);
+    assert_eq!(code, 0, "{err}");
+    let ((code, out, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "u"]));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), mnt.to_str().unwrap());
+    assert_eq!(std::fs::read_to_string(mnt.join("keep.txt")).unwrap(), marker);
+    let (code, _, err) = env.run(&["volume", "close", "u"]);
+    assert_eq!(code, 0, "{err}");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn seal_an_existing_sparse_bundle_and_restic_repository() {
