@@ -35,6 +35,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   `backup run` exits 11 when every backup that failed was busy, and never writes a snapshot
   into a repository that is being re-encrypted or handed back. `volume open` finds a volume
   another command just mounted, or waits a minute for its lock.
+- `volume open` succeeds only when the volume is mounted at its mount point. A sparse bundle
+  attached, or a LUKS volume decrypted, but not mounted there is reported (exit 1) instead of
+  leaving an empty mount point, and a volume another command is still mounting is waited for.
 - The secret store has a write lock on the machine: a store move to new words waits up to a
   minute for writes under way, a write during the move is refused at once (exit 11), and a
   session that still holds the old key cannot write under it.

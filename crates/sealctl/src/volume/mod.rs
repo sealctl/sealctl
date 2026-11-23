@@ -106,6 +106,12 @@ pub trait Backend {
     fn lock(&self, v: &Volume, force: bool) -> Result<()>;
     /// Mounted?
     fn is_unlocked(&self, v: &Volume) -> Result<bool>;
+    /// Mounted at its mount point, so its files are there. A sparse bundle or LUKS volume can
+    /// be unlocked without that: attached or decrypted but not mounted (yet), or mounted
+    /// elsewhere.
+    fn is_mounted(&self, v: &Volume) -> Result<bool> {
+        self.is_unlocked(v)
+    }
     /// Replaces the passphrase.
     fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()>;
     /// Destroys the encrypted data.
@@ -211,6 +217,11 @@ impl Volume {
     /// Mounted?
     pub fn is_open(&self) -> bool {
         backend(self.kind).is_unlocked(self).unwrap_or(false)
+    }
+
+    /// Mounted at its mount point ([`Backend::is_mounted`]).
+    pub fn is_mounted(&self) -> bool {
+        backend(self.kind).is_mounted(self).unwrap_or(false)
     }
 
     /// The `keys` item for its key.
@@ -421,9 +432,10 @@ pub fn open_with(vol: &Volume, key: &ObjectKey, wait: Option<std::time::Duration
     let _lock = match vol.lock() {
         Ok(l) => l,
         // another open (the daemon mounting the session's volumes) may have it mounted by now;
-        // a mount takes seconds, a change of the volume longer
+        // a mount takes seconds, a change of the volume longer. Attached is not enough: the
+        // other open may not have mounted it yet
         Err(e) if exit::code_of(&e) == exit::BUSY => {
-            if be.is_unlocked(vol).unwrap_or(false) {
+            if be.is_mounted(vol).unwrap_or(false) {
                 return Ok(());
             }
             match wait {
@@ -434,7 +446,20 @@ pub fn open_with(vol: &Volume, key: &ObjectKey, wait: Option<std::time::Duration
         Err(e) => return Err(e),
     };
     if be.is_unlocked(vol)? {
-        return Ok(());
+        if be.is_mounted(vol)? {
+            return Ok(());
+        }
+        // no open is under way (this command holds the lock): attached or decrypted, but not
+        // mounted at its mount point
+        return Err(exit::fail(
+            exit::ERROR,
+            format!(
+                "Volume {} is open but not mounted at {}. Close it (sealctl volume close {}), then open it again.",
+                vol.name,
+                vol.mountpoint.display(),
+                vol.name
+            ),
+        ));
     }
     be.unlock(vol, key.hex().as_bytes())?;
     write_inner_id(vol);

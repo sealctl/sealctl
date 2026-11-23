@@ -243,6 +243,10 @@ impl Backend for Luks {
     fn is_unlocked(&self, v: &Volume) -> Result<bool> {
         Ok(is_mounted(&v.mountpoint)? || mapper_open(v))
     }
+
+    fn is_mounted(&self, v: &Volume) -> Result<bool> {
+        is_mounted(&v.mountpoint)
+    }
 }
 
 fn users_uid() -> String {
