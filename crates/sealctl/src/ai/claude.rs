@@ -34,6 +34,17 @@ pub const DENY: &[&str] = &[
     "Read(**/*.sealed)",
     "Read(~/.config/sealctl/machine.json)",
     "Read(~/.local/state/sealctl/**)",
+    // Claude Code also leaves the files that Read rules name out of Grep and Glob, so a search
+    // across a folder skips them; `.env.example` and the like stay readable
+    "Read(**/.env)",
+    "Read(**/.envrc)",
+    "Read(**/.env.local)",
+    "Read(**/.env.*.local)",
+    "Read(**/.env.development)",
+    "Read(**/.env.production)",
+    "Read(**/.env.prod)",
+    "Read(**/.env.staging)",
+    "Read(**/.env.test)",
 ];
 
 const MARKER: &str = " hook claude";

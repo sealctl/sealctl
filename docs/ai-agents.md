@@ -55,7 +55,9 @@ program gets the key while the agent sees only `****`.
 3. **Skill and deny rules** — the `sealctl-secrets` skill (open SKILL.md format) explains the
    workflow; deny rules block the dangerous sealctl commands where the agent supports them
    (`secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `aws credentials`,
-   `git credential`, and `git credential fill`). The skill never mentions the price.
+   `git credential`, and `git credential fill`). In Claude Code and Qwen Code they also cover
+   reading `.env`, `.env.local`, `.env.production` and the like, which keeps those files out of
+   a folder-wide search as well. The skill never mentions the price.
 
 What needs which layer: the refusals in layer 1 hold with no setup, in every agent. Everything
 in layers 2 and 3 — `.env` reads, environment dumps, `echo $KEY`, clipboard reads,

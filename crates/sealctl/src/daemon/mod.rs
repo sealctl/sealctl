@@ -864,7 +864,8 @@ impl Daemon {
             )
             .await;
             match r {
-                Ok(Ok(Ok(()))) => lines.push(format!("Backed up {name}.")),
+                Ok(Ok(Ok(None))) => lines.push(format!("Backed up {name}.")),
+                Ok(Ok(Ok(Some(warning)))) => lines.push(format!("Backed up {name} ({warning}).")),
                 _ => lines.push(format!(
                     "Backup {name} failed; run sealctl backup run {name} later."
                 )),
