@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Changed
+
+- `sealctl run` also masks values printed as hex, in lower or upper case, alongside the raw,
+  base64, base64url and URL-encoded forms.
+- A leak test stores a canary and checks that none of those forms reaches the output of
+  `sealctl run`, `daemon.log`, or any file in the config, state and data folders.
+
 ## 0.7.0 - 2026-11-23
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes

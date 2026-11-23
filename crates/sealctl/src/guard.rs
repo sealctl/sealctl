@@ -232,10 +232,11 @@ fn percent(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Replaces secret values in a byte stream with `****`: as-is, base64 (e.g. HTTP Basic auth
-/// headers, which also hide `user:value` — that combination is not detected) and URL-encoded;
-/// also when a value is split across reads or overlaps another. Values shorter than 6 bytes
-/// are not masked (too many false hits).
+/// Replaces secret values in a byte stream with `****`: as-is, base64 and base64url (e.g. HTTP
+/// Basic auth headers, which also hide `user:value` — that combination is not detected),
+/// URL-encoded, and hex in lower or upper case (hex dumps, binary tooling); also when a value is
+/// split across reads or overlaps another. Values shorter than 6 bytes are not masked (too many
+/// false hits).
 pub struct Masker {
     secrets: Vec<Vec<u8>>,
     keep: usize,
@@ -256,6 +257,8 @@ impl Masker {
             if p != v {
                 secrets.push(p);
             }
+            secrets.push(hex::encode(&v).into_bytes());
+            secrets.push(hex::encode_upper(&v).into_bytes());
             secrets.push(v);
         }
         secrets.sort();
@@ -425,6 +428,20 @@ mod tests {
         assert_eq!(run(&[token], basic.as_bytes(), 10), "Authorization: Basic ****");
         let url = format!("https://x/?t={}", String::from_utf8(percent(token)).unwrap());
         assert_eq!(run(&[token], url.as_bytes(), 5), "https://x/?t=****");
+    }
+
+    #[test]
+    fn hex_forms_are_masked() {
+        let token: &[u8] = b"ghp_token-value/with+chars";
+        let lower: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        let upper = lower.to_ascii_uppercase();
+        for (form, split) in [(&lower, 7), (&upper, 30)] {
+            let line = format!("dump: {form} end");
+            assert_eq!(run(&[token], line.as_bytes(), split), "dump: **** end", "{form}");
+        }
+        // mixed case is not a form a program prints; it passes as it is
+        let mixed = format!("{}{}", &lower[..10], &upper[10..]);
+        assert_eq!(run(&[token], mixed.as_bytes(), 3), mixed);
     }
 
     #[test]
