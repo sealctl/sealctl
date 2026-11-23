@@ -1121,10 +1121,11 @@ fn resume_while_the_runner_ends_is_taken_over() {
         "stopped",
         "nothing runs beside the runner"
     );
-    // the runner ends (on the pause it saw)
+    // the runner ends (on the pause it saw); the waiting runner takes the job over, and the
+    // item goes from stopped through running to its end
     drop(held);
     let start = Instant::now();
-    while read()["items"][0]["state"] == "stopped" {
+    while matches!(read()["items"][0]["state"].as_str(), Some("stopped" | "running")) {
         assert!(
             start.elapsed() < Duration::from_secs(30),
             "the job was taken over: {}",
