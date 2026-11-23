@@ -48,8 +48,16 @@ pub fn hard_stop_in(first_open: u64, tz: &TimeZone) -> u64 {
     let first_day = start.to_zoned(tz.clone()).date();
     let mut day = first_day;
     for _ in 0..3 {
-        // 02:00 that day; in a DST gap, jiff takes the time just after it
-        if let Ok(t) = day.at(2, 0, 0, 0).to_zoned(tz.clone()) {
+        // 02:00 that day. In a DST gap it does not exist: the moment the clock jumps past it.
+        // In a fold it comes twice: the first of the two after the first open.
+        let two = tz.to_ambiguous_zoned(day.at(2, 0, 0, 0));
+        let times = match two.offset() {
+            jiff::tz::AmbiguousOffset::Fold { .. } => {
+                vec![two.clone().earlier(), two.later()]
+            }
+            _ => vec![two.compatible()],
+        };
+        for t in times.into_iter().flatten() {
             let ms = t.timestamp().as_millisecond();
             if ms > first_open as i64 {
                 return (ms as u64).min(fourteen);
@@ -202,6 +210,52 @@ mod tests {
             let want = (two.timestamp().as_millisecond() as u64).min(t0 + 14 * 3600 * 1000);
             assert!(want > t0 && want <= t0 + 14 * 3600 * 1000, "{tz}");
         }
+    }
+
+    #[test]
+    fn hard_stop_across_daylight_saving_changes() {
+        let Ok(warsaw) = jiff::tz::TimeZone::get("Europe/Warsaw") else {
+            return;
+        };
+        let ms = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_millisecond() as u64;
+        // autumn: 02:00 to 02:59 come twice (03:00 CEST back to 02:00 CET). Opened at 02:30
+        // CEST, the next 02:00 is the second one, half an hour later.
+        assert_eq!(
+            hard_stop_in(ms("2026-10-25T00:30:00Z"), &warsaw),
+            ms("2026-10-25T01:00:00Z")
+        );
+        // opened the evening before: the first 02:00 (CEST)
+        assert_eq!(
+            hard_stop_in(ms("2026-10-24T18:00:00Z"), &warsaw),
+            ms("2026-10-25T00:00:00Z")
+        );
+        // spring: 02:00 does not exist; the stop is when the clock jumps to 03:00 CEST
+        assert_eq!(
+            hard_stop_in(ms("2026-03-28T20:00:00Z"), &warsaw),
+            ms("2026-03-29T01:00:00Z")
+        );
+        // opened right after the jump: the next night, or 14 hours
+        assert_eq!(
+            hard_stop_in(ms("2026-03-29T01:00:00Z"), &warsaw),
+            ms("2026-03-29T15:00:00Z")
+        );
+        if let Ok(la) = jiff::tz::TimeZone::get("America/Los_Angeles") {
+            // 01:00 to 01:59 come twice there; 02:00 PST once
+            assert_eq!(
+                hard_stop_in(ms("2026-11-01T08:30:00Z"), &la),
+                ms("2026-11-01T10:00:00Z")
+            );
+        }
+        // opened exactly at 02:00: the next 02:00 is a day away, so 14 hours
+        assert_eq!(
+            hard_stop_in(ms("2027-01-15T01:00:00Z"), &warsaw),
+            ms("2027-01-15T15:00:00Z")
+        );
+        // a minute before 02:00: one minute
+        assert_eq!(
+            hard_stop_in(ms("2027-01-15T00:59:00Z"), &warsaw),
+            ms("2027-01-15T01:00:00Z")
+        );
     }
 
     #[test]

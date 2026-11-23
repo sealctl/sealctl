@@ -407,7 +407,7 @@ async fn a_session_grant_answered_after_a_lock_is_not_kept_for_the_next_session(
     open(&d, &store_items()).await;
     let vol = item("volume", "fa5a93d5-28d9-4c08-b608-c2b6f344b4d8");
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    d.t.answer(testing::session_reply(&[vol.clone()]), Some(gate.clone()));
+    d.t.answer(testing::session_reply(std::slice::from_ref(&vol)), Some(gate.clone()));
     let asking = tokio::spawn({
         let d = d.clone();
         let vol = vol.clone();
