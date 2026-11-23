@@ -57,8 +57,8 @@ pub fn run_with_fds(
         }));
     }
     if let Some(d) = stdin_data {
-        let mut stdin = child.stdin.take().context("stdin")?;
-        stdin.write_all(d)?;
+        let stdin = child.stdin.take().context("stdin")?;
+        write_stdin(stdin, d)?;
     }
     let out = child.wait_with_output()?;
     for t in threads {
@@ -87,12 +87,20 @@ pub fn run_with_stdin(cmd: &mut Command, stdin_data: &[u8]) -> Result<std::proce
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("starting {name}"))?;
-    {
-        let mut stdin = child.stdin.take().context("stdin")?;
-        stdin.write_all(stdin_data)?;
-    }
+    let stdin = child.stdin.take().context("stdin")?;
+    write_stdin(stdin, stdin_data)?;
     let out = child.wait_with_output()?;
     Ok(out)
+}
+
+/// Writes a child's stdin and closes it. A child that exits without reading it all (a refused
+/// `sudo -n`, a tool that fails early) is not an error here: the caller then sees its exit status
+/// and stderr from `wait_with_output` instead of a broken pipe.
+fn write_stdin(mut stdin: std::process::ChildStdin, data: &[u8]) -> Result<()> {
+    match stdin.write_all(data) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Run `cmd` and fail with its stderr when it exits non-zero.
@@ -149,28 +157,49 @@ pub fn copy_to_clipboard_with_clear(text: &str, secs: u64) -> Result<()> {
     } else {
         bail!("no clipboard tool found (install wl-clipboard or xclip)");
     };
+    // checked before copying: without a hash tool the clear below could never match
+    let hash = clipboard_hash_tool()?;
     check(
         run_with_stdin(Command::new(copy[0]).args(&copy[1..]), text.as_bytes())?,
         "clipboard",
     )?;
 
-    // Detached shell clears the clipboard later if it still holds our value.
-    // The comparison uses a hash so the secret itself is not on any command line.
+    // Detached shell clears the clipboard later if it still holds our value. It compares
+    // hashes, and reads ours from its stdin, so neither the value nor its hash is on any
+    // command line.
     let digest = sha256_hex(text.as_bytes());
-    let script = format!(
-        "sleep {secs}; cur=$({paste} | shasum -a 256 | cut -d' ' -f1); \
-         [ \"$cur\" = \"{digest}\" ] && printf '' | {copy}",
-        paste = paste.join(" "),
-        copy = copy.join(" "),
-    );
-    Command::new("sh")
+    let script = clear_script(secs, &paste.join(" "), hash, &copy.join(" "));
+    let mut child = Command::new("sh")
         .args(["-c", &script])
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("scheduling clipboard clear")?;
+    let stdin = child.stdin.take().context("stdin")?;
+    write_stdin(stdin, format!("{digest}\n").as_bytes()).context("scheduling clipboard clear")?;
     Ok(())
+}
+
+/// The SHA-256 tool for the delayed clipboard clear: `sha256sum` (coreutils), else
+/// `shasum -a 256` (Perl; always on macOS).
+fn clipboard_hash_tool() -> Result<&'static str> {
+    if which("sha256sum") {
+        Ok("sha256sum")
+    } else if which("shasum") {
+        Ok("shasum -a 256")
+    } else {
+        bail!("cannot clear the clipboard later: neither sha256sum nor shasum is installed")
+    }
+}
+
+/// The shell script that clears the clipboard after `secs` seconds if it still holds the value
+/// whose SHA-256 (hex) arrives as the first line on stdin.
+fn clear_script(secs: u64, paste: &str, hash: &str, copy: &str) -> String {
+    format!(
+        "read -r want; sleep {secs}; cur=$({paste} | {hash} | cut -d' ' -f1); \
+         [ -n \"$want\" ] && [ \"$cur\" = \"$want\" ] && printf '' | {copy}"
+    )
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -368,6 +397,48 @@ mod fd_tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("run_with_fds hung on an unread pipe");
         assert_eq!(code, Some(3));
+    }
+
+    /// A child that exits before reading its stdin: its own status and stderr come back.
+    #[test]
+    fn a_child_that_does_not_read_stdin_reports_its_own_error() {
+        let big = vec![b'x'; 4 << 20];
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "echo refused >&2; exit 4"]);
+        let out = run_with_stdin(&mut c, &big).unwrap();
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(out.stderr, b"refused\n");
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "echo refused >&2; exit 4"]);
+        let out = run_with_fds(&mut c, &[], Some(&big)).unwrap();
+        assert_eq!(out.status.code(), Some(4));
+    }
+
+    /// The clear script takes the hash on stdin and clears only on a match.
+    #[test]
+    fn clear_script_compares_the_hash_from_stdin() {
+        let hash = clipboard_hash_tool().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let clip = tmp.path().join("clip");
+        let cleared = tmp.path().join("cleared");
+        std::fs::write(&clip, b"s3cret").unwrap();
+        let run = |want: &str| {
+            let _ = std::fs::remove_file(&cleared);
+            let script = clear_script(
+                0,
+                &format!("cat '{}'", clip.display()),
+                hash,
+                &format!("cat > '{}'", cleared.display()),
+            );
+            assert!(!script.contains(want) || want.is_empty());
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", &script]);
+            run_with_stdin(&mut c, format!("{want}\n").as_bytes()).unwrap();
+            cleared.exists()
+        };
+        assert!(run(&sha256_hex(b"s3cret")), "same value: cleared");
+        assert!(!run(&sha256_hex(b"other")), "changed clipboard: kept");
+        assert!(!run(""), "no hash: kept");
     }
 
     #[test]

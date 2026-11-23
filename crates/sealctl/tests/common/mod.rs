@@ -427,6 +427,9 @@ impl PhoneThread {
                                     if let Some(n) = number_on(&screen.lock().unwrap()) {
                                         break n;
                                     }
+                                    if s2.load(Ordering::SeqCst) {
+                                        return; // the test ended without a number on screen
+                                    }
                                     tokio::time::sleep(Duration::from_millis(50)).await;
                                 };
                                 let choices = req.match_choices();
@@ -443,6 +446,9 @@ impl PhoneThread {
                         RequestKind::Report => {
                             seen2.store(true, Ordering::SeqCst);
                             while !rel2.load(Ordering::SeqCst) {
+                                if s2.load(Ordering::SeqCst) {
+                                    return; // the test ended without releasing the report
+                                }
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                             phone.answer_report(&r, &req).await.unwrap()
