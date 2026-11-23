@@ -42,10 +42,10 @@ machine when the phone approves. Wire formats and keys: [protocol.md](protocol.m
   variables agents set and, for the credential helpers, the agent's program among the parent
   processes; the helpers' check of who started them reads executable names. These guard
   against mistakes and a curious agent, not against code running as you that sets out to get
-  around them: it can drop the variables, run a copy of a shell named `git`, or make git
-  itself print a token (its trace output with redaction turned off, a credential helper of its
-  own). Hooks deny the known ways when installed, and every value given out is a use the phone
-  logs.
+  around them: it can drop the variables, run a copy of a shell named `git-remote-https`, or
+  make git itself print a token (its trace output with redaction turned off, a credential
+  helper of its own, a command one of git's transports runs from its configuration). Hooks
+  deny the known ways when installed, and every value given out is a use the phone logs.
 - **Programs run with `sealctl run`.** They get the values they are given, by design.
 - **A malicious relay holding back or delaying messages.** It cannot forge a reply or release a
   delayed one early (the machine checks the signed not-before time), but it can drop notes and

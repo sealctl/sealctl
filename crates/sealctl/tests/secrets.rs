@@ -366,11 +366,11 @@ fn credential_helpers_answer_only_git_and_aws_inside_agents() {
 
     // git and the AWS CLI themselves: stand-ins whose executables are named git-remote-https
     // and aws (copies of this test binary, see `stand_in_spawner`) start the helper from a
-    // script, as git does
+    // script, as git does. One named plain `git` is refused: that program only relays.
     let bin = env.h().join("toolbin");
     std::fs::create_dir_all(&bin).unwrap();
     let me = std::env::current_exe().unwrap();
-    for name in ["git-remote-https", "aws"] {
+    for name in ["git-remote-https", "aws", "git"] {
         std::fs::copy(&me, bin.join(name)).unwrap();
     }
     for (tool, line, want) in [
@@ -383,6 +383,11 @@ fn credential_helpers_answer_only_git_and_aws_inside_agents() {
             "aws",
             "\"$SEALCTL_BIN\" aws credentials --profile default",
             aws_secret.clone(),
+        ),
+        (
+            "git",
+            "printf 'protocol=https\\nhost=example.test\\n\\n' | \"$SEALCTL_BIN\" git credential get",
+            String::new(),
         ),
     ] {
         let script = env.h().join(format!("{tool}.sh"));
@@ -412,8 +417,14 @@ fn credential_helpers_answer_only_git_and_aws_inside_agents() {
                 String::from_utf8_lossy(&o.stderr).into_owned(),
             )
         });
-        assert_eq!(code, 0, "{tool}: {err}");
         let out = std::fs::read_to_string(&out_file).unwrap();
+        if tool == "git" {
+            // the `git` program itself only relays (an alias, a pager, a hook): refused
+            assert_eq!(code, 8, "{tool}: {err}");
+            assert!(!out.contains(&token), "{tool}: {out}");
+            continue;
+        }
+        assert_eq!(code, 0, "{tool}: {err}");
         assert!(out.contains(&want), "{tool}: {out}");
     }
 

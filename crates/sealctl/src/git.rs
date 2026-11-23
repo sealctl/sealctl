@@ -198,11 +198,13 @@ pub fn credential(action: &str) -> Result<()> {
 /// `gpg.ssh.program` shim: exec `ssh-keygen` with our agent socket.
 pub fn ssh_keygen_shim(args: &[String]) -> Result<()> {
     let sock = ssh::socket_path()?;
-    if !sock.exists() {
+    // a socket file left by a daemon that did not exit cleanly answers nothing
+    let answers = || std::os::unix::net::UnixStream::connect(&sock).is_ok();
+    if !answers() {
         // the daemon serves the agent; start it
         let _ = crate::daemon::client::call(serde_json::json!({"op": "status"}));
     }
-    if !sock.exists() {
+    if !answers() {
         bail!("The sealctl SSH agent is not running. Run: sealctl status");
     }
     let mut cmd = Command::new("ssh-keygen");
