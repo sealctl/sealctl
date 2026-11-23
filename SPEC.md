@@ -669,7 +669,7 @@ When the words change, the phone moves each machine to its new key (protocol.md,
 | APFS volume | `diskutil apfs changePassphrase <uuid> -user disk` with old and new passphrases on stdin; new hint |
 | Sparse bundle | `hdiutil chpass -oldstdinpass -newstdinpass`; new `sealctl.id` |
 | LUKS | `cryptsetup luksAddKey --key-file /dev/fd/3 <file> /dev/fd/4`, then `luksRemoveKey` with the old key, then the token replaced |
-| Restic repository | `restic key add --user sealctl --host sealctl-<new fp>` with old and new passwords on fds, then `restic key remove <old key id>`; on S3-compatible storage with versioning, the old versions of that `keys/` object are deleted (`ListObjectVersions`, `DeleteObjects`); where that is impossible, `sealctl migrate` says `Old key file versions remain in <bucket>; delete them in the provider's console.` |
+| Restic repository | `restic key add --user sealctl --host sealctl-<new fp>` with old and new passwords on fds, then `restic key remove <old key id>` (a rewrap that finds the new key there already, after a stop between the two, still removes the old one); on S3-compatible storage with versioning, the old versions of that `keys/` object are deleted (`ListObjectVersions`, `DeleteObjects`); where that is impossible, `sealctl migrate` says `Old key file versions remain in <bucket>; delete them in the provider's console.` |
 
 3. updates `inventory.json`, sends a status, and logs `Rewrapped 12 objects to words 4kPz` at `info`.
 
@@ -708,7 +708,7 @@ A launchd job `com.sealctl.migrate` or systemd user service `sealctl-migrate.ser
 | Object | Steps |
 | --- | --- |
 | APFS volume | Check free space ≥ used size (else stop with the needed size). Unmount; add a new APFS volume in the same container; get its key with a `keys` request; mount the old one read-only at a private mountpoint; copy with `ditto` (a resumed copy runs `ditto` again); compare file count and total size, and SHA-256 of 1% of files picked at random; delete the old volume; rename the new one; update the volume config with the new id. The volume cannot be used during the job; `sealctl volume open` says so |
-| Sparse bundle | Same, with a new bundle beside the old one, then the old bundle deleted and the new one renamed |
+| Sparse bundle | Same, with a new bundle beside the old one, then the old bundle deleted and the new one renamed. A copy beside it that the job's key does not open (left by a job started over under another id) is made again, once the original is checked to open with its key |
 | LUKS | Close the volume; `sudo cryptsetup reencrypt --resilience checksum <file>` with the key on a file descriptor (offline, resumable by cryptsetup itself) |
 | Restic repository | New repository id (kept in `migrate.json` with the old URL); `restic init --from-repo <old> --copy-chunker-params` with both passwords on fds; `restic copy --from-repo <old>` (skips snapshots already copied); `restic check` on the new one; update the backup config to the new repository; only then delete the old repository's objects (folder: remove the folder; S3-compatible: delete all objects and versions under the prefix). A resumed job whose backup config already names the new id only deletes the old repository, and never the one the config names. Other restic backends (sftp, rest, rclone): stop before deleting and print what to delete |
 
@@ -716,6 +716,7 @@ A launchd job `com.sealctl.migrate` or systemd user service `sealctl-migrate.ser
 - Progress goes to `sealctl migrate --status`, `sealctl status` and the phone (status `migrate`).
 - The job needs the session Open only to get the new object keys; it asks once at the start, with one `keys` request for all new ids.
 - Each object is held with its object lock (18.1) while it is copied and swapped: `volume open`, backup runs, `seal`, `unseal` and rewrap of it are refused meanwhile (exit 11).
+- A new job is not written while a runner holds `migrate.lock` (exit 11, `The re-encryption job is running.`); an unfinished item of the job on file keeps its new id and old repository in the new one.
 - `--pause`, `--resume` and `--cancel` change only the request in `migrate.json`, read and written under `migrate.json.lock` as the runner's own saves are, so the item states the runner wrote are never replaced by ones read before them.
 
 ### 16.4 `--scan`
