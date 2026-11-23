@@ -804,13 +804,13 @@ A level 3 approval away from a trusted place waits two hours (see [Delayed appro
 | --- | --- | --- |
 | Reply with `delay` | Phone | Creates the record with the request's `id` and `machine` and the sealed reply |
 | `POST .../delayed` with `{"id", "delay"}` | Phone | Creates a record with no machine and no sealed reply, for an action on the phone. `id` is 22 base64url characters made by the phone (`400 bad_id`, `409 duplicate_id`). `201 {"id", "releaseAt", "expires"}`; `400 bad_delay`, `429 too_many_delayed` |
-| `GET .../delayed` | Phone or any paired machine | `200 {"delayed": [{"id", "machine", "created", "releaseAt", "expires", "state"}]}`, `state` `waiting`, `released` or `cancelled` |
+| `GET .../delayed` | Phone or any paired machine | `200 {"delayed": [{"id", "machine", "created", "releaseAt", "expires", "state"}]}`, `state` `waiting`, `released` or `cancelled` (then also `"by"`), cancelled tombstones included |
 | `GET .../delayed/{id}` | Phone or any paired machine | The same fields for one record. For the machine that asked, once `releaseAt` has passed and it is not cancelled, also `"sealed"`, and the record is then deleted. `404 gone` when there is no such record |
-| `POST .../delayed/{id}/cancel` | Phone or any paired machine | Drops `sealed`, sets `cancelled` `{by: "phone" or the machine key, at}`; the record stays as a tombstone until `expires`, so the machine that asked learns why. `200 {"cancelled": true}`, also when already cancelled; `404 gone` when fetched, finished or expired |
+| `POST .../delayed/{id}/cancel` | Phone or any paired machine | Drops `sealed`, sets `cancelled` `{by: "phone" or the machine key, at}`, and moves `expires` to `releaseAt` + 2,400 seconds; the record stays as a tombstone until then, so the machine that asked learns why, and the phone still finds the cancel while it answers the later parts of a delayed plan. `200 {"cancelled": true}`, also when already cancelled; `404 gone` when fetched, finished or expired |
 | `POST .../delayed/{id}/finish` | Phone | For a record with no machine: once `releaseAt` has passed and it is not cancelled, deletes it and answers `200 {"finished": true}`. `425 too_early` with `{"releaseAt"}`; `409 cancelled` with `{"by"}`; `400 bad_id` for a record that has a machine; `404 gone` |
 
-- `delay` is 1 to 7,200 seconds; `releaseAt` = now + `delay`; `expires` = `releaseAt` + 900 seconds. A record past `expires` is deleted and answers `404 gone`.
-- At most 4 records per phone; a fifth answers `429 too_many_delayed`.
+- `delay` is 1 to 7,200 seconds; `releaseAt` = now + `delay`; `expires` = `releaseAt` + 900 seconds. A cancel moves `expires` to `releaseAt` + 2,400 seconds: the phone answers the later parts of a delayed plan from `nb` to `nb` + 30 minutes ([Plan and plan signature](#plan-and-plan-signature)) and asks the relay first whether it was cancelled, and a record it no longer finds after `releaseAt` it takes as fetched; the 30 minutes plus the 300-second signature window twice (the phone's clock against the relay's, when `nb` is set and when it is checked) cover that. A record past `expires` is deleted and answers `404 gone`.
+- At most 4 records per phone that are not cancelled, and at most 16 records in all, cancelled tombstones included (they do not count toward the 4, so a person can start again at once after a cancel; the 16 bound storage). Past either, a reply with `delay` or `POST .../delayed` answers `429 too_many_delayed`, and a request whose delayed reply is refused stays pending.
 - **Notes.** On create, the relay sends `{"type": "delayed", "id", "machine", "releaseAt"}` on every open phone socket and machine socket, and pushes `{"type": "delayed", "id", "expires": <releaseAt>}` to every push device. On cancel, `{"type": "cancelled", "id", "by"}` on the same sockets and a push with `"type": "cancelled"`. A machine socket that opens while records are pending gets one `delayed` note per record. The phone also sends each paired machine a sealed `notice` message.
 - Deleting the phone deletes its records.
 
@@ -850,7 +850,7 @@ The phone runs these steps in order, while it still holds the old root:
 | Data kept without a signed call from the phone **(planned)** | 730 days |
 | Sealed status, sealed machine message **(planned)** | 8,192 and 4,096 characters |
 | Machine messages held per machine **(planned)** | 16, for at most 24 hours |
-| Delayed approvals per phone **(planned)** | 4; delay 1 to 7,200 seconds; kept 900 seconds after `releaseAt` |
+| Delayed approvals per phone **(planned)** | 4 not cancelled, 16 records with cancelled tombstones; delay 1 to 7,200 seconds; kept 900 seconds after `releaseAt`, 2,400 seconds once cancelled |
 
 ## Appendix A: test vectors
 

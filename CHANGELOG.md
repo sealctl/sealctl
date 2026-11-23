@@ -12,6 +12,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   base64, base64url and URL-encoded forms.
 - A leak test stores a canary and checks that none of those forms reaches the output of
   `sealctl run`, `daemon.log`, or any file in the config, state and data folders.
+- protocol.md, Delayed approvals (planned), matches the relay: a cancel keeps the record until
+  `releaseAt` + 2,400 s (900 s when not cancelled), and cancelled records do not count toward
+  the 4 per phone but do toward 16 in all. The fake relay keeps cancelled records as long.
 
 ## 0.7.0 - 2026-11-23
 
