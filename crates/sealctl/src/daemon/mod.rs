@@ -83,6 +83,15 @@ fn caller_left() -> anyhow::Error {
     fail(exit::ERROR, "The command stopped waiting for your phone.")
 }
 
+/// A command that waited (for the phone, the pairing, its turn) and finds the session it
+/// counted on Locked.
+fn locked_meanwhile() -> anyhow::Error {
+    fail(
+        exit::ERROR,
+        "The session locked while this command waited. Run it again.",
+    )
+}
+
 /// Tests only (`test-hooks`): with a file `test-hold-<point>` in the state folder the daemon
 /// stops at that point: it writes `test-held-<point>` there and goes on once the test removes
 /// the first file, removing `test-held-<point>` as it goes (so each hold is seen afresh). A
@@ -912,12 +921,7 @@ impl Daemon {
         } else {
             self.st().store_key.as_ref().map(copy_key)
         };
-        key.ok_or_else(|| {
-            fail(
-                exit::ERROR,
-                "The session locked while this command waited. Run it again.",
-            )
-        })
+        key.ok_or_else(locked_meanwhile)
     }
 
     /// `open`.
@@ -1042,8 +1046,14 @@ impl Daemon {
         };
         let uses = match &turn {
             Some(_) => {
+                // the wait for the turn may have taken the session past its time, or a lock
+                // came meanwhile: the phone is not asked for uses of a session that is gone
+                self.expire();
                 let remembered = load_answers();
                 let st = self.st();
+                if !st.open || self.is_exiting() {
+                    return Err(locked_meanwhile());
+                }
                 generation = st.generation;
                 needed(&st, &remembered)
             }

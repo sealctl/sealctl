@@ -838,6 +838,39 @@ fn a_request_queued_behind_another_says_it_waits_for_the_phone() {
     assert!(env.block(env.phone.requests()).unwrap().is_empty());
 }
 
+/// An agent's request waits for its turn behind another when the session locks. At its turn
+/// the session it found Open is gone: it ends there, and the phone is never asked for uses of
+/// a Locked session.
+#[test]
+fn a_request_queued_when_the_session_locks_does_not_reach_the_phone() {
+    let mut env = Env::fake(Options::default());
+    env.pair();
+    open_with_secret(&env);
+    let first = start(agent_cmd(&env));
+    let mut seen = Vec::new();
+    let r = next_request(&env, &mut seen);
+    let second = start(agent_cmd(&env));
+    second.waits();
+    let (code, _, err) = run_within(&env, &["lock"], 10);
+    assert_eq!(code, 0, "{err}");
+    env.block(env.phone.auto(&r, &Answer::Session)).unwrap();
+    let (code, out, _) = first.finish(10, "the first agent");
+    assert_ne!(code, 0, "the answer came after the lock");
+    assert!(!out.contains("ran="));
+    let (code, out, err) = second.finish(10, "the queued agent");
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("The session locked while this command waited"),
+        "{err}"
+    );
+    assert!(!out.contains("ran="));
+    assert!(
+        env.block(env.phone.requests()).unwrap().is_empty(),
+        "no request for a Locked session"
+    );
+    assert_eq!(daemon(&env, json!({"op": "status"}))["state"], "locked");
+}
+
 #[test]
 fn a_person_is_not_held_up_by_an_agent_request_on_the_phone() {
     let mut env = Env::fake(Options::default());

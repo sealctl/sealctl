@@ -59,7 +59,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - A pending open declined on the phone, or left without an answer, ends the commands that
   joined it too, instead of asking the phone again right after.
 - A command queued behind another request prints `Waiting for your phone`, and an agent use
-  granted for the session meanwhile is not asked for again.
+  granted for the session meanwhile is not asked for again; if the session locked while it
+  queued, it ends without asking the phone.
 - A request asked before the machine slept past its 5 minutes ends on waking (exit 5) instead
   of waiting up to 5 more minutes on a connection that may be dead.
 - A delayed action that finished or expired leaves the daemon's pending list; one announced
