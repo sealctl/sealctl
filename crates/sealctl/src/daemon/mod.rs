@@ -460,8 +460,10 @@ impl Daemon {
             }
             Ok(None) => Err(fail(exit::ERROR, "The phone delayed a routine request.")),
             Err(e) => {
+                // the lock's slow steps run in the background: other requests do not wait
+                // behind a running lock's backups with this one
                 if exit::code_of(&e) == exit::NOT_PAIRED {
-                    self.lock("unpaired", true, false).await;
+                    self.lock_soon("unpaired", true, |_| Some(false));
                 }
                 Err(e)
             }
@@ -477,6 +479,9 @@ impl Daemon {
                 if let Ok(p) = g.acquire().await {
                     p.forget();
                 }
+            }
+            if c.reply.err.as_deref() == Some(testing::UNPAIRED) {
+                return Err(exit::unpaired());
             }
             return Ok(Some(c.reply));
         }
@@ -755,7 +760,12 @@ impl Daemon {
     /// waited (for the phone, the pairing, its turn) since its first check.
     fn session_store_key(self: &Arc<Self>) -> Result<ObjectKey> {
         self.expire();
-        self.st().store_key.as_ref().map(copy_key).ok_or_else(|| {
+        let key = if self.is_exiting() {
+            None
+        } else {
+            self.st().store_key.as_ref().map(copy_key)
+        };
+        key.ok_or_else(|| {
             fail(
                 exit::ERROR,
                 "The session locked while this command waited. Run it again.",
@@ -954,7 +964,7 @@ impl Daemon {
         self.expire();
         let held = || -> Option<(Vec<ObjectKey>, String)> {
             let st = self.st();
-            if !st.open || items.iter().any(|i| i.words.is_none()) {
+            if !st.open || self.is_exiting() || items.iter().any(|i| i.words.is_none()) {
                 return None;
             }
             let keys = items
@@ -1624,10 +1634,14 @@ impl Daemon {
                 let locked = self.lock_soon(&reason, reason == "words", |st| {
                     (st.open && msg.time.saturating_add(LOCK_SKEW_MS) >= st.opened_at).then_some(false)
                 });
-                // none Open: an `open` the phone is asked meanwhile stays with its command
+                // none Open: an `open` the phone was asked before this lock was made stays
+                // with its command
                 if !locked {
                     let mut st = self.st();
-                    if !st.open {
+                    let made_during = st
+                        .waiting_since
+                        .is_some_and(|w| msg.time.saturating_add(LOCK_SKEW_MS) >= w);
+                    if !st.open && made_during {
                         st.lock_asks += 1;
                     }
                 }
@@ -1806,9 +1820,12 @@ impl Daemon {
     fn idle_exit_due(&self) -> bool {
         let n = self.now();
         let st = self.st();
+        // an exit would stop a running lock's backups
+        let lock_running = *self.locks_done.borrow() < st.locks_begun;
         !st.open
             && st.clients == 0
             && st.waiting_since.is_none()
+            && !lock_running
             && n.saturating_sub(st.last_client) > 10 * 60 * 1000
     }
 

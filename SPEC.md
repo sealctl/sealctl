@@ -279,7 +279,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 | Situation | How the daemon runs |
 | --- | --- |
 | Paired desktop or laptop | Login service installed by `sealctl pair`: launchd `com.sealctl.daemon` (`RunAtLoad`, `KeepAlive`) or systemd user unit `sealctl.service` (`Restart=on-failure`). Runs `sealctl daemon` |
-| Service missing (containers, dev boxes without a user systemd) | The CLI starts `sealctl daemon --spawned` detached (`setsid`, stdio to `/dev/null`). It exits after 10 minutes Locked with no client and no request waiting for the phone |
+| Service missing (containers, dev boxes without a user systemd) | The CLI starts `sealctl daemon --spawned` detached (`setsid`, stdio to `/dev/null`). It exits after 10 minutes Locked with no client, no request waiting for the phone and no lock running its backups |
 | `SEALCTL_NO_DAEMON=1` (CI runners) | No daemon. Each command asks the phone itself; keys live as long as that process. No Open session, no SSH agent |
 
 - Any exit locks first (SPEC 6.5), whether asked over the socket, by a version mismatch, by Ctrl-C, or by SIGTERM from the service manager (logout, `launchctl bootout`, `systemctl stop`), and waits for a lock still running. Once an exit begins, no session opens (a request that still reaches the daemon, such as an SSH signature, is refused) and on-lock backups still running stop, so the unmount and the last status come within the service's stop timeout: 60 seconds (launchd `ExitTimeOut`, systemd `TimeoutStopSec` with `KillMode=mixed`, so the daemon stops its own restic).

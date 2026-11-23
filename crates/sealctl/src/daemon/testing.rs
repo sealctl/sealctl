@@ -53,6 +53,9 @@ impl Gate {
     }
 }
 
+/// A canned answer whose `err` is this stands for the relay saying the machine is unpaired.
+pub const UNPAIRED: &str = "test: unpaired";
+
 /// A canned phone answer: waits for its gate (if any), then answers.
 pub struct Canned {
     pub gate: Option<Arc<tokio::sync::Semaphore>>,

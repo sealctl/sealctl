@@ -1011,3 +1011,53 @@ async fn a_restarted_daemon_tells_the_phone_what_the_last_one_could_not() {
     d3.tick().await;
     assert!(d3.t.events().is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_spawned_daemon_does_not_exit_while_a_lock_runs_its_backups() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.backup.hold();
+    open(&d, &store_items()).await;
+    let locking = tokio::spawn({
+        let d = d.clone();
+        async move { d.lock("idle", false, false).await }
+    });
+    settle().await;
+    // no client for 11 minutes while the on-lock backup runs; an exit would stop it
+    d.st().last_client = t0() - 11 * 60_000;
+    assert!(!d.idle_exit_due(), "the backup runs to its end");
+    d.t.backup.release();
+    locking.await.unwrap();
+    assert!(d.idle_exit_due());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unpaired_answer_holds_up_no_other_request() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.backup.hold();
+    open(&d, &store_items()).await;
+    let locking = tokio::spawn({
+        let d = d.clone();
+        async move { d.lock("idle", false, false).await }
+    });
+    settle().await;
+    // the relay says the machine is unpaired while the on-lock backup runs
+    let mut gone = testing::grant("once", &[]);
+    gone.err = Some(testing::UNPAIRED.into());
+    d.t.answer(gone, None);
+    d.t.answer(testing::grant("once", &[]), None);
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        d.ask(approve::body("agent"), &ev(), false),
+    )
+    .await
+    .expect("the unpaired answer does not wait for the lock's backups");
+    assert!(r.is_err());
+    tokio::time::timeout(Duration::from_secs(5), d.ask(approve::body("keys"), &ev(), false))
+        .await
+        .expect("the next request does not wait for the lock's backups")
+        .unwrap();
+    d.t.backup.release();
+    locking.await.unwrap();
+    settle().await;
+    assert_eq!(*d.locks_done.borrow(), 2);
+}
