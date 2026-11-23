@@ -20,6 +20,11 @@
           # integration tests need hdiutil and the fake relay; unit tests only here
           cargoTestFlags = [ "-p" "sealctl" "-p" "sealctl-core" "--lib" ];
           nativeBuildInputs = [ pkgs.installShellFiles ];
+          # the daemon's unit tests build the relay client, which loads the system's CA
+          # certificates; the build sandbox has none
+          preCheck = ''
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+          '';
           postInstall = ''
             installShellCompletion --cmd sealctl \
               --bash <($out/bin/sealctl completions bash) \

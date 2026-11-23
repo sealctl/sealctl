@@ -198,10 +198,30 @@ fn a_daemon_of_another_version_locks_before_it_exits() {
     assert!(session("locked"), "the phone hears the session lock");
 }
 
+/// The running daemon's pid. On Linux the daemon is not dumpable, so its open files are hidden
+/// from `lsof`: the daemon socket's peer credentials name it instead.
+#[cfg(target_os = "linux")]
+fn daemon_pid(env: &Env) -> String {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let s = UnixStream::connect(env.h().join("s/sealctl/daemon.sock")).unwrap();
+    getsockopt(&s, PeerCredentials).unwrap().pid().to_string()
+}
+
+/// The running daemon's pid: the process holding `daemon.lock`.
+#[cfg(not(target_os = "linux"))]
+fn daemon_pid(env: &Env) -> String {
+    let o = std::process::Command::new("lsof")
+        .arg("-t")
+        .arg(env.h().join("s/sealctl/daemon.lock"))
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
 #[test]
 fn a_daemon_stopped_by_its_service_manager_locks_first() {
     // the service manager stops the daemon with SIGTERM (logout, `systemctl stop`)
-    if !common::have("lsof") {
+    if cfg!(not(target_os = "linux")) && !common::have("lsof") {
         return;
     }
     let mut env = Env::fake(Options::default());
@@ -220,13 +240,7 @@ fn a_daemon_stopped_by_its_service_manager_locks_first() {
         false
     };
     assert!(session("open"));
-    // the daemon holds daemon.lock while it runs
-    let o = std::process::Command::new("lsof")
-        .arg("-t")
-        .arg(env.h().join("s/sealctl/daemon.lock"))
-        .output()
-        .unwrap();
-    let pid = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let pid = daemon_pid(&env);
     assert!(!pid.is_empty(), "the daemon's pid");
     let killed = std::process::Command::new("kill")
         .args(["-TERM", &pid])
