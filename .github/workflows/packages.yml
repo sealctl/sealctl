@@ -265,6 +265,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [notices, deb, rpm, arch, homebrew, nix]
     runs-on: ubuntu-24.04
+    # Publishing waits for the owner's approval; the environment accepts tags v* only.
+    environment: release
     permissions:
       contents: write
       # build provenance attestations (Sigstore, via the workflow's OIDC token)
@@ -312,6 +314,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: release
     runs-on: ubuntu-24.04
+    # HOMEBREW_TAP_DEPLOY_KEY is a secret of this environment only (tags v*, owner approval).
+    environment: release
     permissions:
       contents: read
     steps:
@@ -333,7 +337,9 @@ jobs:
             test "$(sha256sum "$f" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "dist/$n.sha256")"
             gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
           done
-      # The deploy key is the only write access to the tap (its credentials stay in tap/.git).
+      # The deploy key is the only write access to the tap. checkout writes it to $RUNNER_TEMP
+      # (tap/.git/config only points core.sshCommand at it) until the post-job cleanup, so the
+      # steps after this one can read it: they run only this repository's own scripts.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: sealctl/homebrew-tap
