@@ -36,6 +36,9 @@ use session::Saved;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// How long a lock or the daemon's exit waits for one volume's mount.
+const MOUNT_LIMIT: Duration = Duration::from_secs(120);
+
 /// How far the phone's clock may be behind the machine's for a `lock` message.
 const LOCK_SKEW_MS: u64 = 60_000;
 
@@ -653,16 +656,19 @@ impl Daemon {
     }
 
     /// Mounts the auto volumes of session `generation`, while it stays Open. A lock meanwhile
-    /// unmounts after the mount in progress (both hold `volumes`).
-    async fn mount_auto(&self, generation: u64) {
+    /// unmounts after the mount in progress (both hold `volumes`), or after [`MOUNT_LIMIT`].
+    async fn mount_auto(self: &Arc<Self>, generation: u64) {
         let _volumes = self.volumes.lock().await;
+        // unit tests mount one simulated volume, `safe`, never the developer's
         #[cfg(test)]
-        {
-            self.t.mount.pass("mount", &self.t).await;
-            // unit tests never mount the developer's volumes
-            if self.t.offline() {
-                return;
-            }
+        if self.t.offline() {
+            let me = self.clone();
+            let job = async move {
+                me.t.mount.pass("mount", &me.t).await;
+                Ok(true)
+            };
+            self.mount_one("safe".into(), job).await;
+            return;
         }
         let vols: Vec<Volume> = Volume::list()
             .unwrap_or_default()
@@ -679,16 +685,48 @@ impl Daemon {
             };
             let Some(key) = key else { continue };
             let name = v.name.clone();
-            let r = tokio::task::spawn_blocking(move || {
-                let was = v.is_open();
-                crate::volume::open_with(&v, &key).map(|_| !was)
-            })
-            .await;
-            match r {
-                Ok(Ok(true)) => self.st().mounted.push(name),
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => log::warn!("mounting {name}: {e:#}"),
-                Err(_) => {}
+            let job = async move {
+                tokio::task::spawn_blocking(move || {
+                    let was = v.is_open();
+                    crate::volume::open_with(&v, &key).map(|_| !was)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("the mount stopped"))?
+            };
+            self.mount_one(name, job).await;
+        }
+    }
+
+    /// Mounts one volume (`job` gives whether it mounted it). A mount that hangs (a password
+    /// prompt nobody sees, a stuck disk image) holds up the locks' unmounts and the daemon's
+    /// exit for [`MOUNT_LIMIT`] at most; if it finishes later, after the session locked, the
+    /// volume is closed again.
+    async fn mount_one(
+        self: &Arc<Self>,
+        name: String,
+        job: impl std::future::Future<Output = Result<bool>> + Send + 'static,
+    ) {
+        let mut job = tokio::spawn(job);
+        match tokio::time::timeout(MOUNT_LIMIT, &mut job).await {
+            Ok(Ok(Ok(true))) => self.st().mounted.push(name),
+            Ok(Ok(Ok(false))) | Ok(Err(_)) => {}
+            Ok(Ok(Err(e))) => log::warn!("mounting {name}: {e:#}"),
+            Err(_) => {
+                log::warn!("mounting {name} did not finish in {} s", MOUNT_LIMIT.as_secs());
+                let me = self.clone();
+                tokio::spawn(async move {
+                    if !matches!(job.await, Ok(Ok(true))) {
+                        return;
+                    }
+                    // a session Open by now (this one, or one approved since) keeps it
+                    let _volumes = me.volumes.lock().await;
+                    let open = me.st().open;
+                    if open {
+                        me.st().mounted.push(name);
+                    } else {
+                        me.close_volumes(Some(std::slice::from_ref(&name)), false).await;
+                    }
+                });
             }
         }
     }

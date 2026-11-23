@@ -871,3 +871,32 @@ async fn a_busy_volume_that_closed_is_told_even_when_that_status_failed() {
         "the phone hears the volume closed: {e:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_hung_mount_holds_up_a_lock_for_two_minutes_at_most() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.mount.hold();
+    let opening = tokio::spawn({
+        let d = d.clone();
+        async move { open(&d, &store_items()).await }
+    });
+    settle().await;
+    let locking = tokio::spawn({
+        let d = d.clone();
+        async move { d.lock("cli", true, false).await }
+    });
+    tokio::time::timeout(Duration::from_secs(600), locking)
+        .await
+        .expect("the lock does not wait for a hung mount")
+        .unwrap();
+    opening.await.unwrap();
+    let e = d.t.events();
+    assert!(e.contains(&"unmount".to_string()), "{e:?}");
+    assert!(!e.contains(&"mount end".to_string()), "{e:?}");
+    // the mount finishes after all: the session is Locked, so the volume closes again
+    d.t.mount.release();
+    settle().await;
+    let e = d.t.events();
+    assert!(at(&e, "mount end") < at(&e, "close safe"), "{e:?}");
+    assert!(d.st().mounted.is_empty());
+}
