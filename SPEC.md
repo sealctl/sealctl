@@ -1095,7 +1095,8 @@ Most of this code is written with AI coding agents. A security tool cannot ship 
 
 - **ci.yml** (every push and pull request): `cargo fmt --check`; `cargo clippy --all-targets --locked -D warnings`; `cargo test --locked` on `ubuntu-latest` and `macos-latest`, including the OS-tool tests; `cargo deny check`; `cargo vet --locked`; vector regeneration diff (Node 20); WebCrypto check of `relay-signing.json`; the leak and secret-type tests; MSRV check (1.89).
 - **bindings.yml**: builds `sealctl-core` with `--features uniffi`, generates Swift and Kotlin in library mode, runs a Swift smoke test on macOS and a Kotlin one on Linux (JNA) against `v1.json`.
-- **fuzz.yml**: section 21.
+- **fuzz.yml**: section 21. The fuzz crate is a member of the main workspace but not of `default-members`, so it shares the one `Cargo.lock` (Dependabot, `cargo deny` and `cargo vet` see every fuzz dependency; vet policy `safe-to-run` for `sealctl-fuzz`) while plain `cargo build`/`test`/`clippy` never build it. fuzz.yml overrides the release profile's LTO and strip through `CARGO_PROFILE_RELEASE_*`.
+- **CI shape** (all workflows): one run per pull request, and a new push cancels the old one; runs on `main`, tags, schedules and manual runs are never cancelled or replaced (each gets a concurrency group of its own). Every job has `timeout-minutes`. Required checks (ruleset on `main`): `fmt`, `deny`, `msrv`, `test (ubuntu-latest)`, `test (macos-latest)` from ci.yml, which has no path filter. The free plan runs 5 macOS jobs at a time, so on pull requests packages.yml's macOS jobs (`build macos`, `brew install (macOS)`, `nix build (macos-latest)`) run only when packaging files change (its `changes` job reads the pull request's file list); bindings.yml (Swift on macOS) and fuzz.yml keep workflow path filters because they are not required. Push, tag and manual runs build everything.
 - **packages.yml**: Linux tarballs, `.deb`, `.rpm` built on Rocky 9, install tests on Debian, Ubuntu, Fedora, Rocky, openSUSE, Arch; macOS tarballs; Homebrew formula test; Nix build. The package descriptions say "phone-approved keys"; `deb` and `rpm` recommend `restic` and `cryptsetup`; the Linux packages depend only on the C and GCC runtime libraries. Planned:
   - build attestations for every artifact and `SHA256SUMS`;
   - `sealctl-<version>-cli.md`, the full command reference generated from the clap definitions (`sealctl help --markdown`, hidden command, using `clap-markdown`), attached to each release.
@@ -1174,7 +1175,7 @@ into its section.
 | 18.9 | The delayed wait reads the relay every 60 seconds and at `releaseAt`; a cancelled approval names `your phone`, this machine's name, or `another paired machine` |
 | 20 | Hidden input (words, passphrases, values) is read from stdin with echo off through termios, so it works on any terminal stdin and never from a pipe for the words |
 | 18.4 | Ctrl-C or TERM during the steps lets the current step finish, records it, and stops with exit 13 |
-| 21 | `fuzz/` (its own workspace) has 12 targets; `bindings/` holds the Swift and Kotlin smoke tests run by `bindings.yml` |
+| 21 | `fuzz/` (a workspace member outside `default-members`, sharing `Cargo.lock`) has 12 targets; `bindings/` holds the Swift and Kotlin smoke tests run by `bindings.yml` |
 | 22 | `crates/sealctl-fakerelay` holds the fake relay and the scripted phone; the integration tests run against a live relay when `SEALCTL_TEST_RELAY` is set. `scripts/pair-test.sh` pairs a real phone with a throwaway HOME |
 
 ## 28. 0.8.0: credential helpers

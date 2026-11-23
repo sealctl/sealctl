@@ -13,9 +13,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # one run per pull request (a new push cancels the old run); push, tag, schedule and manual
+  # runs get a group of their own, so a run on main or a tag is never cancelled or replaced
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    # build about 10 minutes; 2 minutes per target on pull requests, 1 hour nightly
+    timeout-minutes: ${{ github.event_name == 'schedule' && 90 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +31,11 @@ jobs:
     env:
       # cargo-fuzz needs nightly (sanitizers); overrides rust-toolchain.toml
       RUSTUP_TOOLCHAIN: nightly
+      # the fuzz crate is a member of the main workspace: not its release profile's LTO and
+      # strip (slow builds, no symbols in crash reports)
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_STRIP: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,11 +43,11 @@ jobs:
       - run: rustup toolchain install nightly --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: fuzz
+          shared-key: fuzz
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      # cargo fuzz has no --locked: fail here if fuzz/Cargo.lock is out of date instead of
+      # cargo fuzz has no --locked: fail here if Cargo.lock is out of date instead of
       # resolving fresh versions on the runner
-      - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+      - run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Run
         env:
           TARGET: ${{ matrix.target }}
