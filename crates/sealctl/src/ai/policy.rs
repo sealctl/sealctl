@@ -1,6 +1,7 @@
 //! What AI agents may do with secrets — the same rules for every tool. Each tool's hook adapter
 //! (see `mod.rs`) turns these verdicts into that tool's hook output.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -111,7 +112,7 @@ pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
     for safe in SAFE_ENV_FILES {
         probe = probe.replace(safe, "EXAMPLE_FILE");
     }
-    if let Some(why) = sealctl_in(command, 0) {
+    if let Some(why) = sealctl_check(command) {
         return Some(format!("sealctl: {why}"));
     }
     for (re, why) in deny_patterns() {
@@ -170,25 +171,51 @@ fn denied_verb(verb: &str, sub: Option<&str>) -> Option<&'static str> {
 /// The simple commands of a shell command line, each as its words with quotes removed. Pipes,
 /// lists, subshells and command substitutions (`$(…)`, backquotes, also inside double quotes)
 /// separate commands. Not a full shell parser: it is meant to find which program each command
-/// runs and with which arguments, erring towards splitting more.
-fn simple_commands(text: &str) -> Vec<Vec<String>> {
+/// runs and with which arguments, erring towards splitting more. With `resume`, the text after a
+/// substitution inside double quotes is double-quoted again (as the shell reads it); without, it
+/// is not. With `track_case`, a `case … esac` is followed so that a pattern's `)` closes nothing
+/// (as bash 4+ and zsh read it); without, a pattern's `)` closes an open `$(` (as bash 3.2, the
+/// macOS `/bin/bash` and `/bin/sh`, reads it inside double quotes). Shells differ here and a `)`
+/// can be misread either way, so callers check every reading.
+fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
+    // open subshells and command substitutions: `'('` or `` '`' ``, and whether the text after
+    // the matching `)` or backquote is inside double quotes again (`"a $(b) c"`); `'c'` for an
+    // open `case … esac`, whose patterns' `)` close nothing
+    let mut open: Vec<(char, bool)> = Vec::new();
     let cs: Vec<char> = text.chars().collect();
     let mut i = 0;
-    let end_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
+    // whether every word of the current command so far is a shell keyword (`if`, `do`, `time`, …),
+    // kept as a flag so each word costs O(1): a `case` or `esac` only counts in that position
+    let mut all_kw = true;
+    let end_word = |word: &mut String,
+                    in_word: &mut bool,
+                    words: &mut Vec<String>,
+                    open: &mut Vec<(char, bool)>,
+                    all_kw: &mut bool| {
         if *in_word {
-            words.push(std::mem::take(word));
+            let w = std::mem::take(word);
+            if track_case && *all_kw {
+                if w == "case" {
+                    open.push(('c', false));
+                } else if w == "esac" && open.last() == Some(&('c', false)) {
+                    open.pop();
+                }
+            }
+            *all_kw = *all_kw && is_keyword(&w);
+            words.push(w);
             *in_word = false;
         }
     };
-    let end_cmd = |words: &mut Vec<String>, cmds: &mut Vec<Vec<String>>| {
+    let end_cmd = |words: &mut Vec<String>, cmds: &mut Vec<Vec<String>>, all_kw: &mut bool| {
         if !words.is_empty() {
             cmds.push(std::mem::take(words));
         }
+        *all_kw = true;
     };
     while i < cs.len() {
         let c = cs[i];
@@ -206,17 +233,20 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
                     i += 1;
                     word.push(cs[i]);
                 }
-                // a command substitution inside double quotes runs a command too
+                // a command substitution inside double quotes runs a command too; the quotes
+                // resume after it
                 '`' => {
                     quote = None;
-                    end_word(&mut word, &mut in_word, &mut words);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    open.push(('`', true));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     quote = None;
                     i += 1;
-                    end_word(&mut word, &mut in_word, &mut words);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    open.push(('(', true));
                 }
                 c => word.push(c),
             },
@@ -232,18 +262,41 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
                         in_word = true;
                     }
                 }
-                ' ' | '\t' => end_word(&mut word, &mut in_word, &mut words),
+                ' ' | '\t' => end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw),
                 // `2>&1`, `>&2`, `&>file`: redirections, not separators
                 '&' if i > 0 && matches!(cs[i - 1], '>' | '<') => word.push(c),
                 '&' if cs.get(i + 1) == Some(&'>') => word.push(c),
-                '|' | ';' | '&' | '\n' | '(' | ')' | '`' | '{' | '}' => {
-                    end_word(&mut word, &mut in_word, &mut words);
-                    end_cmd(&mut words, &mut cmds);
+                '|' | ';' | '&' | '\n' | '{' | '}' => {
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                }
+                '(' => {
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    open.push(('(', false));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     i += 1;
-                    end_word(&mut word, &mut in_word, &mut words);
-                    end_cmd(&mut words, &mut cmds);
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    open.push(('(', false));
+                }
+                ')' | '`' => {
+                    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    let opener = if c == ')' { '(' } else { '`' };
+                    match open.last() {
+                        Some(&(o, dq)) if o == opener => {
+                            open.pop();
+                            if dq && resume {
+                                quote = Some('"');
+                                in_word = true;
+                            }
+                        }
+                        // a `case` pattern's `)`, or a stray one
+                        _ if c == ')' => {}
+                        _ => open.push(('`', false)),
+                    }
                 }
                 c => {
                     word.push(c);
@@ -253,27 +306,74 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
         }
         i += 1;
     }
-    end_word(&mut word, &mut in_word, &mut words);
-    end_cmd(&mut words, &mut cmds);
+    end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+    end_cmd(&mut words, &mut cmds, &mut all_kw);
     cmds
 }
 
-/// Why a command line may not run, if one of its commands runs a denied sealctl subcommand.
-fn sealctl_in(text: &str, depth: usize) -> Option<&'static str> {
-    if depth > 8 {
-        return None;
+/// The reason given when a command line is too deeply nested or too costly to check: the hook
+/// must answer within its timeout, and a command it cannot check is denied, not let through.
+const TOO_COMPLEX: &str = "this command is too complex to check (too deeply nested `eval`, `sh -c` or wrappers, or too much text to parse). Split it into simpler commands.";
+
+/// How deeply `eval`, `sh -c`, wrappers and `sealctl run` may nest before a command line counts
+/// as too complex to check.
+const MAX_DEPTH: usize = 8;
+
+/// The readings of a command line that are checked (see `simple_commands`): double quotes resumed
+/// after a substitution or not, `case` patterns followed or not (bash 3.2 closes `$(` at a
+/// pattern's `)`).
+const READINGS: [(bool, bool); 4] = [(true, true), (true, false), (false, true), (false, false)];
+
+/// The longest command line checked; macOS limits all of execve's arguments to 1 MiB.
+const MAX_COMMAND_BYTES: usize = 1 << 20;
+
+/// Why a whole command line may not run, if one of its commands runs a denied sealctl subcommand.
+/// The work is bounded: every parse of every reading, at every nesting level, is paid for from
+/// one budget of characters that grows linearly with the command's length; when it runs out the
+/// command is denied as too complex to check.
+fn sealctl_check(command: &str) -> Option<&'static str> {
+    // Longer than any command line a shell accepts (execve limits): denied, so the check stays
+    // well inside the hook's timeout for any input.
+    if command.len() > MAX_COMMAND_BYTES {
+        return Some(TOO_COMPLEX);
     }
-    simple_commands(text)
+    let mut budget = command.len().saturating_mul(32).saturating_add(1 << 20);
+    sealctl_in(command, 0, &mut budget)
+}
+
+/// Why a command line may not run (`budget`: characters left to parse, shared by the recursion).
+fn sealctl_in(text: &str, depth: usize, budget: &mut usize) -> Option<&'static str> {
+    if depth > MAX_DEPTH {
+        return Some(TOO_COMPLEX);
+    }
+    let cost = text.len().saturating_mul(READINGS.len()).max(1);
+    if *budget < cost {
+        return Some(TOO_COMPLEX);
+    }
+    *budget -= cost;
+    // deny if any plausible reading finds a denied command; the readings mostly agree, so each
+    // distinct simple command is looked into once (else the work grows as 4^depth)
+    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    let mut distinct: Vec<Vec<String>> = Vec::new();
+    for (resume, track_case) in READINGS {
+        for words in simple_commands(text, resume, track_case) {
+            if !seen.contains(&words) {
+                seen.insert(words.clone());
+                distinct.push(words);
+            }
+        }
+    }
+    distinct
         .iter()
-        .find_map(|words| sealctl_argv(words, depth))
+        .find_map(|words| sealctl_argv(words, depth, budget))
 }
 
 /// The same for one command's words: the program is found past variable assignments, shell
 /// keywords and wrappers (`env`, `command`, `sudo`, `xargs`, …), at any path; `sh -c` and `eval`
 /// are looked into, and so is the command `sealctl run` starts.
-fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
-    if depth > 8 {
-        return None;
+fn sealctl_argv(words: &[String], depth: usize, budget: &mut usize) -> Option<&'static str> {
+    if depth > MAX_DEPTH {
+        return Some(TOO_COMPLEX);
     }
     let is_assignment = |w: &str| {
         w.split_once('=').is_some_and(|(k, _)| {
@@ -323,10 +423,10 @@ fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
             let c = rest
                 .iter()
                 .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))?;
-            return sealctl_in(rest.get(c + 1)?, depth + 1);
+            return sealctl_in(rest.get(c + 1)?, depth + 1, budget);
         }
-        "eval" => return sealctl_in(&rest.join(" "), depth + 1),
-        "sealctl" => return sealctl_args(rest, depth),
+        "eval" => return sealctl_in(&rest.join(" "), depth + 1, budget),
+        "sealctl" => return sealctl_args(rest, depth, budget),
         _ => return None,
     };
     let mut j = 0;
@@ -348,7 +448,7 @@ fn sealctl_argv(words: &[String], depth: usize) -> Option<&'static str> {
     if base == "timeout" && j < rest.len() {
         j += 1;
     }
-    sealctl_argv(rest.get(j..)?, depth + 1)
+    sealctl_argv(rest.get(j..)?, depth + 1, budget)
 }
 
 /// `git credential fill` and `git credential-<helper> get` print the stored password or token.
@@ -388,7 +488,7 @@ fn is_keyword(w: &str) -> bool {
 
 /// sealctl's arguments: its global options are skipped, the first word left is the subcommand,
 /// and the next one its own subcommand (`secret get`, `git credential`).
-fn sealctl_args(args: &[String], depth: usize) -> Option<&'static str> {
+fn sealctl_args(args: &[String], depth: usize, budget: &mut usize) -> Option<&'static str> {
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() && positional.len() < 2 {
@@ -420,7 +520,7 @@ fn sealctl_args(args: &[String], depth: usize) -> Option<&'static str> {
                     _ => break,
                 }
             }
-            return sealctl_argv(args.get(j..)?, depth + 1);
+            return sealctl_argv(args.get(j..)?, depth + 1, budget);
         }
     }
     denied_verb(positional.first()?, positional.get(1).copied())
@@ -496,6 +596,76 @@ pub fn read(path: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// A search with the agent's file tool in `path`, limited to the files `glob` names (several
+/// globs separated by spaces or commas, braces allowed): denied when the glob itself picks files
+/// that `read` keeps out (`.env*`, `**/.env.local`, `*.rs .env`, `{.env,.env.prod}`, `*.pem`).
+pub fn search(path: &str, glob: &str) -> Option<String> {
+    read(path).or_else(|| {
+        glob_parts(glob)
+            .iter()
+            .flat_map(|part| expand_braces(part, 0))
+            .map(|alt| alt.trim_end_matches('*').to_string())
+            .filter(|alt| !alt.is_empty())
+            .find_map(|alt| read(&alt))
+    })
+}
+
+/// The globs of a glob list: split at spaces and commas outside braces.
+fn glob_parts(glob: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut depth = 0usize;
+    for c in glob.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && (c == ',' || c.is_whitespace()) {
+            parts.push(std::mem::take(&mut part));
+        } else {
+            part.push(c);
+        }
+    }
+    parts.push(part);
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+/// The globs a brace pattern stands for: `a{b,c{d,e}}` → `ab`, `acd`, `ace`.
+fn expand_braces(glob: &str, depth: usize) -> Vec<String> {
+    let Some(open) = glob.find('{').filter(|_| depth < 16) else {
+        return vec![glob.to_string()];
+    };
+    let mut level = 0usize;
+    let mut alts = Vec::new();
+    let mut start = open + 1;
+    for (i, c) in glob[open..].char_indices().map(|(i, c)| (open + i, c)) {
+        match c {
+            '{' => level += 1,
+            '}' => {
+                level -= 1;
+                if level == 0 {
+                    alts.push(&glob[start..i]);
+                    let (head, tail) = (&glob[..open], &glob[i + 1..]);
+                    return alts
+                        .iter()
+                        .flat_map(|alt| expand_braces(&format!("{head}{alt}{tail}"), depth + 1))
+                        .take(256)
+                        .collect();
+                }
+            }
+            ',' if level == 1 => {
+                alts.push(&glob[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    // no closing brace: a literal `{`
+    vec![glob.to_string()]
 }
 
 /// One line of context for a new session: that sealctl exists, and which secrets (names only).
@@ -584,6 +754,8 @@ mod tests {
             "gh pr list",
             "ls -la",
             "echo hello",
+            "echo \"$(date) and $(case $x in a) echo sealctl;; esac)\" done",
+            "echo \"`date`\" \"$(git rev-parse HEAD)\"",
             "env FOO=bar cargo run",
             "grep -r environment src/",
             "cat README.md",
@@ -646,6 +818,16 @@ mod tests {
             "sh -lc \"sealctl unpair --yes\"",
             "eval sealctl secret get k",
             "echo \"$(sealctl secret get k)\"",
+            "echo \"$(date)\"; sealctl secret get k",
+            "echo \"`id`\" && sealctl recover",
+            "echo \"a $(echo \"b\") c\" | sealctl unseal --all",
+            "x=\"$(echo \")\")\"; sealctl buy",
+            "echo \"$(case x in a) sealctl secret get k;; esac)\"",
+            "echo \"$(case x in a) echo '\"';; esac)\"; sealctl secret get k",
+            "echo \"$(case x in (a) y;; b) z;; esac) w\"; sealctl recover",
+            "echo \"$(date)\" \"$(case x in a) y;; esac)\"; sealctl unseal --all",
+            "echo \"$(case x in a) X\"; sealctl secret get k; echo \"Y)\"",
+            "bash -c 'echo \"$(case x in a) X\"; sealctl secret get k; echo \"Y)\"'",
             "x=`sealctl secret get k`; echo $x",
             "if sealctl secret get k >/dev/null; then echo y; fi",
             "true && (sealctl seal ssh ~/.ssh/id_ed25519)",
@@ -658,6 +840,82 @@ mod tests {
         ] {
             assert!(bash(c).is_some(), "should deny: {c}");
         }
+    }
+
+    #[test]
+    fn keyword_only_lines_are_checked_in_linear_time() {
+        // a `case` counts only after keywords; that check must not rescan the command per word
+        let started = std::time::Instant::now();
+        let line = format!("{}; sealctl secret get k", "do ".repeat(100_000));
+        let why = bash(&line);
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("secret get") || w.contains(TOO_COMPLEX)),
+            "should deny: {why:?}"
+        );
+        let eval = format!("eval {}; sealctl secret get k", "do ".repeat(100_000));
+        assert!(bash(&eval).is_some(), "should deny the eval form");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+        // `case` after keywords still opens a case
+        assert!(bash("if case x in a) sealctl secret get k ;; esac").is_some());
+    }
+
+    #[test]
+    fn oversized_command_lines_are_denied() {
+        let line = format!("{}; true", "x".repeat(MAX_COMMAND_BYTES));
+        assert_eq!(
+            bash(&line).as_deref(),
+            Some(format!("sealctl: {TOO_COMPLEX}").as_str())
+        );
+    }
+
+    #[test]
+    fn nested_commands_are_checked_in_bounded_time() {
+        // many distinct `eval` and `sh -c` chains, each nested as deep as is checked, then a
+        // denied command: every reading of every level used to be looked into separately
+        // (4^depth work per chain)
+        let chains: Vec<String> = (0..300)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("eval eval eval eval eval eval eval eval x{i}")
+                } else {
+                    format!("bash -c 'eval eval eval eval eval eval eval y{i}'")
+                }
+            })
+            .collect();
+        let line = format!("{} ; sealctl secret get k", chains.join(" ; "));
+        let started = std::time::Instant::now();
+        let why = bash(&line);
+        let took = started.elapsed();
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("secret get")),
+            "should deny: {why:?}"
+        );
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+        // the chains alone are fine
+        assert!(bash(&chains.join(" ; ")).is_none());
+
+        // deeper than is checked: denied, not let through
+        for c in [
+            "eval eval eval eval eval eval eval eval eval sealctl secret get k",
+            "eval eval eval eval eval eval eval eval eval x",
+            "sh -c \"sh -c 'eval eval eval eval eval eval eval eval x'\"",
+        ] {
+            assert_eq!(
+                bash(c).as_deref(),
+                Some(format!("sealctl: {TOO_COMPLEX}").as_str()),
+                "{c}"
+            );
+        }
+        // when the budget runs out, the command is denied
+        let mut budget = 100;
+        assert_eq!(
+            sealctl_in(&"echo hello ".repeat(10), 0, &mut budget),
+            Some(TOO_COMPLEX)
+        );
+        let mut budget = 1000;
+        assert_eq!(sealctl_in(&"echo hello ".repeat(10), 0, &mut budget), None);
     }
 
     #[test]
@@ -701,6 +959,33 @@ mod tests {
         assert!(read("/home/u/.aws/credentials").is_some());
         assert!(read("/home/u/.npmrc").is_some());
         assert!(read("/p/app/credentials").is_none());
+        for g in [
+            ".env*",
+            "**/.env",
+            ".env.*",
+            "{.env,.env.local}",
+            "*.pem",
+            ".env *.rs",
+            "*.rs .env",
+            "*.rs,.env.local",
+            "*.{rs,pem}",
+            "**/{src,.}/.env",
+            "{*.rs,{.env,x}}",
+        ] {
+            assert!(search("/p", g).is_some(), "should deny: {g}");
+        }
+        for g in [
+            "",
+            "*.rs",
+            "**/*.{ts,tsx}",
+            ".env.example",
+            "src/**",
+            "*.rs *.toml",
+            "{.env.example,.env.sample}",
+            "{unclosed",
+        ] {
+            assert!(search("/p", g).is_none(), "should allow: {g}");
+        }
         assert!(write(
             "/p/config.ts",
             "const key = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123'"

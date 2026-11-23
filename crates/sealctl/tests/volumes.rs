@@ -154,6 +154,13 @@ fn sparse_bundle_volume_with_backup_lock_and_unseal() {
     assert_eq!(v["volumes"][0]["mounted"], true, "{out}");
     let (code, _, err) = env.run(&["volume", "close", "v1"]);
     assert_eq!(code, 0, "{err}");
+    if restic_ok {
+        // a mount point folder left behind is not the volume: no empty snapshot of it
+        std::fs::create_dir_all(&mnt).unwrap();
+        let (code, _, err) = env.run(&["backup", "run", "b1", "--quiet"]);
+        assert_ne!(code, 0, "backed up a closed volume");
+        assert!(err.contains("Volume v1 is not open."), "{err}");
+    }
 
     // unseal the volume (and the backup): new passwords in the folder, sealctl's gone
     let mut c = env.cmd();
@@ -559,4 +566,48 @@ fn sealing_a_bundle_resumed_after_a_kill_at_its_marker_uses_its_id() {
     let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["volume", "open", "left"]));
     assert_eq!(code, 0, "{err}");
     env.run(&["volume", "close", "left"]);
+}
+
+#[test]
+fn unreadable_files_still_make_a_backup_and_retention_runs() {
+    if !have("restic") {
+        return;
+    }
+    let mut env = Env::new();
+    env.pair();
+    let src = env.h().join("docs");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), canary()).unwrap();
+    let locked = src.join("locked.txt");
+    std::fs::write(&locked, "x").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        return; // root reads it anyway
+    }
+    let repos = env.h().join("repos");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&[
+            "backup",
+            "init",
+            "docs",
+            "--from",
+            src.to_str().unwrap(),
+            "--repo",
+            repos.to_str().unwrap(),
+        ])
+    });
+    assert_eq!(code, 0, "{err}");
+    // restic exits 3: the snapshot is made, one file is missing from it
+    let (code, _, err) = env.run(&["backup", "run", "docs", "--quiet"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("Backed up docs (some files could not be read)."),
+        "{err}"
+    );
+    let state = std::fs::read_to_string(env.h().join("s/sealctl/backup/docs.toml")).unwrap();
+    assert!(state.contains("last_success"), "{state}");
+    assert!(state.contains("last_prune"), "forget ran: {state}");
+    assert!(state.contains("could not be read"), "{state}");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
 }

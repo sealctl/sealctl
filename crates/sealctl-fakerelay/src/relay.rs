@@ -470,28 +470,38 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             if sealed.is_empty() || sealed.len() > 4096 {
                 return err(400, "bad_sealed");
             }
-            let delay = body["delay"].as_u64();
+            // checked before anything changes, as the relay does
+            let delay = match body.get("delay") {
+                None => None,
+                Some(v) => match valid_delay(v) {
+                    Some(d) => Some(d),
+                    None => return err(400, "bad_delay"),
+                },
+            };
             let mut g = app.inner.lock().unwrap();
             let Some(p) = g.phones.get_mut(&phone) else {
                 return err(404, "gone");
             };
-            let Some(pend) = p.pending.remove(*id) else {
+            let Some(pend) = p.pending.get(*id) else {
                 return err(404, "gone");
             };
             if pend.tx.is_closed() || pend.expires < now_ms() {
+                p.pending.remove(*id);
                 return err(404, "gone");
             }
+            if delay.is_some() {
+                if let Some(e) = delayed_refused(p, id) {
+                    return e;
+                }
+            }
+            let pend = p.pending.remove(*id).expect("checked above");
             let day = now_ms() / 86_400_000;
             if p.last_day != day {
                 p.last_day = day;
                 p.days_used += 1;
             }
             match delay {
-                Some(d) if (1..=7200).contains(&d) => {
-                    if p.delayed.len() >= 4 {
-                        p.pending.insert(id.to_string(), pend);
-                        return err(429, "too_many_delayed");
-                    }
+                Some(d) => {
                     let created = now_ms();
                     let release_at = created + d * 1000;
                     p.delayed.insert(
@@ -514,7 +524,6 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                     }
                     ok(200, json!({"delivered": true, "releaseAt": release_at}))
                 }
-                Some(_) => err(400, "bad_delay"),
                 None => {
                     let _ = pend.tx.send(Out::Close(
                         json!({"type": "reply", "id": id, "sealed": sealed}).to_string(),
@@ -657,17 +666,16 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         }
         (Method::POST, ["delayed"]) if is_phone => {
             let id = body["id"].as_str().unwrap_or("").to_string();
-            let delay = body["delay"].as_u64().unwrap_or(0);
             if id.len() != 22 {
                 return err(400, "bad_id");
             }
-            if !(1..=7200).contains(&delay) {
+            let Some(delay) = valid_delay(&body["delay"]) else {
                 return err(400, "bad_delay");
-            }
+            };
             let mut g = app.inner.lock().unwrap();
             let p = g.phones.entry(phone.clone()).or_default();
-            if p.delayed.contains_key(&id) {
-                return err(409, "duplicate_id");
+            if let Some(e) = delayed_refused(p, &id) {
+                return e;
             }
             let created = now_ms();
             let release_at = created + delay * 1000;
@@ -758,6 +766,31 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         }
         _ => err(403, "forbidden"),
     }
+}
+
+/// A delay in seconds: a whole number from 1 to 7200 (`60.0` too, as JSON numbers go).
+fn valid_delay(v: &Value) -> Option<u64> {
+    let d = v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.fract() == 0.0 && *f >= 0.0)
+            .map(|f| f as u64)
+    })?;
+    (1..=7200).contains(&d).then_some(d)
+}
+
+/// Why a new delayed approval `id` is refused: the id is taken, 4 are live (not cancelled) or
+/// 16 are kept at all. Expired records go first.
+fn delayed_refused(p: &mut PhoneRec, id: &str) -> Option<Response> {
+    let n = now_ms();
+    p.delayed.retain(|_, d| d.expires > n);
+    if p.delayed.contains_key(id) {
+        return Some(err(409, "duplicate_id"));
+    }
+    let live = p.delayed.values().filter(|d| d.cancelled.is_none()).count();
+    if live >= 4 || p.delayed.len() >= 16 {
+        return Some(err(429, "too_many_delayed"));
+    }
+    None
 }
 
 fn delayed_json(id: &str, d: &DelayedRec, n: u64) -> Value {

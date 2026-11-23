@@ -385,11 +385,14 @@ pub fn backup_run(names: &[String], all: bool, if_open: bool, quiet: bool) -> Re
     let mut failed = Vec::new();
     for b in list {
         let (key, env) = backup_material(&b)?;
-        if let Err(e) = backup::run_one(&b, &key, env, quiet) {
-            eprintln!("sealctl: backup {} failed: {}", b.name, exit::message_of(&e));
-            failed.push(b.name.clone());
-        } else if !quiet {
-            eprintln!("Backed up {}.", b.name);
+        match backup::run_one(&b, &key, env, quiet) {
+            Err(e) => {
+                eprintln!("sealctl: backup {} failed: {}", b.name, exit::message_of(&e));
+                failed.push(b.name.clone());
+            }
+            Ok(Some(warning)) => eprintln!("Backed up {} ({warning}).", b.name),
+            Ok(None) if !quiet => eprintln!("Backed up {}.", b.name),
+            Ok(None) => {}
         }
     }
     if !failed.is_empty() {

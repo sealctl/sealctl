@@ -261,6 +261,15 @@ impl Repo {
 
     /// Runs restic with output shown (stdout optional).
     pub fn run(&self, args: &[&str], quiet: bool) -> Result<()> {
+        let status = self.run_status(args, quiet)?;
+        if !status.success() {
+            bail!("restic {} failed ({status})", args.first().unwrap_or(&""));
+        }
+        Ok(())
+    }
+
+    /// The same, returning how restic exited.
+    pub fn run_status(&self, args: &[&str], quiet: bool) -> Result<std::process::ExitStatus> {
         let mut c = self.command();
         c.args(args).stdin(Stdio::piped());
         if quiet {
@@ -274,11 +283,7 @@ impl Repo {
             let mut i = child.stdin.take().context("stdin")?;
             i.write_all(self.password.as_bytes())?;
         }
-        let status = child.wait()?;
-        if !status.success() {
-            bail!("restic {} failed ({status})", args.first().unwrap_or(&""));
-        }
-        Ok(())
+        Ok(child.wait()?)
     }
 
     /// Does the password open the repository?
@@ -474,23 +479,33 @@ pub fn init(opts: InitOpts<'_>, new_key: &mut crate::volume::NewKey<'_>) -> Resu
     Ok((b, key))
 }
 
-/// Runs one backup now, then `forget` with the policy (`--prune` at most weekly).
+/// Runs one backup now, then `forget` with the policy (`--prune` at most weekly). `Some` is a
+/// warning: the snapshot was made but is missing something.
 pub fn run_one(
     b: &Backup,
     key: &ObjectKey,
     env: BTreeMap<String, Zeroizing<String>>,
     quiet: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if key.check() != b.check {
         return Err(fail(
             exit::WRONG_KEY,
             format!("The key does not open backup {} (check mismatch).", b.name),
         ));
     }
-    if !b.source.is_dir() {
+    // a closed volume can leave its empty mount point folder behind: backing that up would
+    // make an empty snapshot that `forget` then keeps in place of the real ones
+    let there = match &b.volume {
+        Some(v) => crate::volume::Volume::load(v).is_ok_and(|v| v.is_open()),
+        None => b.source.is_dir(),
+    };
+    if !there {
         return Err(fail(
             exit::NOT_FOUND,
-            format!("{} is not there (volume closed?).", b.source.display()),
+            match &b.volume {
+                Some(v) => format!("Volume {v} is not open."),
+                None => format!("{} is not there.", b.source.display()),
+            },
         ));
     }
     let repo = Repo::new(&b.repo, key, env);
@@ -516,11 +531,17 @@ pub fn run_one(
     if quiet {
         args.push("--quiet");
     }
-    let r = repo.run(&args, quiet);
+    // restic exits 3 when it made the snapshot but could not read some files (it lists them)
+    let r = match repo.run_status(&args, quiet) {
+        Ok(s) if s.success() => Ok(None),
+        Ok(s) if s.code() == Some(3) => Ok(Some("some files could not be read".to_string())),
+        Ok(s) => Err(anyhow::anyhow!("restic backup failed ({s})")),
+        Err(e) => Err(e),
+    };
     match &r {
-        Ok(()) => {
+        Ok(warning) => {
             st.last_success = Some(now_secs());
-            st.last_error = None;
+            st.last_error = warning.clone();
             let prune = st
                 .last_prune
                 .is_none_or(|t| now_secs().saturating_sub(t) > 7 * 86_400);
