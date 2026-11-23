@@ -122,6 +122,7 @@ pub fn seal_volume_given(
 ) -> Result<()> {
     term::require_person("sealctl seal", None)?;
     volume::validate_name(name)?;
+    let _name = volume::lock_name(name)?;
     if Volume::load(name).is_ok() {
         return Err(fail(exit::USAGE, format!("Volume {name} exists already.")));
     }
@@ -136,6 +137,17 @@ pub fn seal_volume_given(
     let path = (kind != Kind::Apfs)
         .then(|| std::fs::canonicalize(p))
         .transpose()?;
+    // one seal (or other change) of this target at a time, from the marker read to the saved
+    // definition: a second seal whose phone answers late would write its own id over the marker
+    // of the first, leaving the bundle under a key its marker does not lead to
+    // (an APFS volume by its UUID, as every other command locks it, whatever name it was given)
+    let apfs_uuid = (kind == Kind::Apfs).then(|| uuid_of_apfs(target)).transpose()?;
+    let _lock = volume::lock_target(
+        kind,
+        path.as_deref(),
+        apfs_uuid.as_deref().unwrap_or(target),
+        target,
+    )?;
     // a marker with no volume of this machine on the bundle: left by a seal that stopped
     // before it finished; its id is used again if the passphrase still opens the bundle
     let mut leftover = None;
@@ -189,7 +201,7 @@ pub fn seal_volume_given(
             Some(f) => f.id.clone(),
             None => util::new_uuid()?,
         },
-        Kind::Apfs => uuid_of_apfs(target)?,
+        Kind::Apfs => apfs_uuid.clone().context("APFS volume UUID")?,
         Kind::Luks => {
             let out = util::system_cmd("cryptsetup")
                 .arg("luksUUID")
@@ -262,15 +274,29 @@ pub fn seal_volume_given(
             util::check(out, "cryptsetup luksAddKey")?;
         }
     }
-    // LUKS has slots: the user's goes only once the new key is known to open it
+    // LUKS has slots: the user's goes only once the new key is known to open it, and once the
+    // definition and marker are saved, so a stop right after never leaves a container that only
+    // sealctl's key opens without sealctl knowing it
     if kind == Kind::Luks && opens(new.as_bytes())? {
+        volume::write_marker(&vol)?;
+        vol.save()?;
         let out = util::run_with_stdin(
             util::system_cmd("cryptsetup")
                 .args(["luksRemoveKey", "--key-file=-"])
                 .arg(path.as_ref().expect("path")),
             old.as_bytes(),
         )?;
-        util::check(out, "cryptsetup luksRemoveKey")?;
+        util::check(out, "cryptsetup luksRemoveKey").map_err(|e| {
+            fail(
+                exit::ERROR,
+                format!(
+                    "Volume {name} is sealed, but removing your old passphrase failed ({}); your \
+                     passphrase still opens it too. Remove it with: cryptsetup luksRemoveKey {}",
+                    exit::message_of(&e),
+                    target
+                ),
+            )
+        })?;
     }
     // check before the old way in is gone: the new key opens it
     if !opens(new.as_bytes())? {
@@ -361,9 +387,11 @@ pub fn seal_backup_given(
 ) -> Result<()> {
     term::require_person("sealctl seal", None)?;
     volume::validate_name(name)?;
+    let _name = backup::lock_name(name)?;
     if Backup::load(name).is_ok() {
         return Err(fail(exit::USAGE, format!("Backup {name} exists already.")));
     }
+    let _lock = backup::lock_repo(repo)?;
     let repo_id = repo_id_of(repo)?;
     let (source, vol) = match from {
         Some(f) => match Volume::load(f) {
@@ -421,9 +449,6 @@ pub fn seal_backup_given(
     for (var, v) in &env {
         client::store_set(&format!("backup/{name}/{var}"), v.as_bytes(), false, true)?;
     }
-    if !keep_old {
-        new.key_remove(&old_key, &new_id)?;
-    }
     let b = Backup {
         name: name.into(),
         source,
@@ -435,7 +460,21 @@ pub fn seal_backup_given(
         credentials: env.keys().cloned().collect(),
         policy: Default::default(),
     };
+    // the definition before the user's key goes: a stop in between leaves a repository both
+    // open, never one only sealctl's key opens that sealctl does not know
     b.save()?;
+    if !keep_old {
+        new.key_remove(&old_key, &new_id).map_err(|e| {
+            fail(
+                exit::ERROR,
+                format!(
+                    "Backup {name} is sealed, but removing your old key failed ({}); your password \
+                     still opens it too.",
+                    exit::message_of(&e)
+                ),
+            )
+        })?;
+    }
     eprintln!(
         "Sealed backup {name} with words {fp}.{}",
         if keep_old {

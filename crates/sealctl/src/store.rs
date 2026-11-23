@@ -260,8 +260,66 @@ impl Store {
             .map_err(|_| fail(exit::WRONG_KEY, format!("{name} does not open with this key.")))
     }
 
-    /// Writes a secret. A replaced value keeps its file id; a new one gets a new id.
+    /// The lock between writers and a move to new words: `<state>/locks/store-<id>.lock`, on
+    /// this machine (the store folder may be synced, or on a file system without locks; the
+    /// writers and the rewrap are both on this machine). Writers through the daemon hold it
+    /// shared around the write itself, after any phone answer, and never wait; `migrate`'s
+    /// rewrap holds it exclusive from the listing of the files to the new `.id`.
+    fn lock_file(&self) -> String {
+        format!("store-{}.lock", self.id)
+    }
+
+    /// The writers' side of the store lock: shared, refused while a rewrap runs (exit 11).
+    pub fn lock_writes(&self) -> Result<StoreLock> {
+        crate::util::lock_named(
+            &self.lock_file(),
+            crate::util::LockHow::Shared,
+            &|| "The secret store is moving to new words (sealctl migrate). Try again once it ends.".into(),
+            &mut || {},
+        )
+    }
+
+    /// The rewrap's side of the store lock: exclusive, waiting up to a minute for the writes
+    /// under way (each one is a single file).
+    pub fn lock_rewrap(&self) -> Result<StoreLock> {
+        crate::util::lock_named(
+            &self.lock_file(),
+            crate::util::LockHow::ExclusiveWait(std::time::Duration::from_secs(60)),
+            &|| "The secret store is still being written to after a minute. Run it again.".into(),
+            &mut || eprintln!("Waiting for a secret write to finish..."),
+        )
+    }
+
+    /// Writes a secret. A replaced value keeps its file id; a new one gets a new id. A value
+    /// under the store key is written only with the key the `.id` file names: a session that
+    /// opened before the store moved to new words holds the old key, and a value sealed with it
+    /// would open with neither the store's key nor the words the file says.
     pub fn write(
+        &self,
+        name: &str,
+        mode: Mode,
+        key: &ObjectKey,
+        words: &str,
+        value: &[u8],
+        file_id: Option<&str>,
+    ) -> Result<()> {
+        if mode == Mode::StoreKey {
+            if let Some(f) = self.id_file()? {
+                if f.check != key.check() {
+                    return Err(fail(
+                        exit::WRONG_KEY,
+                        "The secret store moved to new words since this session opened. Lock \
+                         (sealctl lock) and try again.",
+                    ));
+                }
+            }
+        }
+        self.write_moved(name, mode, key, words, value, file_id)
+    }
+
+    /// [`Store::write`] without the `.id` check: the rewrap, writing the new key's files before
+    /// the `.id` names it.
+    pub fn write_moved(
         &self,
         name: &str,
         mode: Mode,
@@ -337,6 +395,9 @@ impl Store {
     }
 }
 
+/// A held [`Store::lock_writes`] or [`Store::lock_rewrap`]; released when dropped.
+pub type StoreLock = crate::util::ObjectLock;
+
 /// The `keys` item of an own-approval secret.
 pub fn own_item(store: &Store, header: &Header) -> Result<RequestItem> {
     let checks = store.own_checks()?;
@@ -358,9 +419,60 @@ mod tests {
     use super::*;
 
     fn store(dir: &Path) -> Store {
-        let d = dir.join("0b7d3c2e-5f4a-4b8e-9c1d-2a3b4c5d6e7f");
+        // an id of its own: the store lock is per id, and the tests run side by side
+        let d = dir.join(crate::util::new_uuid().unwrap());
         std::fs::create_dir_all(&d).unwrap();
         Store::at(&d).unwrap()
+    }
+
+    /// A session opened before `migrate` moved the store to new words still holds the old store
+    /// key: a write with it after the move is refused instead of sealing a value that neither
+    /// the store's key nor the words named in the file open.
+    #[test]
+    fn a_write_with_the_key_from_before_a_rewrap_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let old = ObjectKey::from_bytes(&[1; 16]).unwrap();
+        let new = ObjectKey::from_bytes(&[2; 16]).unwrap();
+        s.write_id(&s.new_id_file("aaaa", &old)).unwrap();
+        s.write("a/one", Mode::StoreKey, &old, "aaaa", b"one", None)
+            .unwrap();
+        crate::migrate::rewrap_one(&crate::migrate::Obj::Store(s.clone()), &old, &new, "bbbb", None).unwrap();
+        assert_eq!(s.read("a/one", &new).unwrap().as_slice(), b"one");
+        // the daemon's session key from before the move
+        let e = s
+            .write("a/two", Mode::StoreKey, &old, "bbbb", b"two", None)
+            .expect_err("refused");
+        assert_eq!(crate::exit::code_of(&e), exit::WRONG_KEY);
+        assert!(!s.exists("a/two"));
+        s.write("a/two", Mode::StoreKey, &new, "bbbb", b"two", None)
+            .unwrap();
+        assert_eq!(s.read("a/two", &new).unwrap().as_slice(), b"two");
+    }
+
+    /// While a rewrap holds the store, a write through the daemon is refused at once (it would
+    /// carry the old key, or land after the rewrap listed the files); a rewrap waits for a write
+    /// under way; after it, writes go on.
+    #[test]
+    fn writes_wait_out_a_rewrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let held = s.lock_rewrap().unwrap();
+        let e = s.lock_writes().err().expect("busy");
+        assert_eq!(crate::exit::code_of(&e), exit::BUSY);
+        drop(held);
+        let w1 = s.lock_writes().unwrap();
+        let w2 = s.lock_writes().unwrap();
+        let s2 = s.clone();
+        let rewrap = std::thread::spawn(move || s2.lock_rewrap().map(drop));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!rewrap.is_finished(), "the rewrap waits for the writes under way");
+        drop(w1);
+        drop(w2);
+        rewrap.join().unwrap().unwrap();
+        // the lock lives with this machine's state, never in the (maybe synced) store folder
+        assert!(!s.dir.join(".sealctl-write.lock").exists());
+        assert!(std::fs::read_dir(&s.dir).unwrap().next().is_none());
     }
 
     fn names(s: &Store) -> Vec<String> {
