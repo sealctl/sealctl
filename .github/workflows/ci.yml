@@ -83,8 +83,10 @@ jobs:
       # requests on the phone against locks and the clock: hold points in the daemon
       # (test-hold-<point>) and a wall clock moved on (test-clock-ahead-ms), every test of the file
       - run: cargo test --locked -p sealctl --features test-hooks --test daemon
+      # sparse bundles: runs resumed after a kill, and a lock while an open mounts (the daemon's
+      # `mount` hold point)
       - if: runner.os == 'macOS'
-        run: cargo test --locked -p sealctl --features test-hooks --test volumes resumed
+        run: cargo test --locked -p sealctl --features test-hooks --test volumes -- resumed a_lock_while_an_open_mounts
       # the keychain store, in the keychain file made above (macOS runner only)
       - if: runner.os == 'macOS'
         run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture

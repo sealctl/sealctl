@@ -96,8 +96,9 @@ fn locked_meanwhile() -> anyhow::Error {
 /// stops at that point: it writes `test-held-<point>` there and goes on once the test removes
 /// the first file, removing `test-held-<point>` as it goes (so each hold is seen afresh). A
 /// race between two events at a known point, for the integration tests. Points: `reply` (an
-/// answer from the phone in hand, before the caller checks it against locks) and `open-turn`
-/// (`open` has its turn and has not looked at the session yet).
+/// answer from the phone in hand, before the caller checks it against locks), `open-turn`
+/// (`open` has its turn and has not looked at the session yet) and `mount` (an auto volume of
+/// an `open` is about to mount, the session checked Open).
 #[allow(unused_variables)]
 async fn test_hold(point: &str) {
     #[cfg(feature = "test-hooks")]
@@ -861,6 +862,7 @@ impl Daemon {
             let Some(key) = key else { continue };
             let name = v.name.clone();
             let job = async move {
+                test_hold("mount").await;
                 tokio::task::spawn_blocking(move || {
                     let was = v.is_open();
                     crate::volume::open_with(&v, &key, None).map(|_| !was)
