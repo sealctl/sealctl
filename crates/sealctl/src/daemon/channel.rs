@@ -70,7 +70,7 @@ pub async fn run(d: Arc<Daemon>) {
         st.status_dirty || st.sent_state != "open"
     };
     if unsent {
-        if let Err(e) = d.send_status(&[]).await {
+        if let Err(e) = d.send_status().await {
             log::info!("status: {e:#}");
         }
     }

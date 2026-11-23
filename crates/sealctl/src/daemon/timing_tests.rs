@@ -340,7 +340,7 @@ async fn the_end_of_a_wait_is_told_to_the_phone() {
     });
     settle().await;
     // a status goes out while the phone is asked; the one at the end of the wait fails
-    d.send_status(&[]).await.unwrap();
+    d.send_status().await.unwrap();
     *d.t.status_failures.lock().unwrap() = 1;
     gate.add_permits(1);
     assert!(asking.await.unwrap());
@@ -549,7 +549,7 @@ async fn the_next_request_after_a_wait_finds_the_phone_told() {
     });
     settle().await;
     // the periodic status goes out while the phone is asked
-    d.send_status(&[]).await.unwrap();
+    d.send_status().await.unwrap();
     gate.add_permits(1);
     assert!(first.await.unwrap());
     // the next request follows at once
@@ -830,4 +830,44 @@ async fn a_lock_while_the_phone_is_asked_to_open_leaves_the_approval_with_its_co
     // the next open is a session again
     open(&d, &store_items()).await;
     assert!(d.st().open);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_status_with_a_busy_volume_is_sent_again_with_it() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.vol_busy.lock().unwrap().push_back(true);
+    open(&d, &store_items()).await;
+    settle().await;
+    *d.t.status_failures.lock().unwrap() = 1;
+    d.lock("cli", true, false).await;
+    assert!(d.t.events().contains(&"status locked failed".to_string()));
+    d.t.advance(61_000);
+    d.tick().await;
+    let e = d.t.events();
+    assert_eq!(
+        e.last().map(String::as_str),
+        Some("status locked busy 1"),
+        "the phone hears of the busy volume: {e:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_busy_volume_that_closed_is_told_even_when_that_status_failed() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.vol_busy.lock().unwrap().extend([true, false]);
+    open(&d, &store_items()).await;
+    d.lock("cli", true, false).await;
+    assert!(d.t.events().contains(&"status locked busy 1".to_string()));
+    // the retry a minute later closes it; its status fails
+    *d.t.status_failures.lock().unwrap() = 1;
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert!(d.t.events().contains(&"status locked failed".to_string()));
+    d.t.advance(61_000);
+    d.tick().await;
+    let e = d.t.events();
+    assert_eq!(
+        e.last().map(String::as_str),
+        Some("status locked"),
+        "the phone hears the volume closed: {e:?}"
+    );
 }

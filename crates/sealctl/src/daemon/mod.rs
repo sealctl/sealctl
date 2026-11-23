@@ -174,6 +174,10 @@ struct State {
     last_status: u64,
     /// The session state the last status told the phone (`open`, `waiting`, `locked`).
     sent_state: String,
+    /// Volumes a lock could not close, while the session stays Locked (SPEC 6.5 step 3).
+    busy: Vec<sealctl_core::wire::BusyVolume>,
+    /// The busy volumes the last status told the phone.
+    sent_busy: Vec<sealctl_core::wire::BusyVolume>,
     keys_used_month: u64,
 }
 
@@ -413,7 +417,7 @@ impl Daemon {
         // A status went out during the wait and said `waiting`: the phone hears the session is
         // Open again before this caller's next request (or the next caller's) reaches it.
         if told_waiting && !self.inproc {
-            if let Err(e) = self.send_status(&[]).await {
+            if let Err(e) = self.send_status().await {
                 log::info!("status: {e:#}");
             }
         }
@@ -620,6 +624,7 @@ impl Daemon {
                 st.saved.rate = u64::from(reply.rate.unwrap_or(0));
                 st.saved.place = reply.place.clone();
                 st.saved.lock_reason = None;
+                st.busy.clear();
                 st.saved.work(n);
                 st.store_key = set.get(&key_name("secrets", store_id)).map(copy_key);
                 for (k, v) in &set {
@@ -633,7 +638,7 @@ impl Daemon {
             // The phone hears the session is Open before this caller (or one that joined the
             // open) sends its next request, not when the machine channel gets to it.
             if !self.inproc {
-                if let Err(e) = self.send_status(&[]).await {
+                if let Err(e) = self.send_status().await {
                     log::info!("status: {e:#}");
                     // tried again at the next tick
                     self.st().last_status = 0;
@@ -1227,6 +1232,10 @@ impl Daemon {
                 st.keys.clear();
                 st.allowed.clear();
                 st.mounted.clear();
+                // what step 3 found busy, for every status while Locked
+                if !reopened {
+                    st.busy = busy.clone();
+                }
             }
             st.status_dirty = true;
             let i = c
@@ -1236,7 +1245,7 @@ impl Daemon {
         };
         // step 5
         if c.was_open && !self.inproc {
-            let _ = self.send_status(&busy).await;
+            let _ = self.send_status().await;
         }
         if let Some(h) = channel {
             h.abort();
@@ -1338,8 +1347,16 @@ impl Daemon {
             drop(volumes);
             if now_busy != busy {
                 busy = now_busy;
+                {
+                    let mut st = self.st();
+                    if st.open || st.busy_retries != me {
+                        return;
+                    }
+                    st.busy = busy.clone();
+                }
+                // when it fails, the next sample sends it
                 if !self.inproc {
-                    let _ = self.send_status(&busy).await;
+                    let _ = self.send_status().await;
                 }
             }
             if busy.is_empty() {
@@ -1395,11 +1412,7 @@ impl Daemon {
     /// The session state and the unacknowledged usage log, as the status or report `seq`
     /// carries them. Called under the `paired` lock that numbered `seq`, so the newest entry a
     /// status carries never goes back as `seq` grows.
-    fn status_parts(
-        &self,
-        busy: &[sealctl_core::wire::BusyVolume],
-        seq: u64,
-    ) -> (sealctl_core::wire::SessionState, Vec<LogEntry>) {
+    fn status_parts(&self, seq: u64) -> (sealctl_core::wire::SessionState, Vec<LogEntry>) {
         {
             let mut st = self.st();
             let n = self.now();
@@ -1408,7 +1421,7 @@ impl Daemon {
                 left: st.open.then(|| st.saved.left(n)),
                 stop: st.saved.first_open.filter(|_| st.open).map(session::hard_stop),
                 place: st.saved.place.clone(),
-                busy: busy.to_vec(),
+                busy: if st.open { Vec::new() } else { st.busy.clone() },
             };
             let log = st.log.carry(seq);
             (s, log)
@@ -1421,7 +1434,7 @@ impl Daemon {
         paired.file.status_seq += 1;
         let seq = paired.file.status_seq;
         let _ = paired.file.save();
-        let (state, log) = self.status_parts(&[], seq);
+        let (state, log) = self.status_parts(seq);
         drop(paired);
         let mut b = approve::body("report");
         b.seq = Some(seq);
@@ -1439,12 +1452,13 @@ impl Daemon {
         }
     }
 
-    async fn send_status(&self, busy: &[sealctl_core::wire::BusyVolume]) -> Result<()> {
+    async fn send_status(&self) -> Result<()> {
         let mut paired = self.paired.lock().await;
         paired.file.status_seq += 1;
         let seq = paired.file.status_seq;
         let _ = paired.file.save();
-        let (state, log) = self.status_parts(busy, seq);
+        let (state, log) = self.status_parts(seq);
+        let busy = state.busy.clone();
         let status = sealctl_core::wire::MachineStatus {
             version: 1,
             time: self.now(),
@@ -1475,6 +1489,7 @@ impl Daemon {
             st.status_dirty = false;
             st.last_status = self.now();
             st.sent_state = s;
+            st.sent_busy = busy;
             return Ok(());
         }
         let sealed = sealctl_core::channel::seal_status(&paired.keys, &paired.phone, &status)
@@ -1492,6 +1507,7 @@ impl Daemon {
         st.status_dirty = false;
         st.last_status = self.now();
         st.sent_state = status.state.map(|s| s.session).unwrap_or_default();
+        st.sent_busy = busy;
         Ok(())
     }
 
@@ -1508,7 +1524,7 @@ impl Daemon {
             // the real channel sends a status first, then waits for messages
             tokio::spawn(async move {
                 let _stopped = testing::Stopped(me.clone());
-                let _ = me.send_status(&[]).await;
+                let _ = me.send_status().await;
                 std::future::pending::<()>().await;
             })
         } else {
@@ -1690,17 +1706,18 @@ impl Daemon {
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
                     || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000)
                     || (changed && n.saturating_sub(st.last_status) >= 10 * 1000));
-            // A Locked session whose last status still said Open (the lock's own status
-            // failed) tells the phone again every minute, once no lock is running.
+            // A Locked session whose last status still said Open, or told other busy volumes
+            // (a lock's or a retry's status failed), tells the phone again every minute, once
+            // no lock is running.
             let idle_locks = *self.locks_done.borrow() >= st.locks_begun;
             let unsent_lock = !st.open
                 && idle_locks
-                && matches!(st.sent_state.as_str(), "open" | "waiting")
+                && (matches!(st.sent_state.as_str(), "open" | "waiting") || st.busy != st.sent_busy)
                 && n.saturating_sub(st.last_status) > 60 * 1000;
             due || unsent_lock
         };
         if status_due && !self.inproc {
-            if let Err(e) = self.send_status(&[]).await {
+            if let Err(e) = self.send_status().await {
                 log::info!("status: {e:#}");
                 // A failed status (refused, rate limited, relay down) is tried again in a
                 // minute, not on every 15 s tick.
