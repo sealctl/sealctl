@@ -80,6 +80,9 @@ jobs:
       # long operations against each other: kill points, stand-in restic, a phone that holds
       # requests, and the phone's clock moved on (every test of the file, hooks included)
       - run: cargo test --locked -p sealctl --features test-hooks --test long_ops
+      # requests on the phone against locks and the clock: hold points in the daemon
+      # (test-hold-<point>) and a wall clock moved on (test-clock-ahead-ms), every test of the file
+      - run: cargo test --locked -p sealctl --features test-hooks --test daemon
       - if: runner.os == 'macOS'
         run: cargo test --locked -p sealctl --features test-hooks --test volumes resumed
       # the keychain store, in the keychain file made above (macOS runner only)

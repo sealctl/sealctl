@@ -100,6 +100,10 @@ pub struct App {
     phone_over_daily: Arc<std::sync::atomic::AtomicBool>,
     /// Signed calls from phones, counted (to check clients do not hammer the relay).
     phone_calls: Arc<std::sync::atomic::AtomicU64>,
+    /// While set, a machine socket upgrade is not answered (a relay slow to answer).
+    stall_machine_sockets: Arc<std::sync::atomic::AtomicBool>,
+    /// Machine socket upgrades asked for so far.
+    machine_socket_tries: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn now_ms() -> u64 {
@@ -137,6 +141,8 @@ impl FakeRelay {
             limited: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             phone_over_daily: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             phone_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stall_machine_sockets: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            machine_socket_tries: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let a2 = app.clone();
@@ -198,6 +204,20 @@ impl FakeRelay {
         self.app
             .phone_over_daily
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `on`, machine socket upgrades get no answer (the machine's own timeout ends them).
+    pub fn stall_machine_sockets(&self, on: bool) {
+        self.app
+            .stall_machine_sockets
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Machine socket upgrades asked for so far (stalled ones included).
+    pub fn machine_socket_tries(&self) -> u64 {
+        self.app
+            .machine_socket_tries
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Signed calls from phones so far.
@@ -654,6 +674,14 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         (Method::GET, ["machines", mid, "socket"]) if !is_phone && key == *mid && ws => {
             if !app.opts.lock().unwrap().machine_channel {
                 return err(404, "not_found");
+            }
+            app.machine_socket_tries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            while app
+                .stall_machine_sockets
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             let req = Request::from_parts(parts, Body::empty());
             let Ok(up) = WebSocketUpgrade::from_request(req, &()).await else {

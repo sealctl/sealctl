@@ -15,7 +15,7 @@ Output uses these words and no others for the same things: **Locked**, **Open**,
 | Session | The daemon's state for this user: Locked, Open or Waiting |
 | Locked | No keys in memory; volumes unmounted |
 | Open | Keys in memory; the user and known agents use them without asking |
-| Waiting | A request is on the phone. The CLI prints `Waiting for your phone` and gives up after 5 minutes |
+| Waiting | A request is on the phone. The CLI prints `Waiting for your phone` and gives up after 5 minutes (on the wall clock too: after the machine slept past them, the wait ends within a second of waking) |
 | Words fingerprint | 4 characters naming the words that sealed an object (protocol.md) |
 | Tag | 4 characters from the pairing key, shown as `#k7m2` |
 | Object | Anything sealed with a derived key: the secret store, an own-approval secret, a volume, a backup repository |
@@ -287,7 +287,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 
 ### 6.2 Socket
 
-`$XDG_STATE_HOME/sealctl/daemon.sock`, mode 0600 in a 0700 directory. The daemon checks the peer's uid (`getpeereid` on macOS, `SO_PEERCRED` on Linux) and closes any connection from another uid. Messages are JSON lines: `{"v": 1, "cli": "0.7.0", "op": ..., ...}` answered by `{"ok": true, ...}` or `{"ok": false, "error": <code>, "message": <text>}`, where `<code>` maps to the exit codes in 5.4. Values travel over this socket only in `values` and `own` answers.
+`$XDG_STATE_HOME/sealctl/daemon.sock`, mode 0600 in a 0700 directory. The daemon checks the peer's uid (`getpeereid` on macOS, `SO_PEERCRED` on Linux) and closes any connection from another uid. Messages are JSON lines: `{"v": 1, "cli": "0.7.0", "op": ..., ...}` answered by `{"ok": true, ...}` or `{"ok": false, "error": <code>, "message": <text>}`, where `<code>` maps to the exit codes in 5.4. Values travel over this socket only in `values` and `own` answers. One request per connection: the client keeps the connection open until the answer, and closing it earlier (Ctrl-C) withdraws the request it waits for on the phone.
 
 | Op | Does |
 | --- | --- |
@@ -313,7 +313,9 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
    └───── unpaired, daemon exit ◄──────────────────────────────────────────┘
 ```
 
-- **Waiting** is a sub-state: the daemon is Locked or Open and a request is on the phone. There is one pending `open` at a time; other callers that need the same session join it. A caller whose need the pending request does not cover (another agent use, an own-approval secret) gets its own request after the pending one is answered.
+- **Waiting** is a sub-state: the daemon is Locked or Open and a request is on the phone. There is one pending `open` at a time; other callers that need the same session join it. A caller whose need the pending request does not cover (another agent use, an own-approval secret) gets its own request after the pending one is answered; it is told it waits for the phone while it queues, and its need is judged again when its turn comes (an answer meanwhile may cover it). If the session it found Open locked while it queued, it ends there (exit 1, `The session locked while this command waited. Run it again.`): the phone is not asked for uses of a session that is gone.
+- **Ctrl-C:** a caller that closes its connection withdraws its request (the wait socket closes and the relay drops it); an answer that still comes grants nothing. Callers that joined it then ask for themselves.
+- **A refused open ends its joiners.** When the phone declines a pending open, or it gets no answer, the callers that joined it fail the same way (exit 4 or 5) instead of asking again at once. After a `once` grant (also one a lock made `once`), the asker's Ctrl-C or a relay error, they ask for themselves. A caller that found the session Open and only waited a moment for another caller's turn joined no request: it goes on, and asks the phone if the session locked meanwhile.
 - `grant: once` hands the keys to the waiting command only; the session stays Locked.
 - A `grant: session` answer (keys, agent uses) is kept only by the session that asked. When that session locked while the phone was asked, the waiting command still gets what was approved, but the keys and uses are not kept for a later session.
 - A lock asked for while the phone is asked to `open` (`sealctl lock`, a lock message) leaves the approval with the waiting command only, as `grant: once`: the session stays Locked. The same holds for an approval that arrives while the daemon exits.
@@ -351,7 +353,7 @@ While Open, the daemon keeps the phone informed and listens for locks (protocol.
 - The phone takes the session as Open by the machine's last status, so the status goes out when the session opens, before the command that asked (or one that joined its `open`) goes on to its next request, and before volumes are mounted. When a status went out while the phone was asked (`waiting`), a status saying Open follows as soon as the answer arrives, before the next request; if that fails, the next 15-second sample sends it. A request waiting for the phone (up to 5 minutes) holds up neither statuses nor messages: a `lock` from the phone applies at once.
 - Usage log entries wait in `usage.jsonl` until a status that carries them is acknowledged. The log holds names, agents, repositories and masked commands, never values.
 - A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"), unless it was made more than 60 seconds before the session's `open` was sent (a lock held from an earlier session; the minute allows for the phone's clock being behind). An `answers` message replaces `answers.json` (used by `sealctl rules`).
-- A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory, shows it in `sealctl status`, and shows a desktop notification (5.2) whether or not an agent is running:
+- A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory until a `cancelled` or `done` notice or note for it, or 15 minutes after its `at` (when the relay deletes the record; for one without `at`, the longest delay, 2 hours, counts from its arrival, and the notification says `It takes effect within 2 hours`), shows it in `sealctl status`, and shows a desktop notification (5.2) whether or not an agent is running:
   - pending: `sealctl: your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at 11:00. Not you? Run: sealctl cancel`. The relay's own note, without the phone's details, reads `sealctl: a sensitive action was approved on your phone. It takes effect at 11:00. Not you? Run: sealctl cancel`;
   - cancelled: `sealctl: cancelled from your phone: leaving sealctl on dev@mbp.example.com`;
   - done with a report: `sealctl: dev@mbp.example.com handed back 9 objects (macOS Keychain). 0 failed.`
