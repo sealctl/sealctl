@@ -199,6 +199,12 @@ impl Backend for Sparsebundle {
             .any(|m| super::same_path(std::path::Path::new(m), &v.mountpoint)))
     }
 
+    fn is_attached_unmounted(&self, v: &Volume) -> Result<bool> {
+        let path = v.path.as_ref().context("sparsebundle needs a path")?;
+        let a = attachments(path)?;
+        Ok(!a.is_empty() && a.iter().all(|x| x.mounts.is_empty()))
+    }
+
     fn change_passphrase(&self, v: &Volume, old: &[u8], new: &[u8]) -> Result<()> {
         let path = v.path.as_ref().context("sparsebundle needs a path")?;
         let mut input = Zeroizing::new(Vec::with_capacity(old.len() + new.len() + 2));
@@ -230,37 +236,59 @@ impl Backend for Sparsebundle {
 /// Does `passphrase` open the bundle? Attaches without mounting, then detaches. An image that
 /// is attached already is refused: attaching it again only reports the existing attachment
 /// (which says nothing about the passphrase), and detaching that would close the user's volume.
+/// The check's attachment is detached on every way out, an error included, and an image still
+/// attached after it is an error: a check never leaves a decrypted device behind.
 pub fn verify(path: &std::path::Path, passphrase: &[u8]) -> Result<bool> {
     if !attachments(path)?.is_empty() {
         bail!("{} is attached: close it first", path.display());
     }
+    let check = CheckAttachment { path, closed: false };
     let out = run_with_stdin(
         crate::util::system_cmd("hdiutil")
             .args(["attach", "-nomount", "-plist", "-stdinpass"])
             .arg(path),
         passphrase,
     )?;
-    if !out.status.success() {
-        return Ok(false);
+    check.close()?;
+    Ok(out.status.success())
+}
+
+/// The attachment of a key check: the image was not attached before it (`verify` refuses one
+/// that is), so every attachment of the image is the check's. Detached by `close`, or when
+/// dropped on an early return.
+struct CheckAttachment<'a> {
+    path: &'a std::path::Path,
+    closed: bool,
+}
+
+impl CheckAttachment<'_> {
+    fn close(mut self) -> Result<()> {
+        self.closed = true;
+        detach_check(self.path)
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // the first /dev/diskN entity is the whole image
-    if let Some(dev) = text
-        .split("<string>")
-        .filter_map(|s| s.split("</string>").next())
-        .find(|s| s.starts_with("/dev/disk"))
-    {
-        let base: String = dev.trim_start_matches("/dev/").to_string();
-        let whole = base
-            .char_indices()
-            .skip(4)
-            .find(|(_, c)| *c == 's')
-            .map_or(base.clone(), |(i, _)| base[..i].to_string());
-        let _ = crate::util::system_cmd("hdiutil")
-            .args(["detach", "-quiet", &format!("/dev/{whole}")])
-            .output();
+}
+
+impl Drop for CheckAttachment<'_> {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = detach_check(self.path);
+        }
     }
-    Ok(true)
+}
+
+/// Detaches a check's attachment: nothing is mounted from it, so a detach refused three times
+/// (the image busy right after it was attached) is forced.
+fn detach_check(path: &std::path::Path) -> Result<()> {
+    if detach_all(path, false).is_err() {
+        detach_all(path, true)?;
+    }
+    if !attachments(path)?.is_empty() {
+        bail!(
+            "{} is still attached after a key check: hdiutil detach it",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Replaces the passphrase (`hdiutil chpass`).
@@ -285,6 +313,73 @@ pub fn change_passphrase(path: &std::path::Path, old: &[u8], new: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sparse bundle at `path` with `pass`, made with `hdiutil create`.
+    #[cfg(target_os = "macos")]
+    fn bundle(path: &std::path::Path, pass: &str) {
+        let out = run_with_stdin(
+            crate::util::system_cmd("hdiutil")
+                .args([
+                    "create",
+                    "-quiet",
+                    "-size",
+                    "8m",
+                    "-type",
+                    "SPARSEBUNDLE",
+                    "-fs",
+                    "APFS",
+                ])
+                .args(["-encryption", "AES-256", "-stdinpass", "-volname", "v"])
+                .arg(path),
+            pass.as_bytes(),
+        )
+        .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A key check leaves nothing attached, whether the key opens the bundle or not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_key_check_leaves_nothing_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sparsebundle");
+        bundle(&path, "right-passphrase");
+        assert!(!verify(&path, b"wrong-passphrase").unwrap());
+        assert!(
+            attachments(&path).unwrap().is_empty(),
+            "after a key that does not open it"
+        );
+        assert!(verify(&path, b"right-passphrase").unwrap());
+        assert!(
+            attachments(&path).unwrap().is_empty(),
+            "after the key that opens it"
+        );
+    }
+
+    /// An early way out of a check (here a drop before `close`) detaches what it attached.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_check_attachment_is_detached_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sparsebundle");
+        bundle(&path, "pass");
+        {
+            let _check = CheckAttachment {
+                path: &path,
+                closed: false,
+            };
+            let out = run_with_stdin(
+                crate::util::system_cmd("hdiutil")
+                    .args(["attach", "-nomount", "-plist", "-stdinpass"])
+                    .arg(&path),
+                b"pass",
+            )
+            .unwrap();
+            assert!(out.status.success());
+            assert!(!attachments(&path).unwrap().is_empty());
+        }
+        assert!(attachments(&path).unwrap().is_empty());
+    }
 
     const INFO: &str = "framework       : 671.100.2
 driver          : 671.100.2
