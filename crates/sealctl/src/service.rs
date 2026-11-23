@@ -80,37 +80,7 @@ pub fn install(s: &Service) -> Result<()> {
         std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin".into());
 
     if cfg!(target_os = "macos") {
-        let args: String = s
-            .args
-            .iter()
-            .map(|a| format!("    <string>{}</string>\n", xml_escape(a)))
-            .collect();
-        let schedule = match s.every_secs {
-            Some(secs) => format!("  <key>StartInterval</key><integer>{secs}</integer>\n"),
-            None => "  <key>KeepAlive</key><true/>\n".into(),
-        };
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-{args}  </array>
-  <key>RunAtLoad</key><true/>
-{schedule}  <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{path}</string></dict>
-  <key>StandardOutPath</key><string>{log}</string>
-  <key>StandardErrorPath</key><string>{log}</string>
-  <key>ProcessType</key><string>Background</string>
-</dict>
-</plist>
-"#,
-            label = s.label,
-            path = xml_escape(&path_env),
-            log = xml_escape(&log.to_string_lossy()),
-        );
+        let plist = launchd_plist(s, &path_env, &log.to_string_lossy());
         let p = plist_path(s.label)?;
         fs::create_dir_all(p.parent().context("dir")?)?;
         let _ = crate::util::system_cmd("launchctl")
@@ -132,25 +102,7 @@ pub fn install(s: &Service) -> Result<()> {
         let dir = home()?.join(".config/systemd/user");
         fs::create_dir_all(&dir)?;
         let name = unit_name(s.label);
-        let exec = s
-            .args
-            .iter()
-            .map(|a| systemd_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let (svc_type, restart) = if s.every_secs.is_some() {
-            ("oneshot", "")
-        } else {
-            ("simple", "Restart=on-failure\n")
-        };
-        fs::write(
-            dir.join(format!("{name}.service")),
-            format!(
-                "[Unit]\nDescription={}\n\n[Service]\nType={svc_type}\nEnvironment={}\nExecStart={exec}\n{restart}\n[Install]\nWantedBy=default.target\n",
-                s.description,
-                systemd_quote(&format!("PATH={path_env}"))
-            ),
-        )?;
+        fs::write(dir.join(format!("{name}.service")), systemd_service(s, &path_env))?;
         let mut enable = format!("{name}.service");
         if let Some(secs) = s.every_secs {
             fs::write(
@@ -166,6 +118,71 @@ pub fn install(s: &Service) -> Result<()> {
         run(crate::util::system_cmd("systemctl").args(["--user", "enable", "--now", &enable]))?;
     }
     Ok(())
+}
+
+/// How long the service manager lets the daemon stop (SIGTERM, then SIGKILL): the exit locks,
+/// stops on-lock backups still running (restic has 10 s to remove its repository lock),
+/// unmounts and tells the phone.
+const STOP_TIMEOUT_SECS: u64 = 60;
+
+fn launchd_plist(s: &Service, path_env: &str, log: &str) -> String {
+    let args: String = s
+        .args
+        .iter()
+        .map(|a| format!("    <string>{}</string>\n", xml_escape(a)))
+        .collect();
+    let schedule = match s.every_secs {
+        Some(secs) => format!("  <key>StartInterval</key><integer>{secs}</integer>\n"),
+        None => format!(
+            "  <key>KeepAlive</key><true/>\n  <key>ExitTimeOut</key><integer>{STOP_TIMEOUT_SECS}</integer>\n"
+        ),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+{args}  </array>
+  <key>RunAtLoad</key><true/>
+{schedule}  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{path}</string></dict>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+"#,
+        label = s.label,
+        path = xml_escape(path_env),
+        log = xml_escape(log),
+    )
+}
+
+fn systemd_service(s: &Service, path_env: &str) -> String {
+    let exec = s
+        .args
+        .iter()
+        .map(|a| systemd_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // A long-running daemon gets SIGTERM alone (`KillMode=mixed`): it stops its own restic
+    // child with SIGINT. Whatever is left gets SIGKILL after the stop timeout.
+    let (svc_type, extra) = if s.every_secs.is_some() {
+        ("oneshot", String::new())
+    } else {
+        (
+            "simple",
+            format!("Restart=on-failure\nKillMode=mixed\nTimeoutStopSec={STOP_TIMEOUT_SECS}\n"),
+        )
+    };
+    format!(
+        "[Unit]\nDescription={}\n\n[Service]\nType={svc_type}\nEnvironment={}\nExecStart={exec}\n{extra}\n[Install]\nWantedBy=default.target\n",
+        s.description,
+        systemd_quote(&format!("PATH={path_env}"))
+    )
 }
 
 pub fn uninstall(label: &str) -> Result<()> {
@@ -249,6 +266,37 @@ fn systemd_quote(a: &str) -> String {
 
 #[cfg(test)]
 mod systemd_tests {
+    use super::*;
+
+    fn daemon() -> Service<'static> {
+        Service {
+            label: DAEMON_LABEL,
+            args: vec!["/usr/local/bin/sealctl".into(), "daemon".into()],
+            every_secs: None,
+            description: "sealctl session daemon",
+        }
+    }
+
+    #[test]
+    fn the_daemon_has_time_to_lock_when_stopped() {
+        let plist = launchd_plist(&daemon(), "/usr/bin", "/tmp/sealctl.log");
+        assert!(
+            plist.contains("<key>ExitTimeOut</key><integer>60</integer>"),
+            "{plist}"
+        );
+        let unit = systemd_service(&daemon(), "/usr/bin");
+        assert!(unit.contains("\nKillMode=mixed\n"), "{unit}");
+        assert!(unit.contains("\nTimeoutStopSec=60\n"), "{unit}");
+        assert!(unit.contains("\nRestart=on-failure\n"), "{unit}");
+        // a timer job keeps the defaults
+        let timer = Service {
+            every_secs: Some(3600),
+            ..daemon()
+        };
+        assert!(!launchd_plist(&timer, "/usr/bin", "/tmp/x.log").contains("ExitTimeOut"));
+        assert!(systemd_service(&timer, "/usr/bin").contains("Type=oneshot\n"));
+    }
+
     #[test]
     fn quoting() {
         assert_eq!(super::systemd_quote("/a b/sealctl"), "\"/a b/sealctl\"");

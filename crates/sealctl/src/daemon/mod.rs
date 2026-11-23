@@ -6,6 +6,10 @@
 pub mod channel;
 pub mod client;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod testing;
+#[cfg(test)]
+mod timing_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -31,6 +35,12 @@ use crate::{paths, util};
 use session::Saved;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// How long a lock or the daemon's exit waits for one volume's mount.
+const MOUNT_LIMIT: Duration = Duration::from_secs(120);
+
+/// How far the phone's clock may be behind the machine's for a `lock` message.
+const LOCK_SKEW_MS: u64 = 60_000;
 
 /// Set in the daemon process (the rewrap after a phone key change starts from there).
 pub static IN_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -118,9 +128,45 @@ impl UsageLog {
     }
 }
 
+impl State {
+    /// The state of a daemon starting at `n` with `saved` from `session.json`.
+    fn restored(saved: Saved, n: u64) -> State {
+        State {
+            sent_state: saved.told.clone().unwrap_or_default(),
+            saved,
+            last_client: n,
+            ..State::default()
+        }
+    }
+
+    /// The phone heard `state`.
+    fn told(&mut self, state: String, busy: Vec<sealctl_core::wire::BusyVolume>) {
+        self.status_dirty = false;
+        if self.saved.told.as_deref() != Some(state.as_str()) {
+            self.saved.told = Some(state.clone());
+            save_saved(&self.saved);
+        }
+        self.sent_state = state;
+        self.sent_busy = busy;
+    }
+
+    /// The session state as a status tells it.
+    fn state_word(&self) -> &'static str {
+        if self.waiting_since.is_some() {
+            "waiting"
+        } else if self.open {
+            "open"
+        } else {
+            "locked"
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     open: bool,
+    /// When the session's `open` was sent, Unix ms: a `lock` message made more than a minute
+    /// before it is old.
     opened_at: u64,
     saved: Saved,
     store_key: Option<ObjectKey>,
@@ -136,8 +182,26 @@ struct State {
     last_client: u64,
     mounted: Vec<String>,
     channel: Option<tokio::task::JoinHandle<()>>,
+    /// Machine channels of locks still running: each is closed at its lock's step 5, or at
+    /// once when a new session starts its own (two sockets on one machine key evict each other).
+    closing: Vec<tokio::task::JoinHandle<()>>,
+    /// Counts the sessions opened; work started for one session never lands in a later one.
+    generation: u64,
+    /// Locks begun; each runs its slow steps after the one before it has finished.
+    locks_begun: u64,
+    /// Locks asked for: every lock begun, and a lock message that found no session Open. An
+    /// `open` approved after one serves only the command that asked.
+    lock_asks: u64,
+    /// Busy-volume retries started (only the newest goes on).
+    busy_retries: u64,
     status_dirty: bool,
     last_status: u64,
+    /// The session state the last status told the phone (`open`, `waiting`, `locked`).
+    sent_state: String,
+    /// Volumes a lock could not close, while the session stays Locked (SPEC 6.5 step 3).
+    busy: Vec<sealctl_core::wire::BusyVolume>,
+    /// The busy volumes the last status told the phone.
+    sent_busy: Vec<sealctl_core::wire::BusyVolume>,
     keys_used_month: u64,
 }
 
@@ -152,6 +216,31 @@ pub struct Daemon {
     relay: Relay,
     inproc: bool,
     shutdown: tokio::sync::Notify,
+    /// The number of locks whose slow steps have finished (see `State::locks_begun`).
+    locks_done: tokio::sync::watch::Sender<u64>,
+    /// Held while volumes are mounted or a lock runs its backups and unmounts.
+    volumes: tokio::sync::Mutex<()>,
+    /// Set when the daemon begins to exit: no session opens any more, and on-lock backups
+    /// still running stop, so the exit's unmount and last status come within the service
+    /// manager's stop timeout.
+    exiting: tokio::sync::watch::Sender<bool>,
+    /// The same for restic, which runs on a blocking thread.
+    stop_backups: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    t: testing::Hooks,
+}
+
+/// What a lock took from the session at once (SPEC 6.5 step 1), for the slow steps.
+struct Closing {
+    /// Its place among the locks.
+    turn: u64,
+    was_open: bool,
+    /// On-lock backups run (step 2); `jobs` are the ones configured.
+    #[cfg_attr(not(test), allow(dead_code))]
+    backups: bool,
+    jobs: Vec<(Backup, ObjectKey, BTreeMap<String, Zeroizing<String>>)>,
+    /// The machine channel it closes at step 5.
+    channel: Option<tokio::task::Id>,
 }
 
 fn key_name(p: &str, i: &str) -> String {
@@ -183,6 +272,20 @@ fn save_saved(s: &Saved) {
     if let (Ok(p), Ok(b)) = (paths::session_file(), serde_json::to_vec(s)) {
         let _ = paths::ensure_private_dir(p.parent().expect("state dir"));
         let _ = paths::write_private(&p, &b);
+    }
+}
+
+/// Has the time of the session in `saved` run out at `n`? `Some(true)` past the hard stop, or
+/// when the wall clock went back more than a minute behind the last work (neither idle time nor
+/// the hard stop can be trusted then, so the credit goes too); `Some(false)` when the idle
+/// allowance is used up.
+fn expired(saved: &Saved, n: u64) -> Option<bool> {
+    if saved.past_hard_stop(n) || saved.last_work > n + 60_000 {
+        Some(true)
+    } else if saved.left(n) == 0 {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -232,13 +335,16 @@ impl Daemon {
     pub fn new(inproc: bool) -> Result<Arc<Daemon>> {
         let paired = machine::load()?;
         let relay = Relay::new(&paired.file.relay)?;
-        let saved = load_saved();
-        let st = State {
-            saved,
-            last_client: now(),
-            ..State::default()
-        };
-        Ok(Arc::new(Daemon {
+        Ok(Self::with(
+            paired,
+            relay,
+            inproc,
+            State::restored(load_saved(), now()),
+        ))
+    }
+
+    fn with(paired: Paired, relay: Relay, inproc: bool, st: State) -> Arc<Daemon> {
+        Arc::new(Daemon {
             st: Mutex::new(st),
             asking: tokio::sync::Mutex::new(()),
             opening: tokio::sync::Mutex::new(()),
@@ -246,7 +352,43 @@ impl Daemon {
             relay,
             inproc,
             shutdown: tokio::sync::Notify::new(),
-        }))
+            locks_done: tokio::sync::watch::channel(0).0,
+            volumes: tokio::sync::Mutex::new(()),
+            exiting: tokio::sync::watch::channel(false).0,
+            stop_backups: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            t: testing::Hooks::default(),
+        })
+    }
+
+    /// Wall clock, Unix ms (a test may set it).
+    fn now(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let t = self.t.now.load(std::sync::atomic::Ordering::SeqCst);
+            if t != 0 {
+                return t;
+            }
+        }
+        now()
+    }
+
+    /// Input idle time in seconds (a test may set it).
+    fn idle_input(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(v) = *self.t.idle.lock().unwrap() {
+            return v;
+        }
+        idle_input_secs()
+    }
+
+    /// The secret store (a test may give its own).
+    fn store(&self) -> Result<Store> {
+        #[cfg(test)]
+        if let Some(dir) = self.t.store.lock().unwrap().clone() {
+            return Store::at(&dir);
+        }
+        Store::configured()
     }
 
     fn st(&self) -> std::sync::MutexGuard<'_, State> {
@@ -277,44 +419,75 @@ impl Daemon {
 
     /// Asks the phone; one request at a time.
     async fn ask(
-        &self,
+        self: &Arc<Self>,
         body: sealctl_core::wire::RequestBody,
         ev: &Events,
         notify: bool,
     ) -> Result<ReplyBody> {
         let _turn = self.asking.lock().await;
-        self.st().waiting_since = Some(now());
+        self.st().waiting_since = Some(self.now());
         self.st().status_dirty = true;
         ev(json!({"event": "waiting"}));
         if notify && crate::guard::ai_agent().is_none() {
             util::notify("sealctl: waiting for your phone");
         }
-        let r = {
-            let mut paired = self.paired.lock().await;
-            approve::send(&self.relay, &mut paired, body, &mut |_| {}).await
+        let r = self.send_ask(body).await;
+        let told_waiting = {
+            let mut st = self.st();
+            st.waiting_since = None;
+            st.open && st.sent_state == "waiting"
         };
-        self.st().waiting_since = None;
+        // A status went out during the wait and said `waiting`: the phone hears the session is
+        // Open again before this caller's next request (or the next caller's) reaches it.
+        if told_waiting && !self.inproc {
+            if let Err(e) = self.send_status().await {
+                log::info!("status: {e:#}");
+            }
+        }
         match r {
-            Ok(Asked::Reply { reply, .. }) if reply.ok => {
+            Ok(Some(reply)) if reply.ok => {
                 if let Some(w) = &reply.w {
                     self.st().words = Some(w.clone());
                 }
                 ev(json!({"event": "answered"}));
                 Ok(reply)
             }
-            Ok(Asked::Reply { reply, .. }) => {
+            Ok(Some(reply)) => {
                 if reply.err.as_deref() == Some("declined") {
                     self.count_declined();
                 }
                 Err(approve::refusal(&reply, None, None))
             }
-            Ok(Asked::Delayed { .. }) => Err(fail(exit::ERROR, "The phone delayed a routine request.")),
+            Ok(None) => Err(fail(exit::ERROR, "The phone delayed a routine request.")),
             Err(e) => {
+                // the lock's slow steps run in the background: other requests do not wait
+                // behind a running lock's backups with this one
                 if exit::code_of(&e) == exit::NOT_PAIRED {
-                    self.lock("unpaired", true, false).await;
+                    self.lock_soon("unpaired", true, |_| Some(false));
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Sends one request and waits for the phone: its reply, or `None` when delayed.
+    async fn send_ask(&self, body: sealctl_core::wire::RequestBody) -> Result<Option<ReplyBody>> {
+        #[cfg(test)]
+        if let Some(c) = self.t.canned() {
+            self.t.event(format!("ask {}", body.why));
+            if let Some(g) = c.gate {
+                if let Ok(p) = g.acquire().await {
+                    p.forget();
+                }
+            }
+            if c.reply.err.as_deref() == Some(testing::UNPAIRED) {
+                return Err(exit::unpaired());
+            }
+            return Ok(Some(c.reply));
+        }
+        match approve::send_shared(&self.relay, &self.paired, body, &mut |_| {}, approve::WAIT).await? {
+            Asked::Reply { reply, .. } => Ok(Some(reply)),
+            Asked::Delayed { .. } => Ok(None),
         }
     }
 
@@ -391,6 +564,11 @@ impl Daemon {
         ev: &Events,
         notify: bool,
     ) -> Result<(bool, KeySet)> {
+        // unit tests have no store; they open with `open_with`
+        #[cfg(test)]
+        if self.t.offline() {
+            return Err(fail(exit::NOT_FOUND, "no store in unit tests"));
+        }
         let store = Store::configured()?;
         let new_store = store.id_file()?.is_none();
         let mut items = Self::open_items(&store)?;
@@ -399,11 +577,48 @@ impl Daemon {
                 items.push(e);
             }
         }
+        let store_id = store.id.clone();
+        self.open_with(items, &store_id, uses, ctx, ev, notify, |set, words| {
+            if new_store {
+                let k = set
+                    .get(&key_name("secrets", &store.id))
+                    .context("no store key in the reply")?;
+                store.write_id(&store.new_id_file(words, k))?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// The `open` request for `items` and what follows the answer; `first` runs before the
+    /// session takes the keys (a new store writes its `.id` file).
+    #[allow(clippy::too_many_arguments)]
+    async fn open_with(
+        self: &Arc<Self>,
+        items: Vec<RequestItem>,
+        store_id: &str,
+        uses: Vec<AgentUse>,
+        ctx: RequestContext,
+        ev: &Events,
+        notify: bool,
+        first: impl FnOnce(&BTreeMap<String, ObjectKey>, &str) -> Result<()>,
+    ) -> Result<(bool, KeySet)> {
         let mut body = approve::body("open");
         body.keys = items.clone();
         body.uses = uses;
         body.ctx = Some(ctx);
-        body.work = Some(self.st().saved.worked);
+        let (work, lock_asks) = {
+            let st = self.st();
+            (st.saved.worked, st.lock_asks)
+        };
+        body.work = Some(work);
+        if self.is_exiting() {
+            return Err(fail(
+                exit::ERROR,
+                "The sealctl daemon is stopping. Run the command again.",
+            ));
+        }
+        let asked_at = self.now();
         let reply = self.ask(body, ev, notify).await?;
         let keys = approve::keys_from(&reply, &items)?;
         let words = reply.w.clone().unwrap_or_default();
@@ -411,20 +626,22 @@ impl Daemon {
         for (item, key) in items.iter().zip(keys) {
             set.insert(key_name(&item.purpose, &item.id), key);
         }
-        if new_store {
-            let k = set
-                .get(&key_name("secrets", &store.id))
-                .context("no store key in the reply")?;
-            store.write_id(&store.new_id_file(&words, k))?;
-        }
+        first(&set, &words)?;
         let session = reply.grant.as_deref() == Some("session");
         if session {
-            let n = now();
-            {
+            let n = self.now();
+            let generation = {
                 let mut st = self.st();
+                // Checked under the same lock that opens the session: a lock asked for while
+                // the phone was asked (`sealctl lock`, a lock message), or an exit, leaves the
+                // keys with this command only (as `once`).
+                if self.is_exiting() || st.lock_asks != lock_asks {
+                    return Ok((false, KeySet(set)));
+                }
                 st.open = true;
-                st.opened_at = n;
-                if st.saved.past_hard_stop(n) {
+                st.opened_at = asked_at;
+                // past the hard stop, or saved while the clock was ahead: a new day of credit
+                if expired(&st.saved, n) == Some(true) || st.saved.first_open.is_some_and(|f| f > n) {
                     st.saved.reset_credit();
                 }
                 if st.saved.first_open.is_none() {
@@ -435,48 +652,136 @@ impl Daemon {
                 st.saved.rate = u64::from(reply.rate.unwrap_or(0));
                 st.saved.place = reply.place.clone();
                 st.saved.lock_reason = None;
+                st.busy.clear();
                 st.saved.work(n);
-                st.store_key = set.get(&key_name("secrets", &store.id)).map(copy_key);
+                st.store_key = set.get(&key_name("secrets", store_id)).map(copy_key);
                 for (k, v) in &set {
                     st.keys.insert(k.clone(), copy_key(v));
                 }
                 st.status_dirty = true;
+                st.generation += 1;
                 save_saved(&st.saved);
-            }
-            self.mount_auto().await;
+                st.generation
+            };
+            // The phone hears the session is Open before this caller (or one that joined the
+            // open) sends its next request, not when the machine channel gets to it.
             if !self.inproc {
-                self.start_channel();
+                if let Err(e) = self.send_status().await {
+                    log::info!("status: {e:#}");
+                    // tried again at the next tick
+                    self.st().last_status = 0;
+                }
+            }
+            self.mount_auto(generation).await;
+            if !self.inproc {
+                self.start_channel(generation);
             }
         }
         Ok((session, KeySet(set)))
     }
 
-    async fn mount_auto(&self) {
+    /// Mounts the auto volumes of session `generation`, while it stays Open. A lock meanwhile
+    /// unmounts after the mount in progress (both hold `volumes`), or after [`MOUNT_LIMIT`].
+    async fn mount_auto(self: &Arc<Self>, generation: u64) {
+        let _volumes = self.volumes.lock().await;
+        // unit tests mount one simulated volume, `safe`, never the developer's
+        #[cfg(test)]
+        if self.t.offline() {
+            let me = self.clone();
+            let job = async move {
+                me.t.mount.pass("mount", &me.t).await;
+                Ok(true)
+            };
+            self.mount_one("safe".into(), job).await;
+            return;
+        }
         let vols: Vec<Volume> = Volume::list()
             .unwrap_or_default()
             .into_iter()
             .filter(|v| !v.manual)
             .collect();
         for v in vols {
-            let key = self.st().keys.get(&key_name("volume", &v.id)).map(copy_key);
+            let key = {
+                let st = self.st();
+                if !st.open || st.generation != generation || self.is_exiting() {
+                    return;
+                }
+                st.keys.get(&key_name("volume", &v.id)).map(copy_key)
+            };
             let Some(key) = key else { continue };
             let name = v.name.clone();
-            let r = tokio::task::spawn_blocking(move || {
-                let was = v.is_open();
-                crate::volume::open_with(&v, &key).map(|_| !was)
-            })
-            .await;
-            match r {
-                Ok(Ok(true)) => self.st().mounted.push(name),
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => log::warn!("mounting {name}: {e:#}"),
-                Err(_) => {}
+            let job = async move {
+                tokio::task::spawn_blocking(move || {
+                    let was = v.is_open();
+                    crate::volume::open_with(&v, &key).map(|_| !was)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("the mount stopped"))?
+            };
+            self.mount_one(name, job).await;
+        }
+    }
+
+    /// Mounts one volume (`job` gives whether it mounted it). A mount that hangs (a password
+    /// prompt nobody sees, a stuck disk image) holds up the locks' unmounts for [`MOUNT_LIMIT`]
+    /// at most, and the daemon's exit not at all; if it finishes later, after the session
+    /// locked, the volume is closed again.
+    async fn mount_one(
+        self: &Arc<Self>,
+        name: String,
+        job: impl std::future::Future<Output = Result<bool>> + Send + 'static,
+    ) {
+        let mut job = tokio::spawn(job);
+        let mut exiting = self.exiting.subscribe();
+        // the daemon's exit does not wait for it either: the service manager gives it a minute
+        let done = tokio::select! {
+            r = tokio::time::timeout(MOUNT_LIMIT, &mut job) => r.ok(),
+            _ = exiting.wait_for(|e| *e) => None,
+        };
+        match done {
+            Some(Ok(Ok(true))) => self.st().mounted.push(name),
+            Some(Ok(Ok(false))) | Some(Err(_)) => {}
+            Some(Ok(Err(e))) => log::warn!("mounting {name}: {e:#}"),
+            None => {
+                log::warn!("mounting {name} did not finish in {} s", MOUNT_LIMIT.as_secs());
+                let me = self.clone();
+                tokio::spawn(async move {
+                    if !matches!(job.await, Ok(Ok(true))) {
+                        return;
+                    }
+                    // a session Open by now (this one, or one approved since) keeps it
+                    let _volumes = me.volumes.lock().await;
+                    let open = me.st().open;
+                    if open {
+                        me.st().mounted.push(name);
+                    } else {
+                        me.close_volumes(Some(std::slice::from_ref(&name)), false).await;
+                    }
+                });
             }
         }
     }
 
+    /// The Open session's store key, after the timers are checked again: the request may have
+    /// waited (for the phone, the pairing, its turn) since its first check.
+    fn session_store_key(self: &Arc<Self>) -> Result<ObjectKey> {
+        self.expire();
+        let key = if self.is_exiting() {
+            None
+        } else {
+            self.st().store_key.as_ref().map(copy_key)
+        };
+        key.ok_or_else(|| {
+            fail(
+                exit::ERROR,
+                "The session locked while this command waited. Run it again.",
+            )
+        })
+    }
+
     /// `open`.
     pub async fn op_open(self: &Arc<Self>, ctx: RequestContext, ev: &Events, notify: bool) -> Result<Value> {
+        self.expire();
         let _opening = self.join_open(ev).await;
         if !self.st().open {
             let (session, _) = self.open_session(vec![], vec![], ctx, ev, notify).await?;
@@ -484,7 +789,7 @@ impl Daemon {
                 return Ok(json!({"left": 0, "once": true}));
             }
         }
-        let left = self.st().saved.left(now());
+        let left = self.st().saved.left(self.now());
         Ok(json!({"left": left}))
     }
 
@@ -494,7 +799,8 @@ impl Daemon {
         req: ValuesReq,
         ev: &Events,
     ) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
-        let store = Store::configured()?;
+        self.expire();
+        let store = self.store()?;
         let mut headers = Vec::new();
         for n in &req.names {
             headers.push((n.clone(), store.header(n)?));
@@ -517,22 +823,30 @@ impl Daemon {
         // what is not covered yet is judged after any pending open: a caller that joined it may
         // find its uses granted for the session already
         let opening = self.join_open(ev).await;
+        // the waits before (the context, the turn) may have taken the session past its time
+        self.expire();
         let remembered = load_answers();
-        let uncovered: Vec<String> = match &req.agent {
-            Some(a) => req
-                .names
-                .iter()
-                .filter(|n| {
-                    let al = Allowed {
-                        agent: a.clone(),
-                        repo: repo.clone(),
-                        name: (*n).clone(),
-                    };
-                    !self.st().allowed.contains(&al) && !remembered.contains(&al)
-                })
-                .cloned()
-                .collect(),
-            None => vec![],
+        // what the session covers and whether it is Open, read together: a lock in between
+        // would leave uses counted as covered for the `open` that follows
+        let (was_open, mut generation, uncovered) = {
+            let st = self.st();
+            let uncovered: Vec<String> = match &req.agent {
+                Some(a) => req
+                    .names
+                    .iter()
+                    .filter(|n| {
+                        let al = Allowed {
+                            agent: a.clone(),
+                            repo: repo.clone(),
+                            name: (*n).clone(),
+                        };
+                        !st.allowed.contains(&al) && !remembered.contains(&al)
+                    })
+                    .cloned()
+                    .collect(),
+                None => vec![],
+            };
+            (st.open, st.generation, uncovered)
         };
         let uses = match &req.agent {
             Some(a) if !uncovered.is_empty() => vec![AgentUse {
@@ -546,12 +860,12 @@ impl Daemon {
         // Agent uses are kept for the session only when the phone granted `session`; a `once`
         // answer covers this call and nothing after it.
         let mut session_uses = false;
-        let was_open = self.st().open;
         if !was_open {
             let (session, set) = self
                 .open_session(vec![], uses.clone(), ctx_n.clone(), ev, req.notify)
                 .await?;
             session_uses = session;
+            generation = self.st().generation;
             if !session {
                 once_store_key = set.get("secrets", &store.id);
             }
@@ -581,7 +895,10 @@ impl Daemon {
         }
         if session_uses {
             let mut st = self.st();
-            for u in &uses {
+            // kept only by the session that was asked: one that locked meanwhile does not hand
+            // them to the next
+            let same = st.open && st.generation == generation;
+            for u in uses.iter().filter(|_| same) {
                 for n in &u.names {
                     st.allowed.insert(Allowed {
                         agent: u.agent.clone(),
@@ -593,12 +910,7 @@ impl Daemon {
         }
         let store_key = match once_store_key {
             Some(k) => k,
-            None => self
-                .st()
-                .store_key
-                .as_ref()
-                .map(copy_key)
-                .ok_or_else(|| fail(exit::ERROR, "The session has no store key."))?,
+            None => self.session_store_key()?,
         };
         // own-approval secrets: an `own` request every time
         let own: Vec<RequestItem> = headers
@@ -626,7 +938,7 @@ impl Daemon {
             };
             out.push((name.clone(), v));
         }
-        let n = now();
+        let n = self.now();
         {
             let mut st = self.st();
             if st.open {
@@ -655,9 +967,10 @@ impl Daemon {
         ev: &Events,
         notify: bool,
     ) -> Result<(Vec<ObjectKey>, String)> {
+        self.expire();
         let held = || -> Option<(Vec<ObjectKey>, String)> {
             let st = self.st();
-            if !st.open || items.iter().any(|i| i.words.is_none()) {
+            if !st.open || self.is_exiting() || items.iter().any(|i| i.words.is_none()) {
                 return None;
             }
             let keys = items
@@ -681,17 +994,25 @@ impl Daemon {
             return Ok((keys, w));
         }
         drop(opening);
-        // the session was opened while this request waited for that open
+        // the session was opened while this request waited for that open (and its time has
+        // not run out since)
+        self.expire();
         if let Some(h) = held() {
             return Ok(h);
         }
+        let generation = self.st().generation;
         let mut body = approve::body("keys");
         body.keys = items.clone();
         body.ctx = Some(ctx);
         let reply = self.ask(body, ev, notify).await?;
         let keys = approve::keys_from(&reply, &items)?;
+        // kept only by the session that asked: one that locked meanwhile does not hand them
+        // to the next
         if reply.grant.as_deref() == Some("session") {
             let mut st = self.st();
+            if !st.open || st.generation != generation {
+                return Ok((keys, reply.w.unwrap_or_default()));
+            }
             for (i, k) in items.iter().zip(keys.iter()) {
                 st.keys.insert(key_name(&i.purpose, &i.id), copy_key(k));
             }
@@ -701,7 +1022,8 @@ impl Daemon {
 
     /// `store`: write or rename a secret with the store key.
     pub async fn op_store(self: &Arc<Self>, req: &Value, ev: &Events) -> Result<Value> {
-        let store = Store::configured()?;
+        self.expire();
+        let store = self.store()?;
         let action = req["action"].as_str().unwrap_or("");
         let name = req["name"].as_str().unwrap_or("").to_string();
         crate::store::check_name(&name)?;
@@ -722,12 +1044,7 @@ impl Daemon {
         drop(opening);
         let key = match once_key {
             Some(k) => k,
-            None => self
-                .st()
-                .store_key
-                .as_ref()
-                .map(copy_key)
-                .ok_or_else(|| fail(exit::ERROR, "No store key."))?,
+            None => self.session_store_key()?,
         };
         let words = store.id_file()?.map(|f| f.words).unwrap_or_default();
         match action {
@@ -812,14 +1129,50 @@ impl Daemon {
         }
     }
 
-    /// Locks: wipes keys, runs on-lock backups, unmounts volumes, tells the phone.
-    pub async fn lock(&self, reason: &str, no_backup: bool, force: bool) -> Value {
-        // SPEC 6.5 step 1: the session closes and its keys leave the shared state before
-        // anything slow runs, so nothing is handed out while backups and unmounts go on, and a
-        // second lock meanwhile finds the session Locked. The backups get their keys and
-        // credentials here; everything else taken is wiped when it drops.
-        let (was_open, store_key, keys, channel) = {
+    /// Locks: wipes keys, runs on-lock backups, unmounts volumes, tells the phone (SPEC 6.5).
+    /// Waits for the slow steps, and for those of any lock still running before them.
+    pub async fn lock(self: &Arc<Self>, reason: &str, no_backup: bool, force: bool) -> Value {
+        let c = self.close(reason, no_backup, |_| Some(false));
+        match c {
+            Some(c) => tokio::spawn(self.clone().finish(c, force))
+                .await
+                .unwrap_or_else(|_| json!({"lines": [], "busy": 0})),
+            None => json!({"lines": [], "busy": 0}),
+        }
+    }
+
+    /// Locks at once if `when` gives `Some` for the state (checked under the same lock), and
+    /// runs the slow steps in the background. `Some(true)` also resets the credit (hard stop).
+    /// Returns whether it locked.
+    fn lock_soon(
+        self: &Arc<Self>,
+        reason: &str,
+        no_backup: bool,
+        when: impl FnOnce(&State) -> Option<bool>,
+    ) -> bool {
+        match self.close(reason, no_backup, when) {
+            Some(c) => {
+                tokio::spawn(self.clone().finish(c, false));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// SPEC 6.5 step 1: the session closes and its keys leave the shared state before anything
+    /// slow runs, so nothing is handed out while backups and unmounts go on, and a second lock
+    /// meanwhile finds the session Locked. The backups get their keys and credentials here;
+    /// everything else taken is wiped when it drops. `when` gives `None` to leave the session
+    /// as it is, or whether to reset the credit.
+    fn close(
+        &self,
+        reason: &str,
+        no_backup: bool,
+        when: impl FnOnce(&State) -> Option<bool>,
+    ) -> Option<Closing> {
+        let (turn, was_open, store_key, keys, channel) = {
             let mut st = self.st();
+            let reset_credit = when(&st)?;
             st.allowed.clear();
             st.answers_parts.clear();
             let was_open = std::mem::replace(&mut st.open, false);
@@ -828,17 +1181,31 @@ impl Daemon {
                 "place" => Some("Locked: your phone left the place".into()),
                 _ => None,
             };
+            // at the hard stop the credit goes with the session it ends, not with whatever
+            // session the phone approves while this lock's backups run
+            if reset_credit {
+                st.saved.reset_credit();
+            }
             save_saved(&st.saved);
             st.status_dirty = true;
+            st.locks_begun += 1;
+            st.lock_asks += 1;
+            let channel = st.channel.take().map(|h| {
+                let id = h.id();
+                st.closing.push(h);
+                id
+            });
             (
+                st.locks_begun,
                 was_open,
                 st.store_key.take(),
                 std::mem::take(&mut st.keys),
-                st.channel.take(),
+                channel,
             )
         };
+        let backups = was_open && !no_backup && reason != "words" && reason != "unpaired";
         let mut jobs = Vec::new();
-        if was_open && !no_backup && reason != "words" && reason != "unpaired" {
+        if backups {
             for b in Backup::list().unwrap_or_default() {
                 if !b.policy.on_lock {
                     continue;
@@ -850,32 +1217,163 @@ impl Daemon {
                 jobs.push((b, key, env));
             }
         }
-        drop(store_key);
-        drop(keys);
+        Some(Closing {
+            turn,
+            was_open,
+            backups,
+            jobs,
+            channel,
+        })
+    }
+
+    /// SPEC 6.5 steps 2 to 5, after the locks before this one finished theirs: a second lock
+    /// never unmounts under the first one's backups, and an exit waits for both.
+    async fn finish(self: Arc<Self>, c: Closing, force: bool) -> Value {
+        /// Marks this lock finished however its task ends.
+        struct Done<'a>(&'a tokio::sync::watch::Sender<u64>, u64);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                let turn = self.1;
+                self.0.send_modify(|d| *d = (*d).max(turn));
+            }
+        }
+        let _done = Done(&self.locks_done, c.turn);
+        let mut rx = self.locks_done.subscribe();
+        let _ = rx.wait_for(|d| *d + 1 >= c.turn).await;
+        // a mount in progress ends first: the backups read the volumes, step 3 closes them
+        drop(self.volumes.lock().await);
         let mut lines = Vec::new();
         let mut busy = Vec::new();
-        // step 2: on-lock backups, at most 15 minutes in total
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
-        for (b, key, env) in jobs {
+        // step 2: on-lock backups, at most 15 minutes in total, and stopped when the daemon
+        // exits
+        #[cfg(test)]
+        if c.backups {
+            let mut exiting = self.exiting.subscribe();
+            tokio::select! {
+                _ = self.t.backup.pass("backup", &self.t) => {}
+                _ = exiting.wait_for(|e| *e) => self.t.event("backup stopped"),
+            }
+        }
+        // restic is stopped at the limit: it holds the backup key and the storage credentials,
+        // and would otherwise run on (and keep volumes busy) after the lock gave up on it
+        let limit = crate::backup::Limit {
+            deadline: std::time::Instant::now() + Duration::from_secs(15 * 60),
+            stop: self.stop_backups.clone(),
+        };
+        for (b, key, env) in c.jobs {
             let name = b.name.clone();
-            let r = tokio::time::timeout_at(
-                deadline,
-                tokio::task::spawn_blocking(move || crate::backup::run_one(&b, &key, env, true)),
-            )
+            if self.is_exiting() {
+                lines.push(format!(
+                    "Backup {name} skipped; run sealctl backup run {name} later."
+                ));
+                continue;
+            }
+            let limit = limit.clone();
+            let r = tokio::task::spawn_blocking(move || {
+                crate::backup::run_one_until(&b, &key, env, true, Some(&limit))
+            })
             .await;
             match r {
-                Ok(Ok(Ok(None))) => lines.push(format!("Backed up {name}.")),
-                Ok(Ok(Ok(Some(warning)))) => lines.push(format!("Backed up {name} ({warning}).")),
+                Ok(Ok(None)) => lines.push(format!("Backed up {name}.")),
+                Ok(Ok(Some(warning))) => lines.push(format!("Backed up {name} ({warning}).")),
                 _ => lines.push(format!(
                     "Backup {name} failed; run sealctl backup run {name} later."
                 )),
             }
         }
-        // unmount
+        // step 3: unmount, unless the phone approved a new session meanwhile: the volumes are
+        // that session's now
+        let volumes = self.volumes.lock().await;
+        let reopened = self.st().open;
+        #[cfg(test)]
+        if !reopened {
+            self.t
+                .event(format!("unmount{}", if force { " force" } else { "" }));
+        }
+        if !reopened {
+            let (l, b) = self.close_volumes(None, force).await;
+            lines.extend(l);
+            busy = b;
+        }
+        drop(volumes);
+        // step 4
+        let channel = {
+            let mut st = self.st();
+            // Unless the phone approved a new session meanwhile, wipe what came in during the
+            // lock: a key or agent use approved by a request that started before it.
+            if !st.open {
+                st.store_key = None;
+                st.keys.clear();
+                st.allowed.clear();
+                st.mounted.clear();
+                // what step 3 found busy, for every status while Locked
+                if !reopened {
+                    st.busy = busy.clone();
+                }
+            }
+            st.status_dirty = true;
+            let i = c
+                .channel
+                .and_then(|id| st.closing.iter().position(|h| h.id() == id));
+            i.map(|i| st.closing.remove(i))
+        };
+        // step 5
+        if c.was_open && !self.inproc {
+            let _ = self.send_status().await;
+        }
+        if let Some(h) = channel {
+            h.abort();
+        }
+        if !busy.is_empty() && !self.inproc {
+            let me = {
+                let mut st = self.st();
+                st.busy_retries += 1;
+                st.busy_retries
+            };
+            tokio::spawn(self.clone().retry_busy(me, busy.clone()));
+        }
+        json!({"lines": lines, "busy": busy.len()})
+    }
+
+    /// Closes the auto volumes and those the session mounted (or only the volumes named
+    /// `only`). Returns the lines to show and the volumes still busy.
+    async fn close_volumes(
+        &self,
+        only: Option<&[String]>,
+        force: bool,
+    ) -> (Vec<String>, Vec<sealctl_core::wire::BusyVolume>) {
+        let mut lines = Vec::new();
+        let mut busy = Vec::new();
+        #[cfg(test)]
+        if let Some(b) = self.t.vol_busy.lock().unwrap().pop_front() {
+            // one simulated volume, `safe`
+            if b {
+                self.t.event("close safe busy");
+                busy.push(sealctl_core::wire::BusyVolume {
+                    name: "safe".into(),
+                    process: "test".into(),
+                    pid: None,
+                });
+            } else {
+                self.t.event("close safe");
+            }
+            return (lines, busy);
+        }
+        // unit tests never close the developer's volumes
+        #[cfg(test)]
+        if self.t.offline() {
+            if let Some(names) = only {
+                self.t.event(format!("close {}", names.join(",")));
+            }
+            return (lines, busy);
+        }
         let mounted: Vec<Volume> = Volume::list()
             .unwrap_or_default()
             .into_iter()
-            .filter(|v| !v.manual || self.st().mounted.contains(&v.name))
+            .filter(|v| match only {
+                Some(names) => names.contains(&v.name),
+                None => !v.manual || self.st().mounted.contains(&v.name),
+            })
             .collect();
         for v in mounted {
             let name = v.name.clone();
@@ -902,25 +1400,43 @@ impl Daemon {
                 Err(_) => {}
             }
         }
-        {
-            let mut st = self.st();
-            // Unless the phone approved a new session meanwhile, wipe what came in during the
-            // lock: a key or agent use approved by a request that started before it.
-            if !st.open {
-                st.store_key = None;
-                st.keys.clear();
-                st.allowed.clear();
-                st.mounted.clear();
+        (lines, busy)
+    }
+
+    /// SPEC 6.5 step 3: a busy volume is tried again every 60 seconds while the session stays
+    /// Locked, until it closes; the phone hears each change. Ends when a session opens (the
+    /// volumes are its own then) or a later lock starts its own retries.
+    async fn retry_busy(self: Arc<Self>, me: u64, mut busy: Vec<sealctl_core::wire::BusyVolume>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let volumes = self.volumes.lock().await;
+            {
+                let st = self.st();
+                if st.open || st.busy_retries != me {
+                    return;
+                }
             }
-            st.status_dirty = true;
+            let names: Vec<String> = busy.iter().map(|b| b.name.clone()).collect();
+            let (_, now_busy) = self.close_volumes(Some(&names), false).await;
+            drop(volumes);
+            if now_busy != busy {
+                busy = now_busy;
+                {
+                    let mut st = self.st();
+                    if st.open || st.busy_retries != me {
+                        return;
+                    }
+                    st.busy = busy.clone();
+                }
+                // when it fails, the next sample sends it
+                if !self.inproc {
+                    let _ = self.send_status().await;
+                }
+            }
+            if busy.is_empty() {
+                return;
+            }
         }
-        if was_open && !self.inproc {
-            let _ = self.send_status(&busy).await;
-        }
-        if let Some(c) = channel {
-            c.abort();
-        }
-        json!({"lines": lines, "busy": busy.len()})
     }
 
     /// Storage credentials of a backup, read with the session's store key.
@@ -944,7 +1460,7 @@ impl Daemon {
     /// `status`.
     pub fn status(&self) -> Value {
         let st = self.st();
-        let n = now();
+        let n = self.now();
         let state = if st.waiting_since.is_some() {
             "waiting"
         } else if st.open {
@@ -970,26 +1486,16 @@ impl Daemon {
     /// The session state and the unacknowledged usage log, as the status or report `seq`
     /// carries them. Called under the `paired` lock that numbered `seq`, so the newest entry a
     /// status carries never goes back as `seq` grows.
-    fn status_parts(
-        &self,
-        busy: &[sealctl_core::wire::BusyVolume],
-        seq: u64,
-    ) -> (sealctl_core::wire::SessionState, Vec<LogEntry>) {
+    fn status_parts(&self, seq: u64) -> (sealctl_core::wire::SessionState, Vec<LogEntry>) {
         {
             let mut st = self.st();
-            let n = now();
+            let n = self.now();
             let s = sealctl_core::wire::SessionState {
-                session: if st.waiting_since.is_some() {
-                    "waiting".into()
-                } else if st.open {
-                    "open".into()
-                } else {
-                    "locked".into()
-                },
+                session: st.state_word().into(),
                 left: st.open.then(|| st.saved.left(n)),
                 stop: st.saved.first_open.filter(|_| st.open).map(session::hard_stop),
                 place: st.saved.place.clone(),
-                busy: busy.to_vec(),
+                busy: if st.open { Vec::new() } else { st.busy.clone() },
             };
             let log = st.log.carry(seq);
             (s, log)
@@ -1002,7 +1508,7 @@ impl Daemon {
         paired.file.status_seq += 1;
         let seq = paired.file.status_seq;
         let _ = paired.file.save();
-        let (state, log) = self.status_parts(&[], seq);
+        let (state, log) = self.status_parts(seq);
         drop(paired);
         let mut b = approve::body("report");
         b.seq = Some(seq);
@@ -1020,21 +1526,44 @@ impl Daemon {
         }
     }
 
-    async fn send_status(&self, busy: &[sealctl_core::wire::BusyVolume]) -> Result<()> {
+    async fn send_status(&self) -> Result<()> {
         let mut paired = self.paired.lock().await;
         paired.file.status_seq += 1;
         let seq = paired.file.status_seq;
         let _ = paired.file.save();
-        let (state, log) = self.status_parts(busy, seq);
+        let (state, log) = self.status_parts(seq);
+        let busy = state.busy.clone();
         let status = sealctl_core::wire::MachineStatus {
             version: 1,
-            time: now(),
+            time: self.now(),
             seq,
             state: Some(state),
             log,
             inventory: Vec::new(),
             migrate: None,
         };
+        #[cfg(test)]
+        if self.t.offline() {
+            let s = status
+                .state
+                .as_ref()
+                .map(|s| s.session.clone())
+                .unwrap_or_default();
+            if self.t.fail_status() {
+                self.t.event(format!("status {s} failed"));
+                return Err(anyhow::anyhow!("test: relay down"));
+            }
+            if busy.is_empty() {
+                self.t.event(format!("status {s}"));
+            } else {
+                self.t.event(format!("status {s} busy {}", busy.len()));
+            }
+            drop(paired);
+            let mut st = self.st();
+            st.last_status = self.now();
+            st.told(s, busy);
+            return Ok(());
+        }
         let sealed = sealctl_core::channel::seal_status(&paired.keys, &paired.phone, &status)
             .map_err(|e| anyhow::anyhow!("sealing status: {e}"))?;
         let path = format!(
@@ -1047,15 +1576,36 @@ impl Daemon {
             .await?;
         drop(paired);
         let mut st = self.st();
-        st.status_dirty = false;
-        st.last_status = now();
+        st.last_status = self.now();
+        st.told(status.state.map(|s| s.session).unwrap_or_default(), busy);
         Ok(())
     }
 
-    fn start_channel(self: &Arc<Self>) {
+    /// Starts the machine channel of session `generation`, if it is still Open. A channel left
+    /// by a lock still running stops now: two sockets on one machine key evict each other.
+    fn start_channel(self: &Arc<Self>, generation: u64) {
         let me = self.clone();
+        let mut st = self.st();
+        if !st.open || st.generation != generation {
+            return;
+        }
+        #[cfg(test)]
+        let h = if self.t.offline() {
+            // the real channel sends a status first, then waits for messages
+            tokio::spawn(async move {
+                let _stopped = testing::Stopped(me.clone());
+                let _ = me.send_status().await;
+                std::future::pending::<()>().await;
+            })
+        } else {
+            tokio::spawn(async move { channel::run(me).await })
+        };
+        #[cfg(not(test))]
         let h = tokio::spawn(async move { channel::run(me).await });
-        if let Some(old) = self.st().channel.replace(h) {
+        for old in st.closing.drain(..) {
+            old.abort();
+        }
+        if let Some(old) = st.channel.replace(h) {
             old.abort();
         }
     }
@@ -1084,9 +1634,22 @@ impl Daemon {
         use sealctl_core::wire::MessageKind;
         match msg.kind {
             MessageKind::Lock { reason } => {
-                let opened_at = self.st().opened_at;
-                if msg.time >= opened_at && self.st().open {
-                    self.lock(&reason, reason == "words", false).await;
+                // A lock made before this session started is old (protocol.md); the phone's clock
+                // may be behind the machine's, so "before" leaves a minute. The channel goes on
+                // taking messages while the lock runs its slow steps.
+                let locked = self.lock_soon(&reason, reason == "words", |st| {
+                    (st.open && msg.time.saturating_add(LOCK_SKEW_MS) >= st.opened_at).then_some(false)
+                });
+                // none Open: an `open` the phone was asked before this lock was made stays
+                // with its command
+                if !locked {
+                    let mut st = self.st();
+                    let made_during = st
+                        .waiting_since
+                        .is_some_and(|w| msg.time.saturating_add(LOCK_SKEW_MS) >= w);
+                    if !st.open && made_during {
+                        st.lock_asks += 1;
+                    }
                 }
             }
             MessageKind::Answers { answers, more } => {
@@ -1193,37 +1756,111 @@ impl Daemon {
 
     /// One tick (every 15 s): idle input counts as work; idle allowance and hard stop lock.
     pub async fn tick(self: &Arc<Self>) {
-        let n = now();
-        let (open, lock_now, status_due) = {
+        // The allowance is checked against the last work before this sample counts: after a
+        // sleep, the key press that woke the machine must not turn the time asleep into work.
+        // The tick goes on (status, the next session's timers) while the lock's backups run.
+        if self.expire() {
+            return;
+        }
+        // `ioreg` runs outside the state lock
+        let idle = if self.st().open { self.idle_input() } else { None };
+        let n = self.now();
+        let status_due = {
             let mut st = self.st();
-            if st.open && idle_input_secs().is_some_and(|s| s < 60) {
+            if st.open && idle.is_some_and(|s| s < 60) {
                 st.saved.work(n);
                 save_saved(&st.saved);
             }
-            let lock_now = st.open && (st.saved.left(n) == 0 || st.saved.past_hard_stop(n));
+            // The phone takes the session as Open by its last status (keys and remembered
+            // agent uses go without a tap): a status that went out while it was asked says
+            // `waiting`, so the end of the wait is told at the next sample.
+            let word = st.state_word();
+            let changed = word != "waiting" && st.sent_state != word;
             let due = st.open
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
-                    || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000));
-            (st.open, lock_now, due)
+                    || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000)
+                    || (changed && n.saturating_sub(st.last_status) >= 10 * 1000));
+            // A Locked session whose last status still said Open, or told other busy volumes
+            // (a lock's or a retry's status failed), tells the phone again every minute, once
+            // no lock is running.
+            let idle_locks = *self.locks_done.borrow() >= st.locks_begun;
+            let unsent_lock = !st.open
+                && idle_locks
+                && (matches!(st.sent_state.as_str(), "open" | "waiting") || st.busy != st.sent_busy)
+                && n.saturating_sub(st.last_status) > 60 * 1000;
+            due || unsent_lock
         };
-        if lock_now {
-            let hard = self.st().saved.past_hard_stop(n);
-            self.lock("idle", false, false).await;
-            if hard {
-                let mut st = self.st();
-                st.saved.reset_credit();
-                save_saved(&st.saved);
-            }
-            return;
-        }
-        if open && status_due && !self.inproc {
-            if let Err(e) = self.send_status(&[]).await {
+        if status_due && !self.inproc {
+            if let Err(e) = self.send_status().await {
                 log::info!("status: {e:#}");
                 // A failed status (refused, rate limited, relay down) is tried again in a
                 // minute, not on every 15 s tick.
                 let mut st = self.st();
-                st.last_status = now();
+                st.last_status = self.now();
                 st.status_dirty = true;
+            }
+        }
+    }
+
+    /// Locks an Open session whose time is up (SPEC 6.4). The tick does this every 15 seconds,
+    /// and every request for a key does it first, so a request right after a wake from sleep
+    /// does not get a key, or count as work, before the tick has run. Returns whether it locked.
+    fn expire(self: &Arc<Self>) -> bool {
+        let n = self.now();
+        self.lock_soon(
+            "idle",
+            false,
+            |st| {
+                if st.open {
+                    expired(&st.saved, n)
+                } else {
+                    None
+                }
+            },
+        )
+    }
+
+    /// A spawned daemon exits after 10 minutes Locked with no client (SPEC 6.1). A request
+    /// on the phone is a client too: an SSH signature comes over the agent socket, not
+    /// `daemon.sock`.
+    fn idle_exit_due(&self) -> bool {
+        let n = self.now();
+        let st = self.st();
+        // an exit would stop a running lock's backups
+        let lock_running = *self.locks_done.borrow() < st.locks_begun;
+        !st.open
+            && st.clients == 0
+            && st.waiting_since.is_none()
+            && !lock_running
+            && n.saturating_sub(st.last_client) > 10 * 60 * 1000
+    }
+
+    /// Whether the daemon has begun to exit.
+    fn is_exiting(&self) -> bool {
+        *self.exiting.borrow()
+    }
+
+    /// From now on no session opens, and on-lock backups still running stop.
+    fn begin_exit(&self) {
+        self.exiting.send_replace(true);
+        self.stop_backups.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The daemon is about to exit: it locks as any exit does (SPEC 6.3), and lets any lock
+    /// still running finish its unmounts (its backups stop). Returns once the session is
+    /// Locked with no lock running.
+    async fn on_exit(self: &Arc<Self>) {
+        self.begin_exit();
+        loop {
+            if self.st().open {
+                self.lock("cli", true, false).await;
+            }
+            let begun = self.st().locks_begun;
+            let mut rx = self.locks_done.subscribe();
+            let _ = rx.wait_for(|d| *d >= begun).await;
+            let st = self.st();
+            if !st.open && st.locks_begun == begun {
+                return;
             }
         }
     }
@@ -1247,6 +1884,11 @@ impl Daemon {
             "lock" => {
                 let force = req["force"].as_bool().unwrap_or(false);
                 let nb = req["noBackup"].as_bool().unwrap_or(false);
+                // the session locks at once; its volumes close after the backups of a lock
+                // still running (up to 15 minutes)
+                if *self.locks_done.borrow() < self.st().locks_begun {
+                    ev(json!({"event": "lock-waits"}));
+                }
                 Ok(self.lock("cli", nb, force).await)
             }
             "values" => {
@@ -1274,6 +1916,7 @@ impl Daemon {
             }
             "store" => self.op_store(&req, &ev).await,
             "exit" => {
+                self.begin_exit();
                 self.lock("cli", true, false).await;
                 self.shutdown.notify_one();
                 Ok(json!({}))
@@ -1432,6 +2075,10 @@ pub fn run(spawned: bool) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
         crate::ssh::start_agent(d.clone());
+        // the service manager stops the daemon with SIGTERM (logout, `launchctl bootout`,
+        // `systemctl stop`): that is a daemon exit too, and locks
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("SIGTERM handler")?;
         let ticker = {
             let d = d.clone();
             tokio::spawn(async move {
@@ -1439,15 +2086,8 @@ pub fn run(spawned: bool) -> Result<()> {
                 loop {
                     t.tick().await;
                     d.tick().await;
-                    if spawned {
-                        let st = d.st();
-                        if !st.open
-                            && st.clients == 0
-                            && now().saturating_sub(st.last_client) > 10 * 60 * 1000
-                        {
-                            drop(st);
-                            d.shutdown.notify_one();
-                        }
+                    if spawned && d.idle_exit_due() {
+                        d.shutdown.notify_one();
                     }
                 }
             })
@@ -1461,6 +2101,7 @@ pub fn run(spawned: bool) -> Result<()> {
                 }
                 _ = d.shutdown.notified() => break,
                 _ = tokio::signal::ctrl_c() => break,
+                _ = term.recv() => break,
             }
         }
         ticker.abort();
@@ -1469,9 +2110,7 @@ pub fn run(spawned: bool) -> Result<()> {
         // mismatch included.
         drop(listener);
         let _ = std::fs::remove_file(&sock);
-        if d.st().open {
-            d.lock("cli", true, false).await;
-        }
+        d.on_exit().await;
         let _ = std::fs::remove_file(paths::ssh_agent_socket()?);
         Ok(())
     })

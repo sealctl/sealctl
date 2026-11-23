@@ -279,9 +279,10 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 | Situation | How the daemon runs |
 | --- | --- |
 | Paired desktop or laptop | Login service installed by `sealctl pair`: launchd `com.sealctl.daemon` (`RunAtLoad`, `KeepAlive`) or systemd user unit `sealctl.service` (`Restart=on-failure`). Runs `sealctl daemon` |
-| Service missing (containers, dev boxes without a user systemd) | The CLI starts `sealctl daemon --spawned` detached (`setsid`, stdio to `/dev/null`). It exits after 10 minutes Locked with no client |
+| Service missing (containers, dev boxes without a user systemd) | The CLI starts `sealctl daemon --spawned` detached (`setsid`, stdio to `/dev/null`). It exits after 10 minutes Locked with no client, no request waiting for the phone and no lock running its backups |
 | `SEALCTL_NO_DAEMON=1` (CI runners) | No daemon. Each command asks the phone itself; keys live as long as that process. No Open session, no SSH agent |
 
+- Any exit locks first (SPEC 6.5), whether asked over the socket, by a version mismatch, by Ctrl-C, or by SIGTERM from the service manager (logout, `launchctl bootout`, `systemctl stop`), and waits for a lock still running. Once an exit begins, no session opens (a request that still reaches the daemon, such as an SSH signature, is refused) and on-lock backups still running stop, so the unmount and the last status come within the service's stop timeout: 60 seconds (launchd `ExitTimeOut`, systemd `TimeoutStopSec` with `KillMode=mixed`, so the daemon stops its own restic).
 - The CLI and the daemon are the same binary. Every socket request carries the CLI version; on a mismatch the daemon answers, then exits, and the service manager (or the next CLI call) starts the new binary. `brew upgrade` therefore needs no step.
 
 ### 6.2 Socket
@@ -297,7 +298,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 | `own` | Values of `--own-approval` secrets for one command |
 | `keys` | Volume and backup keys for the CLI's volume and backup commands |
 | `store` | Write, rename or delete a secret (the daemon holds the store key) |
-| `events` | Stream of `waiting`, `answered`, `locked`, `notice` events, so the CLI prints `Waiting for your phone` once |
+| `events` | Stream of `waiting`, `answered`, `locked`, `notice` events, so the CLI prints `Waiting for your phone` once; `lock-waits` when a `lock` closes the session at once but its volumes wait for an earlier lock's backups (SPEC 6.5) |
 | `pending` | Delayed level 3 actions known from `notice` messages and the relay's `delayed` notes, for `status` and `cancel` |
 | `rewrap`, `migrate` | Section 16 |
 
@@ -314,6 +315,8 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 
 - **Waiting** is a sub-state: the daemon is Locked or Open and a request is on the phone. There is one pending `open` at a time; other callers that need the same session join it. A caller whose need the pending request does not cover (another agent use, an own-approval secret) gets its own request after the pending one is answered.
 - `grant: once` hands the keys to the waiting command only; the session stays Locked.
+- A `grant: session` answer (keys, agent uses) is kept only by the session that asked. When that session locked while the phone was asked, the waiting command still gets what was approved, but the keys and uses are not kept for a later session.
+- A lock asked for while the phone is asked to `open` (`sealctl lock`, a lock message) leaves the approval with the waiting command only, as `grant: once`: the session stays Locked. The same holds for an approval that arrives while the daemon exits.
 - On Open the daemon holds the store key, the keys of auto volumes it mounted, and the backup keys of configured backups (all asked for in the same `open`).
 
 ### 6.4 Timers and credit
@@ -321,20 +324,23 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 - **Minute worked:** a wall-clock minute in which the input idle time dropped below 60 seconds at any 15-second sample, or in which a key was used. Input idle time: macOS `HIDIdleTime` from the `IOHIDSystem` IOKit service; Linux the logind session `IdleSinceHint` over D-Bus. Where neither works (dev boxes, CI), only uses count.
 - **Idle allowance:** `min(cap, base + rate × minutes worked today)` with `cap`, `base`, `rate` from the last `open` reply (protocol.md, Reply body).
 - **Lock on idle:** when `now − last work moment ≥ idle allowance`. Time asleep counts as idle (wall clock). Screen lock and sleep do not lock by themselves.
-- **Hard stop:** 02:00 local time or 14 hours after the first `open` granted today, whichever is first. It locks and resets the credit (minutes worked) to 0.
-- **Credit** survives locks and daemon restarts until the hard stop; it is kept in `session.json` with the first-approval time.
+- **Hard stop:** 02:00 local time or 14 hours after the first `open` granted today, whichever is first. It locks and resets the credit (minutes worked) to 0. 02:00 is the first one after the first open in the zone the machine is in now: on a night when the clocks go back and 02:00 comes twice, the second one counts for a session opened between them; on a night when 02:00 is skipped, the stop is the moment the clock jumps past it.
+- **Credit** survives locks and daemon restarts until the hard stop; it is kept in `session.json` with the first-approval time. `session.json` also keeps the session state the phone last heard, so a daemon started after one whose last status failed tells the phone the session is Locked (SPEC 6.5 step 5).
 - **Own-approval keys** are wiped when the command that asked exits (the daemon watches the client connection).
-- The daemon samples every 15 seconds. It detects sleep by comparing the wall clock with the monotonic clock at each tick, and then checks the idle allowance and hard stop at once.
+- The daemon samples every 15 seconds. At each sample it checks the idle allowance and the hard stop against the last work moment before it counts the sample's input as work, so the key press that wakes a machine from sleep does not turn the time asleep into work. Every request for a key (values, keys, store, `open`, the SSH agent) makes the same check first, so a request right after a wake does not get a key from a session whose time ran out while asleep.
+- **Clock changes:** when the wall clock is more than a minute behind the last work moment (set back), the session locks and the credit resets, since neither the idle time nor the hard stop can be trusted. A saved first open in the future (the clock was ahead) does not carry its credit into the next `open`. A clock set forward only brings the lock sooner.
 
 ### 6.5 Locking
 
 On any lock the daemon, in this order:
 
 1. wipes the store key, decrypted SSH keys, own-approval keys and the per-agent session allowances;
-2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total;
-3. unmounts volumes; a busy volume is reported with the process holding it (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux) and retried every 60 seconds; `sealctl lock --force` force-unmounts;
+2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total: restic still running at the limit, or when the daemon exits, is stopped, since it holds the backup key and the storage credentials (SIGINT, so it removes its repository lock, then SIGKILL after 10 seconds);
+3. unmounts volumes; a busy volume is reported with the process holding it (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux) and retried every 60 seconds until it closes or a session opens, with a status each time the busy list changes; `sealctl lock --force` force-unmounts;
 4. wipes the backup and volume keys;
-5. sends a status (`locked`, with any busy volumes) and closes the machine socket.
+5. sends a status (`locked`, with any busy volumes) and closes the machine socket. When that status (or one after a busy volume closed) fails, the daemon sends it again every minute until the phone has heard the session is Locked with the volumes still busy. Every status while Locked carries the busy volumes.
+
+Step 1 happens at once; at the hard stop it also resets the credit there, so it never touches a session approved later. Steps 2 to 5 run in the background: the 15-second sampling, status and lock messages go on meanwhile. Locks take turns: a lock that begins while another is in steps 2 to 5 (a lock message, `sealctl lock --force`) does step 1 at once and waits for the other to finish before its own steps 2 to 5, so nothing is unmounted under a running backup. If the phone approves a new session before step 3, the volumes stay mounted for it, and the old machine socket closes as soon as the new session opens its own. A lock during the mount of an `open` unmounts after that mount, waiting 2 minutes at most for each volume, and not at all on a daemon exit (a mount that hangs, for example on a password prompt nobody sees, then goes on alone, and the volume is closed again if it mounts after all while the session is Locked); the machine socket of that session is not opened. A daemon exit waits for any lock still running.
 
 ### 6.6 The machine channel
 
@@ -342,8 +348,9 @@ While Open, the daemon keeps the phone informed and listens for locks (protocol.
 
 - When the relay offers the machine channel (planned in protocol.md; specified in the relay spec), it opens the machine socket and sends status with `PUT .../status`. A `404 not_found` on the socket upgrade means this relay does not offer it yet; the daemon then uses the fallback below and tries the socket again after 6 hours.
 - Until then it keeps one `report` request waiting (ttl 300, renewed at most once per 60 seconds) and applies `ack` and `msgs` from the reply.
+- The phone takes the session as Open by the machine's last status, so the status goes out when the session opens, before the command that asked (or one that joined its `open`) goes on to its next request, and before volumes are mounted. When a status went out while the phone was asked (`waiting`), a status saying Open follows as soon as the answer arrives, before the next request; if that fails, the next 15-second sample sends it. A request waiting for the phone (up to 5 minutes) holds up neither statuses nor messages: a `lock` from the phone applies at once.
 - Usage log entries wait in `usage.jsonl` until a status that carries them is acknowledged. The log holds names, agents, repositories and masked commands, never values.
-- A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"). An `answers` message replaces `answers.json` (used by `sealctl rules`).
+- A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"), unless it was made more than 60 seconds before the session's `open` was sent (a lock held from an earlier session; the minute allows for the phone's clock being behind). An `answers` message replaces `answers.json` (used by `sealctl rules`).
 - A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory, shows it in `sealctl status`, and shows a desktop notification (5.2) whether or not an agent is running:
   - pending: `sealctl: your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at 11:00. Not you? Run: sealctl cancel`. The relay's own note, without the phone's details, reads `sealctl: a sensitive action was approved on your phone. It takes effect at 11:00. Not you? Run: sealctl cancel`;
   - cancelled: `sealctl: cancelled from your phone: leaving sealctl on dev@mbp.example.com`;

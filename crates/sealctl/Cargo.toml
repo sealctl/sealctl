@@ -61,6 +61,8 @@ test-hooks = []
 
 [dev-dependencies]
 tempfile = "3"
+# paused time for the daemon's timer tests
+tokio = { workspace = true, features = ["test-util"] }
 sealctl-fakerelay = { path = "../sealctl-fakerelay" }
 nix = { version = "0.31", default-features = false, features = ["term", "fs"] }
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519"] }

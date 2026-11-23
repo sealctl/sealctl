@@ -12,6 +12,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   cargo-about (`scripts/notices.sh`) and shipped in every tarball, .deb, .rpm, PKGBUILD,
   Homebrew and Nix package.
 
+### Fixed
+
+- Session daemon timing: locks take turns and run their backups and unmounts in the
+  background (the hard stop no longer clears a session approved during them, and nothing is
+  unmounted under a running backup); the idle allowance and hard stop are checked before an
+  input sample counts as work and before any key is handed out (time asleep counts as idle);
+  a clock set back locks; the hard stop takes the second 02:00 on the night clocks go back;
+  a wait for the phone no longer holds up lock messages and statuses; the phone hears of an
+  Open session before the next request; lock messages allow a minute of clock skew; busy
+  volumes are retried every minute; on-lock backups stop at 15 minutes; SIGTERM locks.
+- Daemon exit: once it begins, no session opens and on-lock backups still running stop
+  (restic gets SIGINT first, so it removes its repository lock), so the unmount and the last
+  status fit the service's stop timeout, now 60 seconds (launchd `ExitTimeOut`, systemd
+  `TimeoutStopSec` with `KillMode=mixed`) for services installed from this version on. A hung mount no longer holds up locks for more than 2 minutes, or an exit at all.
+- Key requests check the timers again after waiting; a `sealctl lock` or lock message while
+  the phone is asked to open leaves that approval with its command only; statuses while
+  Locked carry the busy volumes and are sent again after a failure, also after a restart.
+
 ## 0.7.0
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes
