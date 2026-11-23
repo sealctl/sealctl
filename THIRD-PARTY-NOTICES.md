@@ -3191,7 +3191,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- tungstenite 0.28.0 (https://github.com/snapview/tungstenite-rs)
+- tungstenite 0.29.0 (https://github.com/snapview/tungstenite-rs)
 
 ````text
 Copyright (c) 2017 Alexey Galakhov
@@ -3294,7 +3294,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- tokio-tungstenite 0.28.0 (https://github.com/snapview/tokio-tungstenite)
+- tokio-tungstenite 0.29.0 (https://github.com/snapview/tokio-tungstenite)
 
 ````text
 Copyright (c) 2017 Daniel Abramov
@@ -4976,6 +4976,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- const-oid 0.10.3 (https://github.com/RustCrypto/formats)
 - cpufeatures 0.3.1 (https://github.com/RustCrypto/utils)
 
 ````text
@@ -5518,7 +5519,7 @@ Used by:
 - env_logger 0.11.11 (https://github.com/rust-cli/env_logger)
 - is_terminal_polyfill 1.70.2 (https://github.com/polyfill-rs/is_terminal_polyfill)
 - serde_spanned 1.1.3 (https://github.com/toml-rs/toml)
-- toml 1.1.8+spec-1.1.0 (https://github.com/toml-rs/toml)
+- toml 1.2.1+spec-1.1.0 (https://github.com/toml-rs/toml)
 - toml_datetime 1.1.3+spec-1.1.0 (https://github.com/toml-rs/toml)
 - toml_edit 0.25.19+spec-1.1.0 (https://github.com/toml-rs/toml)
 - toml_parser 1.1.5+spec-1.1.0 (https://github.com/toml-rs/toml)
@@ -6099,7 +6100,6 @@ Used by:
 - thiserror-impl 2.0.21 (https://github.com/dtolnay/thiserror)
 - thiserror 2.0.21 (https://github.com/dtolnay/thiserror)
 - unicode-ident 1.0.27 (https://github.com/dtolnay/unicode-ident)
-- utf-8 0.7.6 (https://github.com/SimonSapin/rust-utf8)
 - xdg-home 1.3.0 (https://github.com/zeenix/xdg-home)
 - zbus_names 3.0.0 (https://github.com/dbus2/zbus/)
 - zmij 1.0.23 (https://github.com/dtolnay/zmij)
