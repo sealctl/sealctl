@@ -36,11 +36,15 @@ pub fn idle_allowance(cap: u64, base: u64, rate: u64, worked: u64) -> u64 {
 /// The hard stop for a session first opened at `first_open` (Unix ms): 02:00 local time or 14
 /// hours after the first open, whichever comes first.
 pub fn hard_stop(first_open: u64) -> u64 {
+    hard_stop_in(first_open, &TimeZone::system())
+}
+
+/// [`hard_stop`] in the time zone `tz`.
+pub fn hard_stop_in(first_open: u64, tz: &TimeZone) -> u64 {
     let fourteen = first_open + 14 * 3600 * 1000;
     let Some(start) = crate::clock::from_ms(first_open) else {
         return fourteen;
     };
-    let tz = TimeZone::system();
     let first_day = start.to_zoned(tz.clone()).date();
     let mut day = first_day;
     for _ in 0..3 {

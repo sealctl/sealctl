@@ -6,6 +6,8 @@
 pub mod channel;
 pub mod client;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -152,6 +154,8 @@ pub struct Daemon {
     relay: Relay,
     inproc: bool,
     shutdown: tokio::sync::Notify,
+    #[cfg(test)]
+    t: testing::Hooks,
 }
 
 fn key_name(p: &str, i: &str) -> String {
@@ -238,7 +242,11 @@ impl Daemon {
             last_client: now(),
             ..State::default()
         };
-        Ok(Arc::new(Daemon {
+        Ok(Self::with(paired, relay, inproc, st))
+    }
+
+    fn with(paired: Paired, relay: Relay, inproc: bool, st: State) -> Arc<Daemon> {
+        Arc::new(Daemon {
             st: Mutex::new(st),
             asking: tokio::sync::Mutex::new(()),
             opening: tokio::sync::Mutex::new(()),
@@ -246,7 +254,30 @@ impl Daemon {
             relay,
             inproc,
             shutdown: tokio::sync::Notify::new(),
-        }))
+            #[cfg(test)]
+            t: testing::Hooks::default(),
+        })
+    }
+
+    /// Wall clock, Unix ms (a test may set it).
+    fn now(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let t = self.t.now.load(std::sync::atomic::Ordering::SeqCst);
+            if t != 0 {
+                return t;
+            }
+        }
+        now()
+    }
+
+    /// Input idle time in seconds (a test may set it).
+    fn idle_input(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(v) = *self.t.idle.lock().unwrap() {
+            return v;
+        }
+        idle_input_secs()
     }
 
     fn st(&self) -> std::sync::MutexGuard<'_, State> {
@@ -283,38 +314,54 @@ impl Daemon {
         notify: bool,
     ) -> Result<ReplyBody> {
         let _turn = self.asking.lock().await;
-        self.st().waiting_since = Some(now());
+        self.st().waiting_since = Some(self.now());
         self.st().status_dirty = true;
         ev(json!({"event": "waiting"}));
         if notify && crate::guard::ai_agent().is_none() {
             util::notify("sealctl: waiting for your phone");
         }
-        let r = {
-            let mut paired = self.paired.lock().await;
-            approve::send(&self.relay, &mut paired, body, &mut |_| {}).await
-        };
+        let r = self.send_ask(body).await;
         self.st().waiting_since = None;
         match r {
-            Ok(Asked::Reply { reply, .. }) if reply.ok => {
+            Ok(Some(reply)) if reply.ok => {
                 if let Some(w) = &reply.w {
                     self.st().words = Some(w.clone());
                 }
                 ev(json!({"event": "answered"}));
                 Ok(reply)
             }
-            Ok(Asked::Reply { reply, .. }) => {
+            Ok(Some(reply)) => {
                 if reply.err.as_deref() == Some("declined") {
                     self.count_declined();
                 }
                 Err(approve::refusal(&reply, None, None))
             }
-            Ok(Asked::Delayed { .. }) => Err(fail(exit::ERROR, "The phone delayed a routine request.")),
+            Ok(None) => Err(fail(exit::ERROR, "The phone delayed a routine request.")),
             Err(e) => {
                 if exit::code_of(&e) == exit::NOT_PAIRED {
                     self.lock("unpaired", true, false).await;
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Sends one request and waits for the phone: its reply, or `None` when delayed.
+    async fn send_ask(&self, body: sealctl_core::wire::RequestBody) -> Result<Option<ReplyBody>> {
+        #[cfg(test)]
+        if let Some(c) = self.t.canned() {
+            self.t.event(format!("ask {}", body.why));
+            if let Some(g) = c.gate {
+                if let Ok(p) = g.acquire().await {
+                    p.forget();
+                }
+            }
+            return Ok(Some(c.reply));
+        }
+        let mut paired = self.paired.lock().await;
+        match approve::send(&self.relay, &mut paired, body, &mut |_| {}).await? {
+            Asked::Reply { reply, .. } => Ok(Some(reply)),
+            Asked::Delayed { .. } => Ok(None),
         }
     }
 
@@ -391,6 +438,11 @@ impl Daemon {
         ev: &Events,
         notify: bool,
     ) -> Result<(bool, KeySet)> {
+        // unit tests have no store; they open with `open_with`
+        #[cfg(test)]
+        if self.t.offline() {
+            return Err(fail(exit::NOT_FOUND, "no store in unit tests"));
+        }
         let store = Store::configured()?;
         let new_store = store.id_file()?.is_none();
         let mut items = Self::open_items(&store)?;
@@ -399,6 +451,32 @@ impl Daemon {
                 items.push(e);
             }
         }
+        let store_id = store.id.clone();
+        self.open_with(items, &store_id, uses, ctx, ev, notify, |set, words| {
+            if new_store {
+                let k = set
+                    .get(&key_name("secrets", &store.id))
+                    .context("no store key in the reply")?;
+                store.write_id(&store.new_id_file(words, k))?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// The `open` request for `items` and what follows the answer; `first` runs before the
+    /// session takes the keys (a new store writes its `.id` file).
+    #[allow(clippy::too_many_arguments)]
+    async fn open_with(
+        self: &Arc<Self>,
+        items: Vec<RequestItem>,
+        store_id: &str,
+        uses: Vec<AgentUse>,
+        ctx: RequestContext,
+        ev: &Events,
+        notify: bool,
+        first: impl FnOnce(&BTreeMap<String, ObjectKey>, &str) -> Result<()>,
+    ) -> Result<(bool, KeySet)> {
         let mut body = approve::body("open");
         body.keys = items.clone();
         body.uses = uses;
@@ -411,15 +489,10 @@ impl Daemon {
         for (item, key) in items.iter().zip(keys) {
             set.insert(key_name(&item.purpose, &item.id), key);
         }
-        if new_store {
-            let k = set
-                .get(&key_name("secrets", &store.id))
-                .context("no store key in the reply")?;
-            store.write_id(&store.new_id_file(&words, k))?;
-        }
+        first(&set, &words)?;
         let session = reply.grant.as_deref() == Some("session");
         if session {
-            let n = now();
+            let n = self.now();
             {
                 let mut st = self.st();
                 st.open = true;
@@ -436,7 +509,7 @@ impl Daemon {
                 st.saved.place = reply.place.clone();
                 st.saved.lock_reason = None;
                 st.saved.work(n);
-                st.store_key = set.get(&key_name("secrets", &store.id)).map(copy_key);
+                st.store_key = set.get(&key_name("secrets", store_id)).map(copy_key);
                 for (k, v) in &set {
                     st.keys.insert(k.clone(), copy_key(v));
                 }
@@ -452,6 +525,8 @@ impl Daemon {
     }
 
     async fn mount_auto(&self) {
+        #[cfg(test)]
+        self.t.mount.pass("mount", &self.t).await;
         let vols: Vec<Volume> = Volume::list()
             .unwrap_or_default()
             .into_iter()
@@ -484,7 +559,7 @@ impl Daemon {
                 return Ok(json!({"left": 0, "once": true}));
             }
         }
-        let left = self.st().saved.left(now());
+        let left = self.st().saved.left(self.now());
         Ok(json!({"left": left}))
     }
 
@@ -626,7 +701,7 @@ impl Daemon {
             };
             out.push((name.clone(), v));
         }
-        let n = now();
+        let n = self.now();
         {
             let mut st = self.st();
             if st.open {
@@ -855,6 +930,10 @@ impl Daemon {
         let mut lines = Vec::new();
         let mut busy = Vec::new();
         // step 2: on-lock backups, at most 15 minutes in total
+        #[cfg(test)]
+        if was_open && !no_backup && reason != "words" && reason != "unpaired" {
+            self.t.backup.pass("backup", &self.t).await;
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
         for (b, key, env) in jobs {
             let name = b.name.clone();
@@ -872,6 +951,8 @@ impl Daemon {
             }
         }
         // unmount
+        #[cfg(test)]
+        self.t.event(format!("unmount{}", if force { " force" } else { "" }));
         let mounted: Vec<Volume> = Volume::list()
             .unwrap_or_default()
             .into_iter()
@@ -944,7 +1025,7 @@ impl Daemon {
     /// `status`.
     pub fn status(&self) -> Value {
         let st = self.st();
-        let n = now();
+        let n = self.now();
         let state = if st.waiting_since.is_some() {
             "waiting"
         } else if st.open {
@@ -977,7 +1058,7 @@ impl Daemon {
     ) -> (sealctl_core::wire::SessionState, Vec<LogEntry>) {
         {
             let mut st = self.st();
-            let n = now();
+            let n = self.now();
             let s = sealctl_core::wire::SessionState {
                 session: if st.waiting_since.is_some() {
                     "waiting".into()
@@ -1028,13 +1109,23 @@ impl Daemon {
         let (state, log) = self.status_parts(busy, seq);
         let status = sealctl_core::wire::MachineStatus {
             version: 1,
-            time: now(),
+            time: self.now(),
             seq,
             state: Some(state),
             log,
             inventory: Vec::new(),
             migrate: None,
         };
+        #[cfg(test)]
+        if self.t.offline() {
+            let s = status.state.as_ref().map(|s| s.session.clone()).unwrap_or_default();
+            self.t.event(format!("status {s}"));
+            drop(paired);
+            let mut st = self.st();
+            st.status_dirty = false;
+            st.last_status = self.now();
+            return Ok(());
+        }
         let sealed = sealctl_core::channel::seal_status(&paired.keys, &paired.phone, &status)
             .map_err(|e| anyhow::anyhow!("sealing status: {e}"))?;
         let path = format!(
@@ -1048,12 +1139,25 @@ impl Daemon {
         drop(paired);
         let mut st = self.st();
         st.status_dirty = false;
-        st.last_status = now();
+        st.last_status = self.now();
         Ok(())
     }
 
     fn start_channel(self: &Arc<Self>) {
         let me = self.clone();
+        #[cfg(test)]
+        if self.t.offline() {
+            // the real channel sends a status first, then waits for messages
+            let h = tokio::spawn(async move {
+                let _stopped = testing::Stopped(me.clone());
+                let _ = me.send_status(&[]).await;
+                std::future::pending::<()>().await;
+            });
+            if let Some(old) = self.st().channel.replace(h) {
+                old.abort();
+            }
+            return;
+        }
         let h = tokio::spawn(async move { channel::run(me).await });
         if let Some(old) = self.st().channel.replace(h) {
             old.abort();
@@ -1193,10 +1297,10 @@ impl Daemon {
 
     /// One tick (every 15 s): idle input counts as work; idle allowance and hard stop lock.
     pub async fn tick(self: &Arc<Self>) {
-        let n = now();
+        let n = self.now();
         let (open, lock_now, status_due) = {
             let mut st = self.st();
-            if st.open && idle_input_secs().is_some_and(|s| s < 60) {
+            if st.open && self.idle_input().is_some_and(|s| s < 60) {
                 st.saved.work(n);
                 save_saved(&st.saved);
             }
@@ -1222,9 +1326,23 @@ impl Daemon {
                 // A failed status (refused, rate limited, relay down) is tried again in a
                 // minute, not on every 15 s tick.
                 let mut st = self.st();
-                st.last_status = now();
+                st.last_status = self.now();
                 st.status_dirty = true;
             }
+        }
+    }
+
+    /// A spawned daemon exits after 10 minutes Locked with no client (SPEC 6.1).
+    fn idle_exit_due(&self) -> bool {
+        let n = self.now();
+        let st = self.st();
+        !st.open && st.clients == 0 && n.saturating_sub(st.last_client) > 10 * 60 * 1000
+    }
+
+    /// The daemon is about to exit: it locks as any exit does (SPEC 6.3).
+    async fn on_exit(&self) {
+        if self.st().open {
+            self.lock("cli", true, false).await;
         }
     }
 
@@ -1439,15 +1557,8 @@ pub fn run(spawned: bool) -> Result<()> {
                 loop {
                     t.tick().await;
                     d.tick().await;
-                    if spawned {
-                        let st = d.st();
-                        if !st.open
-                            && st.clients == 0
-                            && now().saturating_sub(st.last_client) > 10 * 60 * 1000
-                        {
-                            drop(st);
-                            d.shutdown.notify_one();
-                        }
+                    if spawned && d.idle_exit_due() {
+                        d.shutdown.notify_one();
                     }
                 }
             })
@@ -1469,9 +1580,7 @@ pub fn run(spawned: bool) -> Result<()> {
         // mismatch included.
         drop(listener);
         let _ = std::fs::remove_file(&sock);
-        if d.st().open {
-            d.lock("cli", true, false).await;
-        }
+        d.on_exit().await;
         let _ = std::fs::remove_file(paths::ssh_agent_socket()?);
         Ok(())
     })
