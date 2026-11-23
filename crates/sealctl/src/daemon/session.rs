@@ -214,9 +214,10 @@ mod tests {
 
     #[test]
     fn hard_stop_across_daylight_saving_changes() {
-        let Ok(warsaw) = jiff::tz::TimeZone::get("Europe/Warsaw") else {
-            return;
-        };
+        // POSIX rules, so the test runs without a time zone database: Europe/Warsaw and
+        // America/Los_Angeles as of 2026
+        let warsaw = jiff::tz::TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+        let la = jiff::tz::TimeZone::posix("PST8PDT,M3.2.0,M11.1.0").unwrap();
         let ms = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_millisecond() as u64;
         // autumn: 02:00 to 02:59 come twice (03:00 CEST back to 02:00 CET). Opened at 02:30
         // CEST, the next 02:00 is the second one, half an hour later.
@@ -239,13 +240,11 @@ mod tests {
             hard_stop_in(ms("2026-03-29T01:00:00Z"), &warsaw),
             ms("2026-03-29T15:00:00Z")
         );
-        if let Ok(la) = jiff::tz::TimeZone::get("America/Los_Angeles") {
-            // 01:00 to 01:59 come twice there; 02:00 PST once
-            assert_eq!(
-                hard_stop_in(ms("2026-11-01T08:30:00Z"), &la),
-                ms("2026-11-01T10:00:00Z")
-            );
-        }
+        // 01:00 to 01:59 come twice there; 02:00 PST once
+        assert_eq!(
+            hard_stop_in(ms("2026-11-01T08:30:00Z"), &la),
+            ms("2026-11-01T10:00:00Z")
+        );
         // opened exactly at 02:00: the next 02:00 is a day away, so 14 hours
         assert_eq!(
             hard_stop_in(ms("2027-01-15T01:00:00Z"), &warsaw),
