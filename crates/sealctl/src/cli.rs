@@ -251,7 +251,9 @@ pub fn volume_ls(json_out: bool) -> Result<()> {
 /// `sealctl volume open`.
 pub fn volume_open(name: &str) -> Result<()> {
     let vol = Volume::load(name)?;
-    if vol.is_open() {
+    // mounted where its files are expected; attached but not mounted yet (another command
+    // mounting it) goes through open_with, which waits for that command
+    if vol.is_mounted() {
         println!("{}", vol.mountpoint.display());
         return Ok(());
     }
