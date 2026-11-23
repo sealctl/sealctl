@@ -1,0 +1,143 @@
+# Which tests a pull request runs (SPEC 23, "Test selection"). Read by scripts/select-tests.py,
+# which ci.yml and fuzz.yml run in their `changes` jobs.
+#
+# Each line: a path glob, then the suites a change to a matching path needs. `*` matches within
+# one folder, `**` across folders. A path takes the suites of EVERY line it matches. A path that
+# no line matches runs everything, so a new file or folder is tested in full until it is mapped.
+#
+# Suites:
+#   all            everything: every crate's tests, every integration test, the fuzz build
+#   none           no test of its own; marks the path as mapped (documentation, packaging,
+#                  supply chain: their own jobs check them)
+#   fuzz           fuzz.yml (2 minutes per target)
+#   unit:<crate>   that crate's tests (also implied for the crate a changed file belongs to,
+#                  and for every workspace crate that depends on it: `cargo metadata`)
+#   <target>       an integration test of crates/sealctl/tests/ (`cargo test --test <target>`);
+#                  its test-hooks steps in ci.yml run with it
+#
+# Only the macOS job and the test-hooks steps are selected: `test (ubuntu-latest)` runs the
+# whole `cargo test` on every pull request. Push to main, schedules, manual runs, tags and
+# pull requests labelled `ci:full` run everything.
+
+# ---- everything ---------------------------------------------------------------------------
+# build inputs, toolchain, CI and this selection itself
+Cargo.lock                                  all
+**/Cargo.toml                               all
+rust-toolchain.toml                         all
+flake.*                                     all
+.github/workflows/**                        all
+.github/test-map                            all
+scripts/select-tests*                       all
+# the shared core: every crate and test builds on it
+crates/sealctl-core/**                      all
+# test helpers: the fake relay and scripted phone, the integration tests' shared code and fixtures
+crates/sealctl-fakerelay/**                 all
+crates/sealctl/tests/common/**              all
+crates/sealctl/tests/fixtures/**            all
+
+# ---- crates/sealctl/src: modules every command goes through -----------------------------------
+# the command line, paths and config, output and exit codes, the relay client, asking the phone,
+# pairing, machine.json, the secret store, agent detection and masking, status
+crates/sealctl/src/main.rs                  all
+crates/sealctl/src/lib.rs                   all
+crates/sealctl/src/cli.rs                   all
+crates/sealctl/src/util.rs                  all
+crates/sealctl/src/paths.rs                 all
+crates/sealctl/src/config.rs                all
+crates/sealctl/src/exit.rs                  all
+crates/sealctl/src/term.rs                  all
+crates/sealctl/src/clock.rs                 all
+crates/sealctl/src/relay.rs                 all
+crates/sealctl/src/approve.rs               all
+crates/sealctl/src/pair.rs                  all
+crates/sealctl/src/machine.rs               all
+crates/sealctl/src/store.rs                 all
+crates/sealctl/src/guard.rs                 all
+crates/sealctl/src/status.rs                all
+
+# ---- crates/sealctl/src: modules with their own suites -----------------------------------------
+# the session daemon: every key request passes through it; scan, stores and seal_from use it
+# only to fetch keys. One line per file, so a new file in daemon/ runs everything.
+crates/sealctl/src/daemon/mod.rs            daemon session secrets volumes long_ops unseal migrate pairing
+crates/sealctl/src/daemon/client.rs         daemon session secrets volumes long_ops unseal migrate pairing
+crates/sealctl/src/daemon/channel.rs        daemon session secrets volumes long_ops unseal migrate pairing
+crates/sealctl/src/daemon/session.rs        daemon session secrets
+# unit-test seams and timing tests, compiled only for `cargo test` (unit:sealctl covers them)
+crates/sealctl/src/daemon/testing.rs        none
+crates/sealctl/src/daemon/timing_tests.rs   none
+# volumes (hdiutil, APFS, LUKS) and backups (restic), and the launchd/systemd services they use
+crates/sealctl/src/volume/**                volumes migrate long_ops unseal seal_from
+crates/sealctl/src/backup.rs                volumes migrate long_ops unseal seal_from daemon
+crates/sealctl/src/service.rs               volumes migrate long_ops unseal daemon
+# changing words, recovery from the words
+crates/sealctl/src/migrate.rs               migrate long_ops
+crates/sealctl/src/recover.rs               session migrate unseal seal_from
+# seal and unseal: run folders, journals, where passwords go
+crates/sealctl/src/seal/**                  unseal stores seal_from volumes long_ops migrate
+# AI agents: hooks, policy, the skill file
+crates/sealctl/src/ai/**                    secrets unseal
+# `sealctl run`, .env files and scan
+crates/sealctl/src/project.rs               secrets session daemon long_ops migrate scan volumes
+crates/sealctl/src/dotenv.rs                scan secrets seal_from long_ops
+crates/sealctl/src/scan.rs                  scan long_ops
+# SSH agent, git signing and credentials, the caller chain of credential helpers
+crates/sealctl/src/ssh.rs                   session secrets stores seal_from unseal daemon
+crates/sealctl/src/git.rs                   session secrets
+crates/sealctl/src/caller.rs                session secrets daemon
+crates/sealctl/src/licence.rs               session pairing
+
+# ---- the fuzz targets' parsers (fuzz/fuzz_targets/*.rs) ---------------------------------------
+# sealctl-core is covered by `all` above
+fuzz/**                                     fuzz
+crates/sealctl/src/approve.rs               fuzz
+crates/sealctl/src/relay.rs                 fuzz
+crates/sealctl/src/daemon/mod.rs            fuzz
+crates/sealctl/src/dotenv.rs                fuzz
+crates/sealctl/src/git.rs                   fuzz
+crates/sealctl/src/project.rs               fuzz
+crates/sealctl/src/seal/journal.rs          fuzz
+crates/sealctl/src/seal/handback.rs         fuzz
+
+# ---- integration tests: the file itself ------------------------------------------------------
+crates/sealctl/tests/daemon.rs              daemon
+crates/sealctl/tests/long_ops.rs            long_ops
+crates/sealctl/tests/migrate.rs             migrate
+crates/sealctl/tests/pairing.rs             pairing
+crates/sealctl/tests/scan.rs                scan
+crates/sealctl/tests/seal_from.rs           seal_from
+crates/sealctl/tests/secrets.rs             secrets
+crates/sealctl/tests/session.rs             session
+crates/sealctl/tests/stores.rs              stores
+crates/sealctl/tests/unseal.rs              unseal
+crates/sealctl/tests/volumes.rs             volumes
+
+# ---- no tests ---------------------------------------------------------------------------------
+# test vectors: sealctl-core's tests and bindings.yml read them
+docs/vectors/**                             unit:sealctl-core
+# prose; THIRD-PARTY-NOTICES.md is checked by packages.yml's `notices` job
+*.md                                        none
+docs/*.md                                   none
+LICENSE                                     none
+# packaging: packages.yml builds and install-tests these on every pull request
+scripts/package.sh                          none
+scripts/render-formula.sh                   none
+scripts/render-pkgbuild.sh                  none
+scripts/notices.sh                          none
+scripts/notices.hbs                         none
+about.toml                                  none
+# the pairing script for manual tests against a real phone
+scripts/pair-test.sh                        none
+# the uniffi smoke tests: bindings.yml
+bindings/**                                 none
+# supply chain: the deny and vet jobs run on every pull request
+deny.toml                                   none
+supply-chain/**                             none
+# formatting: the fmt job runs on every pull request
+rustfmt.toml                                none
+.editorconfig                               none
+.gitignore                                  none
+# repository settings and templates
+.github/CODEOWNERS                          none
+.github/dependabot.yml                      none
+.github/pull_request_template.md            none
+.github/ISSUE_TEMPLATE/**                   none

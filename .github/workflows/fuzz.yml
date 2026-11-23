@@ -3,9 +3,11 @@ name: Fuzz
 # cargo-fuzz targets for every parser (SPEC 21): 2 minutes each on pull requests that touch
 # a parser, 1 hour each nightly. A crash fails the job and uploads its input.
 
+# No workflow path filter: the `changes` job asks scripts/select-tests.py whether the pull
+# request touches a parser the targets use (.github/test-map, suite `fuzz`), and the fuzz jobs
+# skip when it does not. Schedules, manual runs and the label `ci:full` run them.
 on:
   pull_request:
-    paths: ["crates/sealctl-core/src/**", "crates/sealctl/src/**", "fuzz/**"]
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
@@ -20,7 +22,30 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      fuzz: ${{ steps.select.outputs.fuzz }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: python3 -B scripts/select-tests.py --github
+
   fuzz:
+    needs: changes
+    # everything when `changes` failed (its output is then empty, never "false")
+    if: ${{ !cancelled() && needs.changes.outputs.fuzz != 'false' }}
     runs-on: ubuntu-latest
     # build about 10 minutes; 2 minutes per target on pull requests, 1 hour nightly
     timeout-minutes: ${{ github.event_name == 'schedule' && 90 || 30 }}
