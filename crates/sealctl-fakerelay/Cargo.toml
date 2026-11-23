@@ -19,4 +19,4 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "query"] }
-base64 = "0.22"
+base64 = "0.23"
