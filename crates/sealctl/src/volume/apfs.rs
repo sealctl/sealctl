@@ -165,13 +165,24 @@ pub fn set_hint(v: &Volume, hint: &str) -> Result<()> {
     Ok(())
 }
 
-/// Does `passphrase` open the volume? (`diskutil apfs unlockVolume -verify`.)
-pub fn verify(uuid: &str, passphrase: &[u8]) -> Result<bool> {
+/// Does `passphrase` open the volume (a UUID or disk identifier)? (`diskutil apfs unlockVolume
+/// -verify`.) `-verify` needs the cryptographic user named by UUID on recent macOS: the disk
+/// user's is the volume UUID.
+pub fn verify(target: &str, passphrase: &[u8]) -> Result<bool> {
+    let uuid = match sealctl_core::ids::parse_uuid(&target.to_lowercase()) {
+        Some(_) => target.to_string(),
+        None => match info_value(target, "Volume UUID")? {
+            Some(u) => u,
+            None => return Ok(false),
+        },
+    };
     let out = run_with_stdin(
         crate::util::system_cmd("diskutil").args([
             "apfs",
             "unlockVolume",
-            uuid,
+            &uuid,
+            "-user",
+            &uuid,
             "-verify",
             "-stdinpassphrase",
         ]),
@@ -180,7 +191,67 @@ pub fn verify(uuid: &str, passphrase: &[u8]) -> Result<bool> {
     Ok(out.status.success())
 }
 
+/// An APFS volume found by its UUID or disk identifier: its UUID in lower case, whether it is
+/// mounted, and where. `None` when diskutil knows no APFS volume by that name.
+pub fn find(target: &str) -> Result<Option<(String, Option<String>)>> {
+    if info_value(target, "Type (Bundle)")?.as_deref() != Some("apfs") {
+        return Ok(None);
+    }
+    let Some(uuid) = info_value(target, "Volume UUID")? else {
+        return Ok(None);
+    };
+    let mounted = info_value(target, "Mounted")?.is_some_and(|m| m.starts_with("Yes"));
+    let mp = info_value(target, "Mount Point")?.filter(|m| mounted && !m.is_empty());
+    Ok(Some((uuid.to_lowercase(), mp)))
+}
+
+/// The words fingerprint in the passphrase hint `sealctl <fp>`, readable while locked
+/// (`diskutil apfs listUsers`).
+pub fn hint_words(uuid: &str) -> Result<Option<String>> {
+    let out = crate::util::system_cmd("diskutil")
+        .args(["apfs", "listUsers", uuid])
+        .output()?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(hint_in(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `Hint: sealctl <fp>` in `diskutil apfs listUsers` output.
+fn hint_in(text: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("Hint:")
+            .and_then(|h| h.trim().strip_prefix("sealctl "))
+            .map(|fp| fp.trim().to_string())
+            .filter(|fp| !fp.is_empty())
+    })
+}
+
+/// Unlocks and mounts the volume at its default mount point; returns the mount point.
+pub fn unlock_uuid(uuid: &str, passphrase: &[u8]) -> Result<String> {
+    check(
+        run_with_stdin(
+            crate::util::system_cmd("diskutil").args(["apfs", "unlockVolume", uuid, "-stdinpassphrase"]),
+            passphrase,
+        )?,
+        "diskutil apfs unlockVolume",
+    )?;
+    Ok(info_value(uuid, "Mount Point")?.unwrap_or_default())
+}
+
 /// Replaces the passphrase.
 pub fn change_passphrase(uuid: &str, old: &[u8], new: &[u8]) -> Result<()> {
     change(uuid, old, new)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_hint_gives_the_words() {
+        let out = "Cryptographic user for disk7s2 (1 found)\n|\n+-- 00C167BE-32EB-4BD7-936B-A4ACA1BF5A67\n    Type: Disk User\n    Hint: sealctl AbCd\n \n";
+        assert_eq!(super::hint_in(out).as_deref(), Some("AbCd"));
+        assert_eq!(super::hint_in("    Hint: my own words\n"), None);
+        assert_eq!(super::hint_in("    Type: Disk User\n"), None);
+    }
 }

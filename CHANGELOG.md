@@ -47,8 +47,8 @@ the sealctl phone app, and the 24 words alone open every object.
   into `~/sealctl-unsealed-<date>` (or the Keychain, 1Password or Bitwarden with `--to` and
   `--secrets-to`), with a plan, number match, plan signature, a two-hour delay away from a
   trusted place, a hand-back report, `--resume`, and `sealctl cancel` from any paired machine.
-- `sealctl recover <store | .sealed | sparse bundle | restic repository>` with the 24 words
-  alone: no phone, relay or configuration.
+- `sealctl recover <store | .sealed | sparse bundle | LUKS file | APFS volume | restic
+  repository>` with the 24 words alone: no phone, relay or configuration.
 - `sealctl status` (with `--json`), `doctor`, `inventory`, `rules`; `sealctl buy` (`--seats`,
   `--code`).
 - Packages: Homebrew, `.deb`, `.rpm`, Arch `PKGBUILD`, Nix.
