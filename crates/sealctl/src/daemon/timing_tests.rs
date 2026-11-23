@@ -647,3 +647,24 @@ async fn asleep_across_the_hard_stop_locks_on_wake_and_resets_the_credit() {
     assert_eq!(st.saved.worked, 0);
     assert!(st.saved.first_open.is_none());
 }
+
+#[tokio::test(start_paused = true)]
+async fn unit_tests_keep_their_files_out_of_home() {
+    use crate::paths;
+    let root = paths::unit_test_root();
+    for dir in [paths::config_dir(), paths::data_dir(), paths::state_dir()] {
+        let dir = dir.unwrap();
+        assert!(
+            dir.starts_with(&root),
+            "{} is not under {}",
+            dir.display(),
+            root.display()
+        );
+    }
+    // a lock saves the session where the tests keep it
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    d.lock("cli", true, false).await;
+    assert!(paths::session_file().unwrap().starts_with(&root));
+    assert!(paths::session_file().unwrap().exists());
+}

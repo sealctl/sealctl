@@ -616,7 +616,13 @@ impl Daemon {
     async fn mount_auto(&self, generation: u64) {
         let _volumes = self.volumes.lock().await;
         #[cfg(test)]
-        self.t.mount.pass("mount", &self.t).await;
+        {
+            self.t.mount.pass("mount", &self.t).await;
+            // unit tests never mount the developer's volumes
+            if self.t.offline() {
+                return;
+            }
+        }
         let vols: Vec<Volume> = Volume::list()
             .unwrap_or_default()
             .into_iter()
@@ -1209,6 +1215,14 @@ impl Daemon {
                 });
             } else {
                 self.t.event("close safe");
+            }
+            return (lines, busy);
+        }
+        // unit tests never close the developer's volumes
+        #[cfg(test)]
+        if self.t.offline() {
+            if let Some(names) = only {
+                self.t.event(format!("close {}", names.join(",")));
             }
             return (lines, busy);
         }
