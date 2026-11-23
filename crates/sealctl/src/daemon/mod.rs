@@ -1845,6 +1845,11 @@ impl Daemon {
             "lock" => {
                 let force = req["force"].as_bool().unwrap_or(false);
                 let nb = req["noBackup"].as_bool().unwrap_or(false);
+                // the session locks at once; its volumes close after the backups of a lock
+                // still running (up to 15 minutes)
+                if *self.locks_done.borrow() < self.st().locks_begun {
+                    ev(json!({"event": "lock-waits"}));
+                }
                 Ok(self.lock("cli", nb, force).await)
             }
             "values" => {

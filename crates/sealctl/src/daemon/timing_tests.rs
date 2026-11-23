@@ -900,3 +900,87 @@ async fn a_hung_mount_holds_up_a_lock_for_two_minutes_at_most() {
     assert!(at(&e, "mount end") < at(&e, "close safe"), "{e:?}");
     assert!(d.st().mounted.is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_lock_message_for_a_session_approved_during_the_backups_locks_at_once_and_takes_its_turn() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.backup.hold();
+    open(&d, &store_items()).await;
+    let first = tokio::spawn({
+        let d = d.clone();
+        async move { d.lock("idle", false, false).await }
+    });
+    settle().await;
+    // a new session during the first lock's backups, then the phone leaves the place
+    open(&d, &store_items()).await;
+    let t = d.now();
+    d.apply_message(lock_message(t, 1, "place")).await;
+    assert!(!d.st().open, "locked at once");
+    assert!(d.st().store_key.is_none());
+    settle().await;
+    let e = d.t.events();
+    assert!(!e.iter().any(|x| x.starts_with("unmount")), "{e:?}");
+    // the first lock finishes, then the second runs its own backups and unmount
+    d.t.backup.release();
+    d.t.backup.release();
+    first.await.unwrap();
+    settle().await;
+    let e = d.t.events();
+    let starts: Vec<usize> = e
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| *x == "backup start")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(starts.len(), 2, "{e:?}");
+    assert!(at(&e, "unmount") < starts[1], "{e:?}");
+    assert_eq!(e.iter().filter(|x| *x == "unmount").count(), 2, "{e:?}");
+    assert_eq!(*d.locks_done.borrow(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tick_and_a_request_both_past_the_allowance_lock_once() {
+    let (d, _) = testing::daemon(DEAD);
+    let vol = item("volume", "fa5a93d5-28d9-4c08-b608-c2b6f344b4d8");
+    open(&d, &[item("secrets", STORE), vol.clone()]).await;
+    settle().await;
+    d.t.advance(ALLOWANCE_MS + 60_000);
+    let events = ev();
+    let (_, r) = tokio::join!(d.tick(), d.op_keys(vec![vol], None, &events, false));
+    assert!(r.is_err(), "no key past the allowance");
+    settle().await;
+    assert_eq!(d.st().locks_begun, 1, "one lock");
+    let e = d.t.events();
+    assert_eq!(e.iter().filter(|x| *x == "backup start").count(), 1, "{e:?}");
+    assert_eq!(e.iter().filter(|x| *x == "status locked").count(), 1, "{e:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lock_that_waits_for_an_earlier_locks_backups_says_so() {
+    let (d, _) = testing::daemon(DEAD);
+    d.t.backup.hold();
+    open(&d, &store_items()).await;
+    let first = tokio::spawn({
+        let d = d.clone();
+        async move { d.lock("idle", false, false).await }
+    });
+    settle().await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ev: Events = {
+        let seen = seen.clone();
+        Arc::new(move |v| {
+            seen.lock()
+                .unwrap()
+                .push(v["event"].as_str().unwrap_or("").to_string())
+        })
+    };
+    let second = tokio::spawn({
+        let d = d.clone();
+        async move { d.handle(serde_json::json!({"op": "lock"}), ev).await }
+    });
+    settle().await;
+    assert_eq!(*seen.lock().unwrap(), ["lock-waits"]);
+    d.t.backup.release();
+    first.await.unwrap();
+    second.await.unwrap().unwrap();
+}

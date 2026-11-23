@@ -298,7 +298,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 | `own` | Values of `--own-approval` secrets for one command |
 | `keys` | Volume and backup keys for the CLI's volume and backup commands |
 | `store` | Write, rename or delete a secret (the daemon holds the store key) |
-| `events` | Stream of `waiting`, `answered`, `locked`, `notice` events, so the CLI prints `Waiting for your phone` once |
+| `events` | Stream of `waiting`, `answered`, `locked`, `notice` events, so the CLI prints `Waiting for your phone` once; `lock-waits` when a `lock` closes the session at once but its volumes wait for an earlier lock's backups (SPEC 6.5) |
 | `pending` | Delayed level 3 actions known from `notice` messages and the relay's `delayed` notes, for `status` and `cancel` |
 | `rewrap`, `migrate` | Section 16 |
 
