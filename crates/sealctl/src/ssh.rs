@@ -210,7 +210,7 @@ fn rsa_hash(flags: u32) -> Option<HashAlg> {
 /// Signs `data` as the request's flags ask: an RSA key with the requested SHA-2 hash, any other
 /// key by its own algorithm.
 fn sign_with(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature> {
-    use signature::{SignatureEncoding, Signer};
+    use rsa::signature::{SignatureEncoding, Signer};
     let KeypairData::Rsa(pair) = key.key_data() else {
         return Ok(key.try_sign(data)?);
     };
@@ -218,13 +218,13 @@ fn sign_with(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature> {
     let (hash, sig) = match rsa_hash(flags) {
         Some(HashAlg::Sha256) => (
             HashAlg::Sha256,
-            rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(private)
+            rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha256>::new(private)
                 .try_sign(data)?
                 .to_vec(),
         ),
         Some(HashAlg::Sha512) => (
             HashAlg::Sha512,
-            rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(private)
+            rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha512>::new(private)
                 .try_sign(data)?
                 .to_vec(),
         ),
@@ -294,7 +294,7 @@ pub fn setup_text() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use signature::Verifier;
+    use rsa::signature::Verifier;
 
     /// An RSA key signs with the hash the request asks for, and the signature verifies.
     #[test]
