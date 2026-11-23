@@ -2,7 +2,7 @@
 
 **Keys for developers and their AI agents.**
 API keys, SSH and git signing keys, encrypted volumes and backups, opened only when your phone
-approves. One tap per use; your AI agents never see the key.
+approves: one tap opens a work session, or approves every use for the keys you choose. Your AI agents never see the key.
 
 `sealctl` keeps API keys out of `.env` files, signs SSH logins and git commits, opens encrypted
 volumes and runs encrypted backups with restic. Every key is derived
