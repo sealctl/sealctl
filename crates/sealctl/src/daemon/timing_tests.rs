@@ -89,7 +89,11 @@ async fn a_hard_stop_keeps_the_first_open_of_a_session_approved_during_its_backu
     settle().await;
     let st = d.st();
     assert!(st.open);
-    assert_eq!(st.saved.first_open, Some(stop + 1_000), "the new session has its hard stop");
+    assert_eq!(
+        st.saved.first_open,
+        Some(stop + 1_000),
+        "the new session has its hard stop"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -169,7 +173,10 @@ async fn a_lock_during_the_mount_unmounts_after_it_and_starts_no_channel() {
     let e = d.t.events();
     assert!(at(&e, "mount end") < at(&e, "unmount"), "{e:?}");
     assert!(!d.st().open);
-    assert!(d.st().channel.is_none(), "no machine channel for a Locked session");
+    assert!(
+        d.st().channel.is_none(),
+        "no machine channel for a Locked session"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -287,7 +294,10 @@ async fn a_clock_set_back_locks_the_session() {
     open(&d, &store_items()).await;
     d.t.set_now(t0() - 10 * 60_000);
     d.tick().await;
-    assert!(!d.st().open, "idle time and the hard stop cannot be trusted any more");
+    assert!(
+        !d.st().open,
+        "idle time and the hard stop cannot be trusted any more"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -408,7 +418,10 @@ async fn a_session_grant_answered_after_a_lock_is_not_kept_for_the_next_session(
     open(&d, &store_items()).await;
     let vol = item("volume", "fa5a93d5-28d9-4c08-b608-c2b6f344b4d8");
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    d.t.answer(testing::session_reply(std::slice::from_ref(&vol)), Some(gate.clone()));
+    d.t.answer(
+        testing::session_reply(std::slice::from_ref(&vol)),
+        Some(gate.clone()),
+    );
     let asking = tokio::spawn({
         let d = d.clone();
         let vol = vol.clone();
@@ -417,7 +430,10 @@ async fn a_session_grant_answered_after_a_lock_is_not_kept_for_the_next_session(
     settle().await;
     d.lock("phone", true, false).await;
     gate.add_permits(1);
-    assert!(asking.await.unwrap(), "the waiting command gets the key it asked for");
+    assert!(
+        asking.await.unwrap(),
+        "the waiting command gets the key it asked for"
+    );
     open(&d, &store_items()).await;
     let held = d.st().keys.contains_key(&super::key_name(&vol.purpose, &vol.id));
     assert!(!held, "the new session does not hold the old session's grant");
@@ -443,15 +459,17 @@ async fn a_spawned_daemon_does_not_exit_while_the_phone_is_asked() {
 #[tokio::test(start_paused = true)]
 async fn a_busy_volume_is_tried_again_every_minute() {
     let (d, _) = testing::daemon(DEAD);
-    d.t.vol_busy
-        .lock()
-        .unwrap()
-        .extend([true, true, false]);
+    d.t.vol_busy.lock().unwrap().extend([true, true, false]);
     open(&d, &store_items()).await;
     d.lock("cli", true, false).await;
     let e = d.t.events();
     assert!(e.contains(&"status locked busy 1".to_string()), "{e:?}");
-    let tries = |d: &Daemon| d.t.events().iter().filter(|x| x.starts_with("close safe")).count();
+    let tries = |d: &Daemon| {
+        d.t.events()
+            .iter()
+            .filter(|x| x.starts_with("close safe"))
+            .count()
+    };
     assert_eq!(tries(&d), 1);
     tokio::time::sleep(Duration::from_secs(59)).await;
     assert_eq!(tries(&d), 1);
@@ -473,17 +491,17 @@ async fn a_lock_whose_status_failed_tells_the_phone_later() {
     *d.t.status_failures.lock().unwrap() = 1;
     d.lock("cli", true, false).await;
     settle().await;
-    let sent = |d: &Daemon| {
-        d.t.events()
-            .iter()
-            .filter(|x| *x == "status locked")
-            .count()
-    };
+    let sent = |d: &Daemon| d.t.events().iter().filter(|x| *x == "status locked").count();
     assert!(d.t.events().contains(&"status locked failed".to_string()));
     assert_eq!(sent(&d), 0);
     d.t.advance(61_000);
     d.tick().await;
-    assert_eq!(sent(&d), 1, "the phone took the session as Open: {:?}", d.t.events());
+    assert_eq!(
+        sent(&d),
+        1,
+        "the phone took the session as Open: {:?}",
+        d.t.events()
+    );
     // once heard, no more
     d.t.advance(3_600_000);
     d.tick().await;
@@ -509,7 +527,10 @@ async fn connecting_the_machine_socket_does_not_hold_up_requests() {
         .await
         .unwrap()
         .unwrap();
-    assert!(d.paired.try_lock().is_ok(), "the pairing is free while the socket connects");
+    assert!(
+        d.paired.try_lock().is_ok(),
+        "the pairing is free while the socket connects"
+    );
     channel.abort();
 }
 
@@ -542,4 +563,87 @@ async fn the_next_request_after_a_wait_finds_the_phone_told() {
         open_again.is_some_and(|o| o < at(&e, "ask keys")),
         "the phone knows the session is Open when the next request comes: {e:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_credit_stays_across_locks_and_the_place_sets_the_allowance() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    for m in 1..60 {
+        d.st().saved.work(t0() + m * 60_000);
+    }
+    d.t.set_now(t0() + 60 * 60_000);
+    d.lock("cli", true, false).await;
+    assert_eq!(d.st().saved.worked, 60);
+    // away from a trusted place: 10 minutes flat, whatever the credit
+    let mut other = session_reply(&store_items());
+    other.place = Some("other".into());
+    other.cap = Some(600);
+    other.base = Some(600);
+    other.rate = Some(0);
+    d.t.answer(other, None);
+    d.open_with(
+        store_items(),
+        STORE,
+        vec![],
+        RequestContext::default(),
+        &ev(),
+        false,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.st().saved.left(t0() + 60 * 60_000), 600);
+    d.lock("place", true, false).await;
+    // back at the trusted place: the credit counts again
+    d.t.advance(60_000);
+    open(&d, &store_items()).await;
+    let worked = d.st().saved.worked;
+    assert!(worked >= 61);
+    assert_eq!(
+        d.st().saved.left(d.now()),
+        session::idle_allowance(14_400, 1_800, 120, worked)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_credit_survives_a_restart_until_the_hard_stop() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    for m in 1..30 {
+        d.st().saved.work(t0() + m * 60_000);
+    }
+    d.lock("cli", true, false).await;
+    let saved = serde_json::to_vec(&d.st().saved).unwrap();
+    // a new daemon reads session.json
+    let (d2, _) = testing::daemon(DEAD);
+    d2.st().saved = serde_json::from_slice(&saved).unwrap();
+    d2.t.set_now(t0() + 2 * 3_600_000);
+    open(&d2, &store_items()).await;
+    assert_eq!(d2.st().saved.first_open, Some(t0()));
+    assert_eq!(d2.st().saved.worked, 31);
+    // after the hard stop it starts over
+    d2.lock("cli", true, false).await;
+    let stop = session::hard_stop(t0());
+    d2.t.set_now(stop + 60_000);
+    open(&d2, &store_items()).await;
+    assert_eq!(d2.st().saved.first_open, Some(stop + 60_000));
+    assert_eq!(d2.st().saved.worked, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn asleep_across_the_hard_stop_locks_on_wake_and_resets_the_credit() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    let stop = session::hard_stop(t0());
+    // working right up to the stop, asleep across it, woken by a key press
+    d.st().saved.work(stop - 60_000);
+    d.t.set_now(stop + 3_600_000);
+    d.t.set_idle(Some(0));
+    d.tick().await;
+    settle().await;
+    let st = d.st();
+    assert!(!st.open);
+    assert_eq!(st.saved.worked, 0);
+    assert!(st.saved.first_open.is_none());
 }
