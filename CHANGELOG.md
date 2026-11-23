@@ -13,6 +13,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - A leak test stores a canary and checks that none of those forms reaches the output of
   `sealctl run`, `daemon.log`, or any file in the config, state and data folders.
 
+### Fixed
+
+- A `lock` from the phone applies even when its message `seq` is below the highest the
+  machine has seen: each install of the app numbers its messages by its own clock, so a lock
+  from an install whose clock is behind another's was ignored. Other messages keep the `seq`
+  rule, and the highest `seq` seen never goes down.
+
 ## 0.7.0 - 2026-11-23
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes

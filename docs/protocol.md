@@ -533,7 +533,7 @@ Message body:
 | Field | Meaning |
 | --- | --- |
 | `v`, `t` | Version, time |
-| `seq` | Increases by one with every message to this machine; the machine ignores a `seq` it has seen |
+| `seq` | Increases with every message to this machine from one install of the app (each install counts from its own clock, so another install's `seq` can be lower); the machine keeps the highest `seq` it has seen and ignores a message at or below it, except a `lock`, which it applies whatever its `seq` (by `t`, below) and which never lowers the highest |
 | `type` | `lock`, `answers`, `ack` or `notice` |
 | `reason` | `lock`: `phone` (Lock tapped), `place` (the phone left the place), `words` (the words changed) |
 | `answers` | `answers`: this machine's remembered answers, at most 40 per message, `[{"a", "r", "n", "last"}]`; `"more": true` when another `answers` message follows. The machine replaces its list when the last part arrives |
