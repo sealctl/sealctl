@@ -320,9 +320,7 @@ impl Drop for Detach<'_> {
 }
 
 /// `lock` (its exit code and output) closed volume `r`: it says so, and the image at `bundle`
-/// is no longer attached. The lock returns once `hdiutil detach` has; `hdiutil info` is asked
-/// until it no longer lists the image, for 10 s at most, so a listing that trails the detach
-/// is not taken for a volume left open.
+/// is no longer attached. On failure: the lock's output, daemon.log and `hdiutil info`.
 #[cfg(feature = "test-hooks")]
 fn closed_by(env: &Env, lock: &(i32, String, String), bundle: &std::path::Path) {
     assert_eq!(lock.0, 0, "{}", report(env, "lock", lock));
@@ -332,7 +330,7 @@ fn closed_by(env: &Env, lock: &(i32, String, String), bundle: &std::path::Path) 
         report(env, "lock", lock)
     );
     assert!(
-        until(10, || !attached(bundle)),
+        !attached(bundle),
         "the image is detached after the lock\n{}",
         report(env, "lock", lock)
     );

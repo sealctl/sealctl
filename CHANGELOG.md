@@ -8,6 +8,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 
+- A sparse bundle listed by `hdiutil info` without its devices (as macOS lists an image while
+  it or another one attaches or detaches) is no longer read as not attached: sealctl reads
+  the list again, for a second at most. Before, a lock could pass over a mounted volume or
+  report it closed while it stayed mounted, and an open could detach the volume it had just
+  mounted (`image attached but not mounted`).
 - `hdiutil` failures name their reason: sealctl no longer runs `hdiutil create`, `attach` or
   `detach` with `-quiet`, which closes hdiutil's output and left errors as an empty
   `hdiutil create failed:`. A create refused as `Resource busy` that left nothing behind is
