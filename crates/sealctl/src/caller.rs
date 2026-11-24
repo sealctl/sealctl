@@ -26,7 +26,7 @@ pub struct Proc {
 
 impl Proc {
     /// The executable's file name (`git`, `bash`, `python3.12`), or `argv[0]`'s if unknown.
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         self.exe
             .as_deref()
             .and_then(Path::file_name)
@@ -43,8 +43,12 @@ fn base(path: &str) -> &str {
 /// The processes above this one, parent first, at most `max`. Stops at pid 1 or at the first
 /// process it can't read.
 pub fn ancestors(max: usize) -> Vec<Proc> {
+    chain(std::os::unix::process::parent_id() as i32, max)
+}
+
+/// Process `pid` and the processes above it, at most `max`.
+pub fn chain(mut pid: i32, max: usize) -> Vec<Proc> {
     let mut out = Vec::new();
-    let mut pid = std::os::unix::process::parent_id() as i32;
     while pid > 1 && out.len() < max {
         let Some(p) = info(pid) else { break };
         pid = p.ppid;
@@ -177,6 +181,68 @@ fn split_nul(b: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// The working folder of process `pid` (of this user).
+#[cfg(target_os = "linux")]
+pub fn cwd_of(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// The working folder of process `pid` (of this user).
+#[cfg(target_os = "macos")]
+pub fn cwd_of(pid: i32) -> Option<PathBuf> {
+    use std::ffi::c_void;
+    use std::mem::{size_of, MaybeUninit};
+
+    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: the buffer is a zeroed proc_vnodepathinfo of exactly `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr() as *mut c_void,
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled all `size` bytes.
+    let info = unsafe { info.assume_init() };
+    // `vip_path` is MAXPATHLEN bytes, NUL-terminated
+    let raw: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|&c| c as u8)
+        .collect();
+    let end = raw.iter().position(|&b| b == 0)?;
+    use std::os::unix::ffi::OsStrExt;
+    (end > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end])))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn cwd_of(_pid: i32) -> Option<PathBuf> {
+    None
+}
+
+/// The environment of process `pid` (of this user), as `NAME=value` strings.
+#[cfg(target_os = "linux")]
+pub fn env_of(pid: i32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|b| split_nul(&b))
+        .unwrap_or_default()
+}
+
+/// The environment of process `pid`: empty where the system does not show it (macOS shows
+/// another process's environment to root only).
+#[cfg(not(target_os = "linux"))]
+pub fn env_of(_pid: i32) -> Vec<String> {
+    Vec::new()
+}
+
 /// The program a credential helper serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -257,38 +323,33 @@ pub fn started_by(tool: Tool, chain: &[Proc]) -> bool {
     false
 }
 
-/// Agents recognised by their process when their environment variables were removed.
-const AGENT_PROGRAMS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "qwen",
-    "opencode",
-    "cursor-agent",
-    "copilot",
-];
-const AGENT_PACKAGES: &[&str] = &[
-    "@anthropic-ai/claude-code",
-    "@openai/codex",
-    "@google/gemini-cli",
-    "@qwen-code/qwen-code",
-    "@github/copilot",
-    "opencode-ai",
+/// Agents recognised by their process when their environment variables were removed (or, on
+/// macOS, cannot be read from another process): program name, npm package, agent.
+const AGENT_PROGRAMS: &[(&str, &str, &str)] = &[
+    ("claude", "@anthropic-ai/claude-code", "Claude Code"),
+    ("codex", "@openai/codex", "Codex"),
+    ("gemini", "@google/gemini-cli", "Gemini CLI"),
+    ("qwen", "@qwen-code/qwen-code", "Qwen Code"),
+    ("opencode", "opencode-ai", "OpenCode"),
+    ("cursor-agent", "", "Cursor"),
+    ("copilot", "@github/copilot", "Copilot CLI"),
 ];
 
-/// The first process in `chain` that is a known AI agent's command line program.
+/// The first process in `chain` that is a known AI agent's command line program, by name.
 pub fn agent_in(chain: &[Proc]) -> Option<&'static str> {
     chain.iter().find_map(|p| {
         let names = [Some(p.name()), p.argv.first().map(|a| base(a))];
-        let by_name = AGENT_PROGRAMS
-            .iter()
-            .find(|a| names.iter().flatten().any(|n| n == *a));
-        let by_package = || {
-            AGENT_PACKAGES
+        let by_name = || {
+            AGENT_PROGRAMS
                 .iter()
-                .find(|pkg| p.argv.iter().take(2).any(|a| a.contains(*pkg)))
+                .find(|(prog, _, _)| names.iter().flatten().any(|n| n == prog))
         };
-        by_name.or_else(by_package).map(|_| "an AI agent")
+        let by_package = || {
+            AGENT_PROGRAMS
+                .iter()
+                .find(|(_, pkg, _)| !pkg.is_empty() && p.argv.iter().take(2).any(|a| a.contains(*pkg)))
+        };
+        by_name().or_else(by_package).map(|(_, _, agent)| *agent)
     })
 }
 
@@ -634,8 +695,14 @@ mod tests {
     #[test]
     fn agents_by_process() {
         assert!(agent_in(&[agent_shell(), agent()]).is_some());
-        assert!(agent_in(&[p("/Users/u/.local/share/claude/versions/2.1.0", &["claude"])]).is_some());
-        assert!(agent_in(&[p("/opt/homebrew/bin/codex", &["codex", "exec"])]).is_some());
+        assert_eq!(
+            agent_in(&[p("/Users/u/.local/share/claude/versions/2.1.0", &["claude"])]),
+            Some("Claude Code")
+        );
+        assert_eq!(
+            agent_in(&[p("/opt/homebrew/bin/codex", &["codex", "exec"])]),
+            Some("Codex")
+        );
         assert!(agent_in(&[
             p("/bin/zsh", &["-zsh"]),
             p("/Applications/iTerm.app/Contents/MacOS/iTerm2", &["iTerm2"]),
@@ -664,5 +731,37 @@ mod tests {
         assert_eq!(chain.first().map(|p| p.pid), Some(me));
         assert!(chain[0].exe.is_some(), "{:?}", chain[0]);
         assert!(!chain[0].argv.is_empty(), "{:?}", chain[0]);
+    }
+
+    #[test]
+    fn another_process_has_a_folder_and_an_environment() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        // a clean environment: nothing of this process's goes into the child
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .current_dir(&dir)
+            .env_clear()
+            .env("SEALCTL_CALLER_TEST", "yes")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let wanted = |env: &[String]| env == ["SEALCTL_CALLER_TEST=yes"];
+        // Linux: until the child runs `sleep`, its environment is still this process's; macOS
+        // shows another process's environment to root only
+        let mut env = env_of(pid);
+        for _ in 0..100 {
+            if !cfg!(target_os = "linux") || wanted(&env) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            env = env_of(pid);
+        }
+        let cwd = cwd_of(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        if cfg!(target_os = "linux") {
+            assert!(wanted(&env), "the child's environment was not read");
+        }
+        assert_eq!(cwd.and_then(|c| std::fs::canonicalize(c).ok()), Some(dir));
     }
 }

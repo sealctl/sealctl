@@ -375,6 +375,8 @@ pub fn backup_run(names: &[String], all: bool, if_open: bool, quiet: bool) -> Re
         if !open {
             return Ok(());
         }
+        // the schedule (`--all --if-open --quiet`): nobody watches its output
+        client::unattended();
     }
     let list: Vec<Backup> = if all || names.is_empty() {
         Backup::list()?
@@ -467,6 +469,7 @@ pub fn aws_credentials(profile: &str) -> Result<()> {
     }
     // inside an agent only the AWS CLI itself may ask (SPEC 10.6)
     crate::caller::check_helper(crate::caller::Tool::Aws, "sealctl aws credentials")?;
+    client::unattended();
     let name = format!("aws/{profile}");
     let vals = client::values(std::slice::from_ref(&name), Some(("secret", &name)))?;
     let v: serde_json::Value = serde_json::from_slice(&vals[0].1)

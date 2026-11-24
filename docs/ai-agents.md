@@ -40,6 +40,9 @@ program gets the key while the agent sees only `****`.
      remember the answer. A person is never asked inside an Open session.
    * When a command prints `Waiting for your phone`, the skill tells the agent to tell you and
      wait, not retry; a decline (exit 4) means stop and ask you.
+   * Where the agent cannot see that line either (a signed `git commit`, `git push` through the
+     credential helper), a desktop notification says what waits, with the repository and the
+     agent: `Approve on your phone: Sign a git commit · sealctl/app · Claude Code`.
    * Nothing secret is printed to a terminal unless asked (`--show`).
 2. **Hooks** — checks the agent runs every time:
    * a prompt containing something that looks like a key is **blocked before the model sees it**;

@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::approve::{self, Asked};
 use crate::backup::Backup;
+use crate::desktop::{self, Desktop};
 use crate::exit::{self, fail};
 use crate::machine::{self, Paired};
 use crate::relay::Relay;
@@ -424,6 +425,10 @@ pub struct ValuesReq {
     /// Nobody watches a terminal: show a desktop notification while waiting.
     #[serde(default)]
     pub notify: bool,
+    /// What the notification says, when the asker knows better than the request (the SSH
+    /// agent: the program that asked for the signature). Never from the socket.
+    #[serde(skip)]
+    pub about: Option<crate::desktop::About>,
 }
 
 impl Daemon {
@@ -538,10 +543,10 @@ impl Daemon {
         self: &Arc<Self>,
         body: sealctl_core::wire::RequestBody,
         ev: &Events,
-        notify: bool,
+        desktop: &Desktop,
     ) -> Result<ReplyBody> {
         let turn = self.turn(ev).await?;
-        self.ask_in_turn(&turn, body, ev, notify).await
+        self.ask_in_turn(&turn, body, ev, desktop).await
     }
 
     /// The turn to ask the phone. A caller that finds another request on the phone waits for
@@ -567,7 +572,7 @@ impl Daemon {
         _turn: &tokio::sync::MutexGuard<'_, ()>,
         body: sealctl_core::wire::RequestBody,
         ev: &Events,
-        notify: bool,
+        desktop: &Desktop,
     ) -> Result<ReplyBody> {
         if caller_is_gone() {
             return Err(caller_left());
@@ -575,15 +580,32 @@ impl Daemon {
         self.st().waiting_since = Some(self.now());
         self.st().status_dirty = true;
         ev(json!({"event": "waiting"}));
-        if notify && crate::guard::ai_agent().is_none() {
-            util::notify("sealctl: waiting for your phone");
-        }
+        // Nobody watches a terminal (the SSH agent, git signing, credential helpers, scheduled
+        // backups): a desktop notification says what waits, also when an agent made the request
+        // and also when this daemon was started from an agent's shell (SPEC 5.2).
+        let shown = if desktop.show {
+            let about = desktop.about.clone().unwrap_or_else(|| desktop::about(&body));
+            #[cfg(test)]
+            self.t.event(format!("desktop {}", about.line()));
+            desktop::waiting(&about)
+        } else {
+            None
+        };
         let r = tokio::select! {
             r = self.send_ask(body) => r,
             () = caller_gone() => Err(caller_left()),
         };
         if r.is_ok() {
             test_hold("reply").await;
+        }
+        if let Some(shown) = shown {
+            shown.answered(match &r {
+                Ok(Some(reply)) if reply.ok => Some(desktop::Outcome::Approved),
+                Ok(Some(_)) => Some(desktop::Outcome::Declined),
+                Err(e) if exit::code_of(e) == exit::NO_ANSWER => Some(desktop::Outcome::Expired),
+                // withdrawn (the asker left), delayed, or the relay failed: nothing to show
+                _ => None,
+            });
         }
         let told_waiting = {
             let mut st = self.st();
@@ -715,7 +737,7 @@ impl Daemon {
         uses: Vec<AgentUse>,
         ctx: RequestContext,
         ev: &Events,
-        notify: bool,
+        desktop: &Desktop,
     ) -> Result<(bool, KeySet)> {
         // unit tests have no store; they open with `open_with`
         #[cfg(test)]
@@ -731,7 +753,7 @@ impl Daemon {
             }
         }
         let store_id = store.id.clone();
-        self.open_with(items, &store_id, uses, ctx, ev, notify, |set, words| {
+        self.open_with(items, &store_id, uses, ctx, ev, desktop, |set, words| {
             if new_store {
                 let k = set
                     .get(&key_name("secrets", &store.id))
@@ -753,7 +775,7 @@ impl Daemon {
         uses: Vec<AgentUse>,
         ctx: RequestContext,
         ev: &Events,
-        notify: bool,
+        desktop: &Desktop,
         first: impl FnOnce(&BTreeMap<String, ObjectKey>, &str) -> Result<()>,
     ) -> Result<(bool, KeySet)> {
         let mut body = approve::body("open");
@@ -772,7 +794,7 @@ impl Daemon {
             ));
         }
         let asked_at = self.now();
-        let reply = self.ask(body, ev, notify).await;
+        let reply = self.ask(body, ev, desktop).await;
         {
             // the end of this open, for the callers that joined it
             let mut st = self.st();
@@ -945,12 +967,17 @@ impl Daemon {
     }
 
     /// `open`.
-    pub async fn op_open(self: &Arc<Self>, ctx: RequestContext, ev: &Events, notify: bool) -> Result<Value> {
+    pub async fn op_open(
+        self: &Arc<Self>,
+        ctx: RequestContext,
+        ev: &Events,
+        desktop: &Desktop,
+    ) -> Result<Value> {
         self.expire();
         let _opening = self.join_open(ev).await?;
         test_hold("open-turn").await;
         if !self.st().open {
-            let (session, _) = self.open_session(vec![], vec![], ctx, ev, notify).await?;
+            let (session, _) = self.open_session(vec![], vec![], ctx, ev, desktop).await?;
             if !session {
                 return Ok(json!({"left": 0, "once": true}));
             }
@@ -986,6 +1013,10 @@ impl Daemon {
             .await;
         let mut ctx_n = ctx.clone();
         ctx_n.names = req.names.iter().take(10).cloned().collect();
+        let desktop = Desktop {
+            show: req.notify,
+            about: req.about.clone(),
+        };
         // what is not covered yet is judged after any pending open: a caller that joined it may
         // find its uses granted for the session already
         let opening = self.join_open(ev).await?;
@@ -1045,7 +1076,7 @@ impl Daemon {
         };
         if !was_open {
             let (session, set) = self
-                .open_session(vec![], uses.clone(), ctx_n.clone(), ev, req.notify)
+                .open_session(vec![], uses.clone(), ctx_n.clone(), ev, &desktop)
                 .await?;
             generation = self.st().generation;
             if session {
@@ -1083,7 +1114,7 @@ impl Daemon {
             let mut body = approve::body("agent");
             body.uses = uses.clone();
             body.ctx = Some(ctx_n.clone());
-            let reply = self.ask_in_turn(turn, body, ev, req.notify).await?;
+            let reply = self.ask_in_turn(turn, body, ev, &desktop).await?;
             if reply.grant.as_deref() == Some("session") {
                 keep_uses(&uses, generation);
             }
@@ -1119,7 +1150,7 @@ impl Daemon {
             let mut body = approve::body("own");
             body.keys = own.clone();
             body.ctx = Some(ctx_n.clone());
-            let reply = self.ask(body, ev, req.notify).await?;
+            let reply = self.ask(body, ev, &desktop).await?;
             for (item, key) in own.iter().zip(approve::keys_from(&reply, &own)?) {
                 own_keys.insert(item.id.clone(), key);
             }
@@ -1161,7 +1192,7 @@ impl Daemon {
         items: Vec<RequestItem>,
         subject: Option<(String, String)>,
         ev: &Events,
-        notify: bool,
+        desktop: &Desktop,
     ) -> Result<(Vec<ObjectKey>, String)> {
         self.expire();
         let held = || -> Option<(Vec<ObjectKey>, String)> {
@@ -1181,7 +1212,7 @@ impl Daemon {
         let ctx = self.context(None, "", "", subject).await;
         let opening = self.join_open(ev).await?;
         if !self.st().open {
-            let (_, set) = self.open_session(items.clone(), vec![], ctx, ev, notify).await?;
+            let (_, set) = self.open_session(items.clone(), vec![], ctx, ev, desktop).await?;
             let keys = items
                 .iter()
                 .map(|i| set.get(&i.purpose, &i.id).context("missing key"))
@@ -1200,7 +1231,7 @@ impl Daemon {
         let mut body = approve::body("keys");
         body.keys = items.clone();
         body.ctx = Some(ctx);
-        let reply = self.ask(body, ev, notify).await?;
+        let reply = self.ask(body, ev, desktop).await?;
         let keys = approve::keys_from(&reply, &items)?;
         // kept only by the session that asked: one that locked meanwhile does not hand them
         // to the next
@@ -1231,7 +1262,16 @@ impl Daemon {
                 .context(None, "", "", Some(("secret".into(), name.clone())))
                 .await;
             let (session, set) = self
-                .open_session(vec![], vec![], ctx, ev, req["notify"].as_bool().unwrap_or(false))
+                .open_session(
+                    vec![],
+                    vec![],
+                    ctx,
+                    ev,
+                    &Desktop {
+                        show: req["notify"].as_bool().unwrap_or(false),
+                        about: None,
+                    },
+                )
                 .await?;
             if !session {
                 once_key = set.get("secrets", &store.id);
@@ -1278,7 +1318,7 @@ impl Daemon {
                     let mut body = approve::body("keys");
                     body.keys = vec![item.clone()];
                     body.ctx = Some(ctx);
-                    let reply = self.ask(body, ev, false).await?;
+                    let reply = self.ask(body, ev, &Desktop::OFF).await?;
                     let k = approve::keys_from(&reply, &[item])?.remove(0);
                     let _writing = store.lock_writes()?;
                     let w = match reply.w {
@@ -1318,7 +1358,7 @@ impl Daemon {
                     let item = crate::store::own_item(&store, &h)?;
                     let mut body = approve::body("own");
                     body.keys = vec![item.clone()];
-                    let reply = self.ask(body, ev, false).await?;
+                    let reply = self.ask(body, ev, &Desktop::OFF).await?;
                     let k = approve::keys_from(&reply, &[item])?.remove(0);
                     let _writing = store.lock_writes()?;
                     let v = store.read(&name, &k)?;
@@ -1909,7 +1949,7 @@ impl Daemon {
             "pending" => {
                 let (at, when) = delayed_at(n.at, self.now());
                 util::notify(&format!(
-                    "sealctl: your phone approved {what}{on} away from a trusted place. It takes effect {when}. Not you? Run: sealctl cancel"
+                    "Your phone approved {what}{on} away from a trusted place. It takes effect {when}. Not you? Run: sealctl cancel"
                 ));
                 if let Some(id) = &n.delay {
                     let mut st = self.st();
@@ -1923,7 +1963,7 @@ impl Daemon {
                 }
             }
             "cancelled" => {
-                util::notify(&format!("sealctl: cancelled from your phone: {what}{on}"));
+                util::notify(&format!("Cancelled from your phone: {what}{on}"));
                 if let Some(id) = &n.delay {
                     self.st().pending.retain(|p| &p.id != id);
                 }
@@ -1934,7 +1974,7 @@ impl Daemon {
                 }
                 if let Some(r) = &n.report {
                     util::notify(&format!(
-                        "sealctl: {} handed back {} objects ({}). {} failed.",
+                        "{} handed back {} objects ({}). {} failed.",
                         n.machine.clone().unwrap_or_default(),
                         r.done,
                         r.to.join(", "),
@@ -1950,7 +1990,7 @@ impl Daemon {
     pub fn on_delayed_note(&self, id: &str, machine: Option<&str>, at: Option<u64>) {
         let (at, when) = delayed_at(at, self.now());
         util::notify(&format!(
-            "sealctl: a sensitive action was approved on your phone. It takes effect {when}. Not you? Run: sealctl cancel"
+            "A sensitive action was approved on your phone. It takes effect {when}. Not you? Run: sealctl cancel"
         ));
         let mut st = self.st();
         if !st.pending.iter().any(|p| p.id == id) {
@@ -2081,7 +2121,10 @@ impl Daemon {
 
     /// Handles one socket request.
     pub async fn handle(self: &Arc<Self>, req: Value, ev: Events) -> Result<Value> {
-        let notify = req["notify"].as_bool().unwrap_or(false);
+        let desktop = Desktop {
+            show: req["notify"].as_bool().unwrap_or(false),
+            about: None,
+        };
         match req["op"].as_str().unwrap_or("") {
             "status" => Ok(self.status()),
             "open" => {
@@ -2093,7 +2136,7 @@ impl Daemon {
                         None,
                     )
                     .await;
-                self.op_open(ctx, &ev, notify).await
+                self.op_open(ctx, &ev, &desktop).await
             }
             "lock" => {
                 let force = req["force"].as_bool().unwrap_or(false);
@@ -2124,7 +2167,7 @@ impl Daemon {
                         req["subject"]["n"].as_str().unwrap_or("").to_string(),
                     )
                 });
-                let (keys, words) = self.op_keys(items, subject, &ev, notify).await?;
+                let (keys, words) = self.op_keys(items, subject, &ev, &desktop).await?;
                 let out: Vec<String> = keys.iter().map(|k| k.b64u().to_string()).collect();
                 Ok(json!({"keys": out, "words": words}))
             }

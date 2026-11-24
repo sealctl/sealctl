@@ -85,6 +85,8 @@ crates/sealctl/src/ssh.rs                   session secrets stores seal_from uns
 crates/sealctl/src/git.rs                   session secrets
 crates/sealctl/src/caller.rs                session secrets daemon
 crates/sealctl/src/licence.rs               session pairing
+# desktop notifications while a request waits for the phone
+crates/sealctl/src/desktop.rs               daemon session secrets
 
 # ---- the fuzz targets' parsers (fuzz/fuzz_targets/*.rs) ---------------------------------------
 # sealctl-core is covered by `all` above
@@ -128,6 +130,9 @@ scripts/render-pkgbuild.sh                  none
 scripts/notices.sh                          none
 scripts/notices.hbs                         none
 about.toml                                  none
+# desktop notifications: the macOS helper app and its build, the Linux desktop entry and icon
+packaging/**                                none
+scripts/build-notifier-macos.sh             none
 # the pairing script for manual tests against a real phone
 scripts/pair-test.sh                        none
 # the uniffi smoke tests: bindings.yml

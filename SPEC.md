@@ -39,7 +39,10 @@ docs/
   vectors/generate.mjs        the script from protocol.md Appendix B
   ai-agents.md, threat-model.md, design.md
   unseal.md                   leaving sealctl: what `unseal` does per object (planned)
-scripts/                      package.sh, render-formula.sh, render-pkgbuild.sh, bindings-check.sh
+scripts/                      package.sh, render-formula.sh, render-pkgbuild.sh, bindings-check.sh,
+                              build-notifier-macos.sh
+packaging/                    macos/notifier/ (sealctl Notifier.app), linux/sealctl.desktop,
+                              icons/ (sealctl.svg and the PNGs made from it)
 .github/workflows/            ci.yml, packages.yml, bindings.yml, fuzz.yml
 .github/CODEOWNERS
 SECURITY-CHANGELOG.md         (planned, section 21)
@@ -187,6 +190,7 @@ The pairing key is a 0600 file rather than a keychain item. The binary is not co
 ```toml
 relay = "https://relay.sealctl.com"      # SEALCTL_RELAY overrides
 store = "~/.local/share/sealctl/store/<store-id>"
+notifications = false                    # no desktop notifications (5.2, 6.6); default true
 ```
 
 ## 4. Environment variables
@@ -200,6 +204,7 @@ store = "~/.local/share/sealctl/store/<store-id>"
 | `SEALCTL_NO_DAEMON=1` | No daemon: the command asks the phone itself and keeps keys for its own lifetime only (CI runners, containers) |
 | `SEALCTL_RESTIC` | restic binary (default `restic` from PATH) |
 | `SEALCTL_SSH_DIR` | Instead of `~/.ssh` |
+| `SEALCTL_NO_NOTIFY` | Set in the daemon's environment: no desktop notifications (5.2); the integration tests set it |
 | `SEALCTL_LOG` | Log level: `warn` (default), `info`, `debug`. Never `trace` of request bodies |
 | `NO_COLOR` | No colour |
 | `CI` | Present: never prompt, never show the ask |
@@ -222,7 +227,25 @@ store = "~/.local/share/sealctl/store/<store-id>"
 | An AI agent | Agent environment variables (`CLAUDECODE`, `CODEX_THREAD_ID`, `GEMINI_CLI`, `QWEN_CODE`, `COPILOT_AGENT_SESSION_ID`, `OPENCODE`, `CURSOR_AGENT`, `AI_AGENT`) or `SEALCTL_AGENT=1` | No prompts; values never printed; `sealctl run` masks; refusals use exit 8; no ask, no price, no request to pass anything on |
 | A pipe, CI or a service | stdout or stderr not a terminal, or `CI` set | No prompts (a command that needs one fails with exit 8 and says which flag to use); masking in `sealctl run`; no ask |
 
-`Waiting for your phone` is printed once on stderr in every context, because agents read it too. When nobody watches a terminal (the SSH agent, git signing, the backup schedule) and no agent is detected, the daemon also shows a desktop notification: "sealctl: waiting for your phone" (`osascript` on macOS, `notify-send` on Linux, silently skipped if missing).
+`Waiting for your phone` is printed once on stderr in every context, because agents read it too.
+
+**Desktop notifications.** Where nobody sees that line, the daemon also shows a desktop notification while the request waits: the SSH agent (SSH logins, and git signing, whose output git hides), the credential helpers (`sealctl git credential`, `sealctl aws credentials`), the backup schedule, the session these open, and any command whose stderr is not a terminal outside an agent. These always notify, also when an AI agent made the request and when the daemon was started from an agent's shell. A command whose stderr a person or an agent reads gets the line only.
+
+- Title `Approve on your phone`. The text names the request in the words of the phone's Activity rows, then the repository and the agent after ` · `; names only, never values (table below).
+- When the answer comes, the same notification is replaced: `Signed` (git signatures) or `Approved`, gone after 5 seconds; `Declined`; `Expired: nothing was signed` (signatures and SSH logins), `Expired: nothing was opened`, `Expired: nothing was backed up`, `Expired: nothing was used`, kept in the notification list. A request withdrawn (Ctrl-C) or failed on the relay takes it away.
+- The same text shows at most once a minute; an approval ends that minute, so a command retried after a decline stays quiet while the next approved one shows.
+- **macOS**: `sealctl Notifier.app` (`packaging/macos/notifier`: Swift, UNUserNotificationCenter; bundle id `com.sealctl.notifier`, name `sealctl`, the sealctl icon; built by `scripts/build-notifier-macos.sh` with the Command Line Tools and signed ad hoc). The daemon looks for it next to the `sealctl` binary, in `../libexec`, then in Homebrew's `opt/sealctl/libexec`, and runs its program `sealctl-notifier --id <id> --title <t> --body <b> [--replace]` (`--replace`: update in place, no sound) or `--id <id> --remove`; arguments carry names only. The first notification makes macOS ask whether sealctl may notify; the helper stays until the answer (up to 10 minutes) because the question goes away with it. When the helper is missing, not allowed (exit 3), still waiting for that answer after 3 seconds, or fails, the notification goes through `osascript` instead (shown as Script Editor, without updates). macOS does not register an app in a temporary folder (`/tmp`), so a helper there always falls back.
+- **Linux**: `org.freedesktop.Notifications` on the session bus (zbus): app name and icon `sealctl`, hint `desktop-entry` = `sealctl`, the answer through `replaces_id` (with a 5-second `expire_timeout` for an approval), removal through `CloseNotification`, `&`, `<` and `>` escaped when the server reads markup. The packages install `sealctl.desktop` (`NoDisplay=true`) and `sealctl.png` in the hicolor icon theme. Without a session bus or server: `notify-send`; without that, nothing.
+- **Off**: `notifications = false` in `config.toml` (also for the notices of 6.6), or `SEALCTL_NO_NOTIFY` in the daemon's environment.
+
+| Request | Text |
+| --- | --- |
+| A git signature through the SSH agent (`ssh-keygen -Y sign -n git`) | `Sign a git commit · sealctl/app · Claude Code`; `Sign a git tag`, `Sign a git push` by the git command above it. The repository from the signing program's folder; the agent from its environment (Linux) or the agent program among its parent processes |
+| Another SSH agent signature | `SSH login to github.com` (the host from `ssh`'s command line), else `SSH login with key work`; `Sign with SSH key work` for other `ssh-keygen -Y sign`; `Use SSH key work` for any other program |
+| A volume | `Open volume safe` |
+| A backup | `Back up safe` |
+| Secrets | `Use git/github.com`, `Use 2 secrets for npm test` (with `sealctl run`: the program and its first plain word, nothing else of the command line) |
+| The session alone | `Open sealctl` |
 
 ### 5.3 JSON
 
@@ -357,10 +380,10 @@ While Open, the daemon keeps the phone informed and listens for locks (protocol.
 - The phone takes the session as Open by the machine's last status, so the status goes out when the session opens, before the command that asked (or one that joined its `open`) goes on to its next request, and before volumes are mounted. When a status went out while the phone was asked (`waiting`), a status saying Open follows as soon as the answer arrives, before the next request; if that fails, the next 15-second sample sends it. A request waiting for the phone (up to 5 minutes) holds up neither statuses nor messages: a `lock` from the phone applies at once.
 - Usage log entries wait in `usage.jsonl` until a status that carries them is acknowledged. The log holds names, agents, repositories and masked commands, never values.
 - A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"), unless it was made more than 60 seconds before the session's `open` was sent (a lock held from an earlier session; the minute allows for the phone's clock being behind). Its `seq` does not matter: each install of the app numbers its messages by its own clock, so a lock from one install can come with a lower `seq` than another install's last message; it still applies, and the highest `seq` seen stays. Every other message applies only when its `seq` is above the highest seen. An `answers` message replaces `answers.json` (used by `sealctl rules`).
-- A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory until a `cancelled` or `done` notice or note for it, or 15 minutes after its `at` (when the relay deletes the record; for one without `at`, the longest delay, 2 hours, counts from its arrival, and the notification says `It takes effect within 2 hours`), shows it in `sealctl status`, and shows a desktop notification (5.2) whether or not an agent is running:
-  - pending: `sealctl: your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at 11:00. Not you? Run: sealctl cancel`. The relay's own note, without the phone's details, reads `sealctl: a sensitive action was approved on your phone. It takes effect at 11:00. Not you? Run: sealctl cancel`;
-  - cancelled: `sealctl: cancelled from your phone: leaving sealctl on dev@mbp.example.com`;
-  - done with a report: `sealctl: dev@mbp.example.com handed back 9 objects (macOS Keychain). 0 failed.`
+- A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory until a `cancelled` or `done` notice or note for it, or 15 minutes after its `at` (when the relay deletes the record; for one without `at`, the longest delay, 2 hours, counts from its arrival, and the notification says `It takes effect within 2 hours`), shows it in `sealctl status`, and shows a desktop notification (5.2, title `sealctl`) whether or not an agent is running:
+  - pending: `Your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at 11:00. Not you? Run: sealctl cancel`. The relay's own note, without the phone's details, reads `A sensitive action was approved on your phone. It takes effect at 11:00. Not you? Run: sealctl cancel`;
+  - cancelled: `Cancelled from your phone: leaving sealctl on dev@mbp.example.com`;
+  - done with a report: `dev@mbp.example.com handed back 9 objects (macOS Keychain). 0 failed.`
 - A Locked machine has no machine socket, so it learns of a pending action at its next relay call; `sealctl status` asks the relay (`GET .../delayed`, 2-second timeout) every time it runs.
 
 ### 6.7 Process hardening
@@ -1129,10 +1152,10 @@ Most of this code is written with AI coding agents. A security tool cannot ship 
 - **fuzz.yml**: section 21. The fuzz crate is a member of the main workspace but not of `default-members`, so it shares the one `Cargo.lock` (Dependabot, `cargo deny` and `cargo vet` see every fuzz dependency; vet policy `safe-to-run` for `sealctl-fuzz`) while plain `cargo build`/`test`/`clippy` never build it. fuzz.yml overrides the release profile's LTO and strip through `CARGO_PROFILE_RELEASE_*`.
 - **CI shape** (all workflows): one run per pull request, and a new push cancels the old one; runs on `main`, tags, schedules and manual runs are never cancelled or replaced (each gets a concurrency group of its own). Every job has `timeout-minutes`. Required checks (ruleset on `main`): `fmt`, `deny`, `msrv`, `test (ubuntu-latest)`, `test (macos-latest)` from ci.yml, which has no path filter. The free plan runs 5 macOS jobs at a time, so on pull requests packages.yml's macOS jobs (`build macos`, `brew install (macOS)`, `nix build (macos-latest)`) run only when packaging files change (its `changes` job reads the pull request's file list); bindings.yml (Swift on macOS) keeps a workflow path filter because it is not required. Push, tag and manual runs build everything.
 - **Test selection** (pull requests): a `changes` job in ci.yml and fuzz.yml runs `scripts/select-tests.py`, which maps the pull request's files through `.github/test-map` (path globs to suites, commented) and finds the crate of each file and the workspace crates that depend on it with `cargo metadata`. `test (ubuntu-latest)` still runs the whole `cargo test` on every pull request; `test (macos-latest)` runs only the selected crates' unit tests and integration tests of `crates/sealctl/tests/` (e.g. `src/volume/**` selects volumes, migrate, long_ops, unseal, seal_from and recover), the test-hooks steps run with their integration test on both systems, and fuzz.yml runs when a parser its targets use changes. Conservative: a path the map does not know, `Cargo.lock`, any `Cargo.toml`, `rust-toolchain.toml`, `flake.*`, the workflows, the map and the selector, `crates/sealctl-core/**`, the fake relay and the tests' shared code select everything, and so do the label `ci:full`, pushes to `main`, tags, schedules and manual runs. Both test jobs always report (step-level `if`); if `changes` fails, they run everything. `scripts/select-tests-test.py` (example file lists and their suites) runs in `test (ubuntu-latest)`.
-- **packages.yml**: Linux tarballs, `.deb`, `.rpm` built on Rocky 9, install tests on Debian, Ubuntu, Fedora, Rocky, openSUSE, Arch; macOS tarballs; Homebrew formula test; Nix build. The package descriptions say "phone-approved keys"; `deb` and `rpm` recommend `restic` and `cryptsetup`; the Linux packages depend only on the C and GCC runtime libraries. Planned:
+- **packages.yml**: Linux tarballs, `.deb`, `.rpm` built on Rocky 9, install tests on Debian, Ubuntu, Fedora, Rocky, openSUSE, Arch; macOS tarballs, each with `sealctl Notifier.app` for its architecture (5.2); Homebrew formula test; Nix build. The Linux tarballs, `.deb`, `.rpm`, the Arch package and the Nix build on Linux carry `sealctl.desktop` and the 256 px `sealctl.png` (installed as `/usr/share/applications/sealctl.desktop` and `/usr/share/icons/hicolor/256x256/apps/sealctl.png`). The package descriptions say "phone-approved keys"; `deb` and `rpm` recommend `restic` and `cryptsetup`; the Linux packages depend only on the C and GCC runtime libraries. Planned:
   - build attestations for every artifact and `SHA256SUMS`;
   - `sealctl-<version>-cli.md`, the full command reference generated from the clap definitions (`sealctl help --markdown`, hidden command, using `clap-markdown`), attached to each release.
-- **Homebrew formula**: `scripts/render-formula.sh` writes it: description "API keys, SSH keys, encrypted volumes and backups, approved on your phone", homepage `https://sealctl.com`, `depends_on "restic"`, caveats (get the phone app from `https://sealctl.com/docs#install`, then `sealctl pair`; `sealctl ai install` for agents), and a test block checking `sealctl --version` and that `sealctl --help` lists `pair`. Planned: `sealctl status --json` exiting 3 (not paired) in the test block.
+- **Homebrew formula**: `scripts/render-formula.sh` writes it: description "API keys, SSH keys, encrypted volumes and backups, approved on your phone", homepage `https://sealctl.com`, `depends_on "restic"`, caveats (get the phone app from `https://sealctl.com/docs#install`, then `sealctl pair`; `sealctl ai install` for agents), on macOS `libexec.install "sealctl Notifier.app"` (where the daemon finds it, 5.2), and a test block checking `sealctl --version`, that `sealctl --help` lists `pair` and, on macOS, that the notifier's program is there. Planned: `sealctl status --json` exiting 3 (not paired) in the test block.
 - **Release**: tag `vX.Y.Z` on `main` → packages.yml publishes the GitHub release and updates `sealctl/homebrew-tap`. Both publishing jobs run in the GitHub environment `release` (deployment tags `v*` only, the owner as required reviewer), which alone holds the tap deploy key `HOMEBREW_TAP_DEPLOY_KEY`. A ruleset protects `v*` tags: no deletion or force update, creation by admins only. Commits are not signed. `CHANGELOG.md` and `SECURITY-CHANGELOG.md` are updated in the release commit. The app repository pins this tag for `sealctl-core`.
 
 ## 24. Milestones

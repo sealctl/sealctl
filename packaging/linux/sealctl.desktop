@@ -1,0 +1,11 @@
+[Desktop Entry]
+# Names sealctl's desktop notifications (their "desktop-entry" hint) and gives them the icon;
+# not shown in menus.
+Type=Application
+Name=sealctl
+Comment=API keys, SSH keys, encrypted volumes and backups, approved on your phone
+Exec=sealctl status
+Icon=sealctl
+Terminal=true
+NoDisplay=true
+Categories=Utility;Security;

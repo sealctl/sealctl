@@ -180,6 +180,7 @@ pub fn credential(action: &str) -> Result<()> {
         return Ok(());
     }
     let name = format!("git/{host}");
+    crate::daemon::client::unattended();
     let store = crate::store::Store::configured()?;
     if !store.exists(&name) {
         return Ok(());

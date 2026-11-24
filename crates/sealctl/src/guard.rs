@@ -52,6 +52,26 @@ fn agent_by_variables() -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+/// The AI agent named by another process's environment (`NAME=value` strings), by the same rules
+/// as [`ai_agent`]: `SEALCTL_AGENT=0` turns detection off, any other value names "an AI agent".
+pub fn agent_in_env(env: &[String]) -> Option<&'static str> {
+    let get = |var: &str| {
+        env.iter()
+            .rev()
+            .find_map(|e| e.strip_prefix(var).and_then(|r| r.strip_prefix('=')))
+            .filter(|v| !v.is_empty())
+    };
+    match get("SEALCTL_AGENT") {
+        Some("0") => return None,
+        Some(_) => return Some("an AI agent"),
+        None => {}
+    }
+    AGENT_ENV
+        .iter()
+        .find(|(var, _)| get(var).is_some())
+        .map(|(_, name)| *name)
+}
+
 /// `SEALCTL_AGENT=0`: agent detection is off. A person sets it (agent hooks refuse it from an
 /// agent); when an agent's own variable is set as well, stderr says so once per process, so the
 /// switch is never silent.
@@ -369,6 +389,21 @@ pub fn mask_stream(mut from: impl Read, mut to: impl Write, secrets: Vec<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_in_another_process_environment() {
+        let env = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            agent_in_env(&env(&["HOME=/h", "CLAUDECODE=1"])),
+            Some("Claude Code")
+        );
+        assert_eq!(agent_in_env(&env(&["CODEX_THREAD_ID=t"])), Some("Codex"));
+        assert_eq!(agent_in_env(&env(&["CLAUDECODE="])), None);
+        assert_eq!(agent_in_env(&env(&["CLAUDECODE_X=1"])), None);
+        assert_eq!(agent_in_env(&env(&["CLAUDECODE=1", "SEALCTL_AGENT=0"])), None);
+        assert_eq!(agent_in_env(&env(&["SEALCTL_AGENT=1"])), Some("an AI agent"));
+        assert_eq!(agent_in_env(&env(&["PATH=/bin"])), None);
+    }
 
     #[test]
     fn detects_known_formats() {

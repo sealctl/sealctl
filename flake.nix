@@ -31,6 +31,10 @@
               --zsh <($out/bin/sealctl completions zsh) \
               --fish <($out/bin/sealctl completions fish)
             install -Dm644 THIRD-PARTY-NOTICES.md $out/share/doc/sealctl/THIRD-PARTY-NOTICES.md
+          '' + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            # the desktop entry and icon that desktop notifications name
+            install -Dm644 packaging/linux/sealctl.desktop $out/share/applications/sealctl.desktop
+            install -Dm644 packaging/icons/sealctl-256.png $out/share/icons/hicolor/256x256/apps/sealctl.png
           '';
           meta = with pkgs.lib; {
             description = "Phone-approved keys: secrets kept from AI agents, SSH, git signing, volumes, backups";

@@ -9,6 +9,7 @@ use sealctl_core::wire::{MachineMessage, MessageKind, RequestContext, RequestIte
 
 use super::testing::{self, item, session_reply, t0};
 use super::{approve, session, Daemon, Events};
+use crate::desktop::Desktop;
 
 /// Nothing listens here; no test reaches it.
 const DEAD: &str = "http://127.0.0.1:9";
@@ -35,7 +36,7 @@ async fn open(d: &Arc<Daemon>, items: &[RequestItem]) {
             vec![],
             RequestContext::default(),
             &ev(),
-            false,
+            &Desktop::OFF,
             |_, _| Ok(()),
         )
         .await
@@ -261,7 +262,7 @@ async fn an_expired_session_hands_out_no_key_before_the_tick() {
     open(&d, &[item("secrets", STORE), vol.clone()]).await;
     // just woken from a long sleep; the tick has not run yet
     d.t.advance(ALLOWANCE_MS + 60_000);
-    let r = d.op_keys(vec![vol], None, &ev(), false).await;
+    let r = d.op_keys(vec![vol], None, &ev(), &Desktop::OFF).await;
     assert!(r.is_err(), "no key from a session past its idle allowance");
     assert!(!d.st().open);
 }
@@ -280,7 +281,7 @@ async fn past_the_hard_stop_a_session_hands_out_no_key_before_the_tick() {
         d.st().saved.work(t);
     }
     d.t.set_now(stop + 1);
-    let r = d.op_keys(vec![vol], None, &ev(), false).await;
+    let r = d.op_keys(vec![vol], None, &ev(), &Desktop::OFF).await;
     assert!(r.is_err());
     assert!(!d.st().open);
     assert_eq!(d.st().saved.worked, 0, "the hard stop reset the credit");
@@ -321,7 +322,7 @@ async fn the_phone_hears_the_session_is_open_before_the_next_request() {
     open(&d, &store_items()).await;
     // an agent asks right after the open
     d.t.answer(testing::grant("once", &[]), None);
-    d.ask(approve::body("agent"), &ev(), false).await.unwrap();
+    d.ask(approve::body("agent"), &ev(), &Desktop::OFF).await.unwrap();
     settle().await;
     let e = d.t.events();
     assert!(at(&e, "status open") < at(&e, "ask agent"), "{e:?}");
@@ -336,7 +337,7 @@ async fn the_end_of_a_wait_is_told_to_the_phone() {
     d.t.answer(testing::grant("once", &[]), Some(gate.clone()));
     let asking = tokio::spawn({
         let d = d.clone();
-        async move { d.ask(approve::body("agent"), &ev(), false).await.is_ok() }
+        async move { d.ask(approve::body("agent"), &ev(), &Desktop::OFF).await.is_ok() }
     });
     settle().await;
     // a status goes out while the phone is asked; the one at the end of the wait fails
@@ -382,7 +383,7 @@ async fn a_lock_message_is_applied_while_the_phone_is_asked() {
     };
     let asking = tokio::spawn({
         let d = d.clone();
-        async move { d.ask(approve::body("agent"), &ev(), false).await.is_ok() }
+        async move { d.ask(approve::body("agent"), &ev(), &Desktop::OFF).await.is_ok() }
     });
     tokio::time::timeout(Duration::from_secs(5), rx)
         .await
@@ -490,7 +491,7 @@ async fn a_session_grant_answered_after_a_lock_is_not_kept_for_the_next_session(
     let asking = tokio::spawn({
         let d = d.clone();
         let vol = vol.clone();
-        async move { d.op_keys(vec![vol], None, &ev(), false).await.is_ok() }
+        async move { d.op_keys(vec![vol], None, &ev(), &Desktop::OFF).await.is_ok() }
     });
     settle().await;
     d.lock("phone", true, false).await;
@@ -513,7 +514,7 @@ async fn a_spawned_daemon_does_not_exit_while_the_phone_is_asked() {
     d.t.answer(testing::grant("once", &[]), Some(gate.clone()));
     let asking = tokio::spawn({
         let d = d.clone();
-        async move { d.ask(approve::body("open"), &ev(), false).await.is_ok() }
+        async move { d.ask(approve::body("open"), &ev(), &Desktop::OFF).await.is_ok() }
     });
     settle().await;
     assert!(!d.idle_exit_due(), "an SSH signature is waiting for the phone");
@@ -612,7 +613,7 @@ async fn the_next_request_after_a_wait_finds_the_phone_told() {
     d.t.answer(testing::grant("once", &[]), None);
     let first = tokio::spawn({
         let d = d.clone();
-        async move { d.ask(approve::body("agent"), &ev(), false).await.is_ok() }
+        async move { d.ask(approve::body("agent"), &ev(), &Desktop::OFF).await.is_ok() }
     });
     settle().await;
     // the periodic status goes out while the phone is asked
@@ -620,7 +621,7 @@ async fn the_next_request_after_a_wait_finds_the_phone_told() {
     gate.add_permits(1);
     assert!(first.await.unwrap());
     // the next request follows at once
-    d.ask(approve::body("keys"), &ev(), false).await.unwrap();
+    d.ask(approve::body("keys"), &ev(), &Desktop::OFF).await.unwrap();
     let e = d.t.events();
     let waiting = at(&e, "status waiting");
     let open_again = e[waiting..]
@@ -656,7 +657,7 @@ async fn the_credit_stays_across_locks_and_the_place_sets_the_allowance() {
         vec![],
         RequestContext::default(),
         &ev(),
-        false,
+        &Desktop::OFF,
         |_, _| Ok(()),
     )
     .await
@@ -762,7 +763,7 @@ async fn an_exit_stops_running_backups_and_opens_no_session() {
             vec![],
             RequestContext::default(),
             &ev(),
-            false,
+            &Desktop::OFF,
             |_, _| Ok(()),
         )
         .await;
@@ -792,7 +793,7 @@ async fn an_approval_that_arrives_during_the_exit_opens_no_session() {
                 vec![],
                 RequestContext::default(),
                 &ev(),
-                false,
+                &Desktop::OFF,
                 |_, _| Ok(()),
             )
             .await
@@ -824,7 +825,7 @@ async fn a_session_that_runs_out_while_a_request_waits_its_turn_hands_out_no_val
         vec![],
         RequestContext::default(),
         &ev(),
-        false,
+        &Desktop::OFF,
         |_, _| Ok(()),
     )
     .await
@@ -878,7 +879,7 @@ async fn a_lock_while_the_phone_is_asked_to_open_leaves_the_approval_with_its_co
                 vec![],
                 RequestContext::default(),
                 &ev(),
-                false,
+                &Desktop::OFF,
                 |_, _| Ok(()),
             )
             .await
@@ -1013,7 +1014,7 @@ async fn the_tick_and_a_request_both_past_the_allowance_lock_once() {
     settle().await;
     d.t.advance(ALLOWANCE_MS + 60_000);
     let events = ev();
-    let (_, r) = tokio::join!(d.tick(), d.op_keys(vec![vol], None, &events, false));
+    let (_, r) = tokio::join!(d.tick(), d.op_keys(vec![vol], None, &events, &Desktop::OFF));
     assert!(r.is_err(), "no key past the allowance");
     settle().await;
     assert_eq!(d.st().locks_begun, 1, "one lock");
@@ -1114,15 +1115,18 @@ async fn an_unpaired_answer_holds_up_no_other_request() {
     d.t.answer(testing::grant("once", &[]), None);
     let r = tokio::time::timeout(
         Duration::from_secs(5),
-        d.ask(approve::body("agent"), &ev(), false),
+        d.ask(approve::body("agent"), &ev(), &Desktop::OFF),
     )
     .await
     .expect("the unpaired answer does not wait for the lock's backups");
     assert!(r.is_err());
-    tokio::time::timeout(Duration::from_secs(5), d.ask(approve::body("keys"), &ev(), false))
-        .await
-        .expect("the next request does not wait for the lock's backups")
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        d.ask(approve::body("keys"), &ev(), &Desktop::OFF),
+    )
+    .await
+    .expect("the next request does not wait for the lock's backups")
+    .unwrap();
     d.t.backup.release();
     locking.await.unwrap();
     settle().await;

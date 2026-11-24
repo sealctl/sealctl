@@ -379,42 +379,9 @@ pub fn read_hidden(prompt: &str) -> Result<Zeroizing<String>> {
     Ok(line)
 }
 
-/// A desktop notification (SPEC 5.2: when nobody watches a terminal): `osascript` on macOS,
-/// `notify-send` on Linux, silently skipped if missing. The same message at most once a minute.
+/// A desktop notice (SPEC 6.6): [`crate::desktop::notice`].
 pub fn notify(msg: &str) {
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    static SHOWN: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
-    {
-        let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
-        shown.retain(|(_, t)| t.elapsed() < Duration::from_secs(60));
-        if shown.iter().any(|(m, _)| m == msg) {
-            return;
-        }
-        shown.push((msg.to_string(), Instant::now()));
-    }
-    if std::env::var_os("SEALCTL_NO_NOTIFY").is_some() {
-        return;
-    }
-    let quoted = msg.replace('\\', "\\\\").replace('"', "\\\"");
-    let _ = if cfg!(target_os = "macos") {
-        Command::new("/usr/bin/osascript")
-            .args([
-                "-e",
-                &format!("display notification \"{quoted}\" with title \"sealctl\" sound name \"Ping\""),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-    } else if which("notify-send") {
-        Command::new("notify-send")
-            .args(["sealctl", msg])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-    } else {
-        return;
-    };
+    crate::desktop::notice(msg);
 }
 
 /// Read the clipboard as text, then clear it (used to store a copied key without it ever being
