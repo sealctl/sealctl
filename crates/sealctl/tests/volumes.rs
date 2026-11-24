@@ -269,7 +269,7 @@ fn until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
 
 /// Whether `hdiutil info` lists an image at `bundle`.
 fn attached(bundle: &std::path::Path) -> bool {
-    let real = std::fs::canonicalize(bundle).unwrap();
+    let real = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
     let info = Command::new("hdiutil").arg("info").output().unwrap();
     let info = String::from_utf8_lossy(&info.stdout);
     info.lines().any(|l| {
@@ -338,6 +338,118 @@ fn closed_by(env: &Env, lock: &(i32, String, String), bundle: &std::path::Path) 
     );
 }
 
+/// A stand-in `hdiutil` first on PATH: `body` (sh), then the real `/usr/bin/hdiutil`. Like
+/// the real one, a stand-in failure says nothing under `-quiet`. Returns the PATH to run with.
+fn stand_in_hdiutil(env: &Env, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.h().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("hdiutil"),
+        format!(
+            "#!/bin/sh\nquiet() {{ case \" $* \" in *' -quiet '*) return 0;; esac; return 1; }}\n\
+             {body}\nexec /usr/bin/hdiutil \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("hdiutil"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
+/// `sealctl args` with `path` as PATH (the daemon it starts gets it too).
+fn run_with_path(env: &Env, path: &str, args: &[&str]) -> (i32, String, String) {
+    let o = env
+        .cmd()
+        .env("PATH", path)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        o.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+/// `volume create r` (a 32 MB sparse bundle in the test HOME) with `path` as PATH.
+fn create_r(env: &Env, path: &str) -> (i32, String, String) {
+    let bundle = env.h().join("r.sparsebundle");
+    let mnt = env.h().join("mnt/r");
+    let (r, _) = env.with_phone(Answer::Session, || {
+        run_with_path(
+            env,
+            path,
+            &[
+                "volume",
+                "create",
+                "r",
+                "--kind",
+                "sparsebundle",
+                "--size",
+                "32m",
+                "--path",
+                bundle.to_str().unwrap(),
+                "--mountpoint",
+                mnt.to_str().unwrap(),
+            ],
+        )
+    });
+    r
+}
+
+/// `hdiutil create` refused as `Resource busy` (the disk images service busy with other
+/// images, as on a CI runner) once: `volume create` tries again and the volume is made.
+#[test]
+fn volume_create_tries_again_after_hdiutil_create_was_busy() {
+    let mut env = Env::new();
+    env.pair();
+    let once = env.h().join("create-was-busy");
+    let path = stand_in_hdiutil(
+        &env,
+        &format!(
+            "if [ \"$1\" = create ] && [ ! -e '{0}' ]; then\n  : > '{0}'\n  \
+             quiet \"$@\" || echo 'hdiutil: create failed - Resource busy' >&2\n  exit 1\nfi",
+            once.display()
+        ),
+    );
+    let bundle = env.h().join("r.sparsebundle");
+    let _detach = Detach(&env, bundle.clone(), env.h().join("mnt/r"));
+    let (code, _, err) = create_r(&env, &path);
+    assert!(once.exists(), "the stand-in was asked");
+    assert_eq!(code, 0, "{err}");
+    assert!(attached(&bundle));
+}
+
+/// Any other `hdiutil create` failure is reported at once, with hdiutil's reason (not an
+/// empty `hdiutil create failed:`), and not tried again.
+#[test]
+fn volume_create_reports_why_hdiutil_create_failed() {
+    let mut env = Env::new();
+    env.pair();
+    let calls = env.h().join("create-calls");
+    let path = stand_in_hdiutil(
+        &env,
+        &format!(
+            "if [ \"$1\" = create ]; then\n  echo x >> '{}'\n  \
+             quiet \"$@\" || echo 'hdiutil: create failed - No space left on device' >&2\n  \
+             exit 1\nfi",
+            calls.display()
+        ),
+    );
+    let (code, _, err) = create_r(&env, &path);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("hdiutil create failed: hdiutil: create failed - No space left on device"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap().lines().count(),
+        1,
+        "not tried again"
+    );
+}
+
 /// A lock that cannot tell whether a volume is open (`hdiutil info` fails) does not pass over
 /// it as closed: it tries to close it, and when that fails too, reports it busy (exit 11, tried
 /// again every minute, SPEC 6.5) rather than "Locked." with the volume still mounted. A
@@ -345,61 +457,25 @@ fn closed_by(env: &Env, lock: &(i32, String, String), bundle: &std::path::Path) 
 /// exists and runs the real one otherwise.
 #[test]
 fn a_lock_that_cannot_list_the_images_reports_the_volume_busy() {
-    use std::os::unix::fs::PermissionsExt;
     let mut env = Env::new();
     env.pair();
     // the daemon started for the pairing has the plain PATH; the next command starts another
     env.stop_daemon();
     let fails = env.h().join("hdiutil-info-fails");
-    let bin = env.h().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(
-        bin.join("hdiutil"),
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = info ] && [ -e '{}' ]; then\n  \
-             echo 'hdiutil: info failed - stand-in' >&2\n  exit 1\nfi\n\
-             exec /usr/bin/hdiutil \"$@\"\n",
+    let path = stand_in_hdiutil(
+        &env,
+        &format!(
+            "if [ \"$1\" = info ] && [ -e '{}' ]; then\n  \
+             echo 'hdiutil: info failed - stand-in' >&2\n  exit 1\nfi",
             fails.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.join("hdiutil"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let run = |args: &[&str]| {
-        let o = env
-            .cmd()
-            .env("PATH", &path)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        (
-            o.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&o.stdout).into_owned(),
-            String::from_utf8_lossy(&o.stderr).into_owned(),
-        )
-    };
+    );
     let bundle = env.h().join("r.sparsebundle");
-    let mnt = env.h().join("mnt/r");
-    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
-        run(&[
-            "volume",
-            "create",
-            "r",
-            "--kind",
-            "sparsebundle",
-            "--size",
-            "32m",
-            "--path",
-            bundle.to_str().unwrap(),
-            "--mountpoint",
-            mnt.to_str().unwrap(),
-        ])
-    });
+    let (code, _, err) = create_r(&env, &path);
     assert_eq!(code, 0, "{err}");
-    let _detach = Detach(&env, bundle.clone(), mnt.clone());
+    let _detach = Detach(&env, bundle.clone(), env.h().join("mnt/r"));
     std::fs::write(&fails, b"").unwrap();
-    let lock = run(&["lock"]);
+    let lock = run_with_path(&env, &path, &["lock"]);
     std::fs::remove_file(&fails).unwrap();
     // the image is still attached: finding its device for the detach needs `hdiutil info` too
     assert!(attached(&bundle));

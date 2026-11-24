@@ -1027,27 +1027,7 @@ fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
         std::fs::remove_dir_all(&new_path)?;
     }
     if !new_path.exists() {
-        let out = util::run_with_stdin(
-            util::system_cmd("hdiutil")
-                .args([
-                    "create",
-                    "-quiet",
-                    "-size",
-                    "1t",
-                    "-type",
-                    "SPARSEBUNDLE",
-                    "-fs",
-                    "APFS",
-                    "-encryption",
-                    "AES-256",
-                    "-stdinpass",
-                    "-volname",
-                ])
-                .arg(&v.name)
-                .arg(&new_path),
-            key.hex().as_bytes(),
-        )?;
-        util::check(out, "hdiutil create")?;
+        volume::sparsebundle::create_image(&new_path, "1t", &v.name, key.hex().as_bytes())?;
     }
     let tmp = paths::state_dir()?.join(format!("migrate-{}", std::process::id()));
     let (old_mp, new_mp) = (tmp.join("old"), tmp.join("new"));
@@ -1055,7 +1035,7 @@ fn reencrypt_bundle(job: &mut Job, i: usize) -> Result<String> {
     std::fs::create_dir_all(&new_mp)?;
     let attach = |p: &Path, mp: &Path, k: &ObjectKey, ro: bool| -> Result<()> {
         let mut c = util::system_cmd("hdiutil");
-        c.args(["attach", "-quiet", "-stdinpass", "-owners", "on", "-mountpoint"])
+        c.args(["attach", "-stdinpass", "-owners", "on", "-mountpoint"])
             .arg(mp);
         if ro {
             c.arg("-readonly");

@@ -88,6 +88,34 @@ pub fn attached_mounts(path: &std::path::Path) -> Result<Vec<String>> {
     Ok(mounts)
 }
 
+/// `hdiutil create`: an encrypted APFS sparse bundle at `path` (which must not exist), with
+/// `pass` on stdin. Never `-quiet`: that closes hdiutil's stdout and stderr, and a failure
+/// would say nothing about why. A create refused as `Resource busy` (the disk images service
+/// busy with other images) that left nothing at `path` is tried again, three times in all, a
+/// second apart; any other failure is reported at once, with hdiutil's reason.
+pub fn create_image(path: &std::path::Path, size: &str, volname: &str, pass: &[u8]) -> Result<()> {
+    const TRIES: u32 = 3;
+    for attempt in 1..=TRIES {
+        let out = run_with_stdin(
+            crate::util::system_cmd("hdiutil")
+                .args(["create", "-size", size, "-type", "SPARSEBUNDLE", "-fs", "APFS"])
+                .args(["-encryption", "AES-256", "-stdinpass", "-volname", volname])
+                .arg(path),
+            pass,
+        )?;
+        let busy = !out.status.success()
+            && String::from_utf8_lossy(&out.stderr).contains("Resource busy")
+            && !path.exists();
+        if !busy || attempt == TRIES {
+            check(out, "hdiutil create")?;
+            return Ok(());
+        }
+        log::info!("hdiutil create: resource busy, trying again ({attempt}/{TRIES})");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Ok(())
+}
+
 /// Detaches every attachment of the image at `path`, wherever it is mounted. Just after a
 /// mount or a write, macOS services (Spotlight, fseventsd) can hold the volume for a moment,
 /// so a detach without `force` is tried three times, a second apart, before the volume is
@@ -97,7 +125,7 @@ fn detach_all(path: &std::path::Path, force: bool) -> Result<()> {
     for a in attachments(path)? {
         for attempt in 1..=TRIES {
             let mut cmd = crate::util::system_cmd("hdiutil");
-            cmd.args(["detach", "-quiet"]);
+            cmd.arg("detach");
             if force {
                 cmd.arg("-force");
             }
@@ -123,23 +151,7 @@ impl Backend for Sparsebundle {
         let path = v.path.clone().context("sparsebundle needs a path")?;
         let id = crate::util::new_uuid()?;
         let pass = key_for(&id)?;
-        let out = run_with_stdin(
-            crate::util::system_cmd("hdiutil")
-                .args([
-                    "create",
-                    "-quiet",
-                    "-size",
-                    size,
-                    "-type",
-                    "SPARSEBUNDLE",
-                    "-fs",
-                    "APFS",
-                ])
-                .args(["-encryption", "AES-256", "-stdinpass", "-volname", &v.name])
-                .arg(&path),
-            pass.as_bytes(),
-        )?;
-        check(out, "hdiutil create")?;
+        create_image(&path, size, &v.name, pass.as_bytes())?;
         v.id = id.clone();
         Ok(pass)
     }
@@ -157,7 +169,7 @@ impl Backend for Sparsebundle {
     fn unlock(&self, v: &Volume, passphrase: &[u8]) -> Result<()> {
         let path = v.path.as_ref().context("sparsebundle needs a path")?;
         let mut cmd = crate::util::system_cmd("hdiutil");
-        cmd.args(["attach", "-quiet", "-stdinpass", "-owners", "on"]);
+        cmd.args(["attach", "-stdinpass", "-owners", "on"]);
         let default_mp = std::path::Path::new("/Volumes").join(&v.name);
         if v.mountpoint != default_mp {
             std::fs::create_dir_all(&v.mountpoint)?;
