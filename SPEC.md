@@ -592,7 +592,7 @@ The helpers print values by design, to the program that called them. Inside an a
 | `sealctl volume create <name> [--kind apfs\|sparsebundle\|luks] [--size 50g] [--container diskN] [--path P] [--mountpoint M] [--manual]` | Section 13; mounted at once; `--manual` means not mounted when the session opens |
 | `sealctl volume ls [--json]` | Name, kind, Open or closed, mountpoint, words, last backup |
 | `sealctl volume open <name>`, `sealctl volume close <name> [--force]` | Mount or unmount one volume |
-| `sealctl volume import <name> <image path or APFS UUID> [--kind] [--mountpoint]` | Alias of `sealctl seal volume` (section 18.2): registers a volume already sealed with these words, or takes over one of the user's own |
+| `sealctl volume import <name> <image path or APFS volume (name, UUID or disk)> [--kind] [--mountpoint]` | Alias of `sealctl seal volume` (section 18.2): registers a volume already sealed with these words, or takes over one of the user's own |
 | `sealctl volume rm <name> [--delete-data]` | Forgets it; `--delete-data` destroys it after typing the name |
 | `sealctl backup init <name> --from <volume or folder> --repo <base URL> [-e VAR=value]...` | Section 14 |
 | `sealctl backup run [<name>...] [--all] [--if-open] [--quiet]` | Back up now; `--if-open` skips silently when Locked (for the schedule) |
@@ -750,12 +750,12 @@ An object whose words are neither the phone's current words (`w` in any reply) n
 Opens an object with the 24 words alone: no phone, no relay, no pairing, no config.
 
 ```text
-sealctl recover <store folder | .sealed file | sparse bundle | LUKS file | APFS volume UUID | restic repository URL>
+sealctl recover <store folder | .sealed file | sparse bundle | LUKS file | APFS volume (name, UUID or disk) | restic repository URL>
                 [--out <dir> | --name <secret> [--show]] [-- <restic arguments>]
 ```
 
 1. Refused inside an AI agent and without a terminal on stdin (exit 8): the words must be typed by a person.
-2. Reads the object's marker for its kind, id and words fingerprint. A LUKS file is known by its header; its id is the LUKS UUID (`cryptsetup luksUUID`) and its marker the LUKS2 token `sealctl` (`cryptsetup luksDump --dump-json-metadata`, without root when the file is readable, else through `sudo`). An APFS volume is given by its volume UUID (any case) or disk identifier (`disk3s5`); its id is the volume UUID in lower case (`diskutil info`) and its marker the passphrase hint `sealctl <fp>` (`diskutil apfs listUsers`), which names the words but holds no check. A marker that is missing (the LUKS token is written best effort) skips step 4: the key is still checked in step 5.
+2. Reads the object's marker for its kind, id and words fingerprint. A LUKS file is known by its header; its id is the LUKS UUID (`cryptsetup luksUUID`) and its marker the LUKS2 token `sealctl` (`cryptsetup luksDump --dump-json-metadata`, without root when the file is readable, else through `sudo`). An APFS volume is given by its volume UUID (any case), disk identifier (`disk3s5`) or name (section 18.2); its id is the volume UUID in lower case (`diskutil info`) and its marker the passphrase hint `sealctl <fp>` (`diskutil apfs listUsers`), which names the words but holds no check. A marker that is missing (the LUKS token is written best effort) skips step 4: the key is still checked in step 5.
 3. Asks for the 24 words one at a time with no echo (`Word 1 of 24:`); the first four letters are enough; an unknown prefix asks again; a failed checksum asks again from the start, three tries.
 4. Computes the root, compares its fingerprint with the marker: on a mismatch, `These words have fingerprint qHWf; this object was sealed with words 7Hq3.` and exit 10.
 5. Derives the object's key, checks it against the marker's check, then:
@@ -795,7 +795,7 @@ The same rules and password stores serve both directions.
 ### 18.2 Commands
 
 ```text
-sealctl seal volume <name> <APFS volume UUID | sparse bundle | LUKS file> [--mountpoint M] [--manual] [--words]
+sealctl seal volume <name> <APFS volume (name, UUID or disk) | sparse bundle | LUKS file> [--mountpoint M] [--manual] [--words]
 sealctl seal backup <name> --repo <restic URL> [--from <volume or folder>] [-e VAR=value]... [--keep-old-password] [--words]
 sealctl seal ssh <file> [--name <n>]
 sealctl seal secret <name> [--from-clipboard] [--force]
@@ -820,7 +820,7 @@ Aliases: `volume import` is `seal volume`, `ssh import` is `seal ssh`, `secret i
 
 | Object | Reads | Steps | Check before the old way in is removed |
 | --- | --- | --- | --- |
-| APFS volume | Its passphrase (prompt without echo, or `--from-*`) | Read the UUID (`diskutil info`); get the volume key with a `keys` request; `diskutil apfs changePassphrase <uuid> -user disk -oldStdinpassphrase -newStdinpassphrase`; hint `sealctl <fp>`; once mounted, `<mount>/.sealctl/volume.id` | `diskutil apfs unlockVolume <uuid> -user <uuid> -verify -stdinpassphrase` passes with `hex(volume key)` and fails with the old passphrase (recent macOS needs the disk user named by UUID for `-verify`; it is the volume UUID) |
+| APFS volume | Its passphrase (prompt without echo, or `--from-*`) | Find the volume: a UUID or disk identifier as given; a name in `diskutil apfs list -plist` (read as JSON through `plutil`; locked volumes are listed too), the exact name first, else ignoring case; a name that several volumes share stops with exit 2, listing each one's disk identifier and UUID. Read the UUID (`diskutil info`); get the volume key with a `keys` request; `diskutil apfs changePassphrase <uuid> -user disk -oldStdinpassphrase -newStdinpassphrase`; hint `sealctl <fp>`; once mounted, `<mount>/.sealctl/volume.id` | `diskutil apfs unlockVolume <uuid> -user <uuid> -verify -stdinpassphrase` passes with `hex(volume key)` and fails with the old passphrase (recent macOS needs the disk user named by UUID for `-verify`; it is the volume UUID) |
 | Sparse bundle | Its passphrase | New UUID, written to `<bundle>/sealctl.id` before `hdiutil chpass -oldstdinpass -newstdinpass` (the id cannot be found again otherwise) and removed if the change fails or is undone. A marker on a bundle no volume of this machine uses is left by a seal that did not finish: when the user's passphrase still opens the bundle, sealing it again takes that marker's UUID; when it does not, the message says the earlier seal may have changed it and `recover` opens it. `volume import` registers a marked bundle from the marker without opening it; `volume open` shows whether sealctl's key opens it | `hdiutil attach -nomount -stdinpass`, then `detach` (on every way out, forced if refused; still attached afterwards is an error), with the new key; the old fails |
 | LUKS | Its passphrase | `cryptsetup luksAddKey` with the volume key on a file descriptor; token `sealctl` imported; the user's slot killed with `luksKillSlot` unless `--keep-old-passphrase` | `cryptsetup open --test-passphrase` with the new key names the new slot. The volume id is the LUKS UUID it already has |
 | Restic repository | Its password and storage credentials | Repository id: the last path segment of the URL (`[A-Za-z0-9._-]{1,64}`, refused if another backup in the inventory uses it); credentials stored as `backup/<name>/<VAR>`; `restic key add --user sealctl --host sealctl-<fp>` with the backup key; the user's key removed unless `--keep-old-password` | `restic cat config` opens with the backup key, and `restic key list --json` marks it current |
