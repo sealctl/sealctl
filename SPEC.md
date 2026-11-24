@@ -626,8 +626,9 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
   - `sealctl secret get`, `sealctl recover`, `sealctl aws credentials`, `sealctl git credential`, the `seal` aliases (`sealctl secret import-env`, `sealctl volume import`, `sealctl ssh import`), `sealctl buy`, `sealctl unpair`, `sealctl seal`, `sealctl unseal`, `sealctl project trust`;
   - `git credential fill` and `git credential-<helper> get`, which print a stored token;
   - setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`, `env -u …`);
-  - environment dumps, `cat .env`, `printenv VAR`, clipboard reads, credential files;
+  - environment dumps, `cat .env`, `printenv VAR` and `echo $VAR` for a variable whose name looks like a credential (KEY, TOKEN, SECRET, PASS, CREDENTIAL, AUTH), except names that only say where something is (ending in `_SOCK`, `_SOCKET`, `_PID`, `_DIR`, `_PATH`, `_FILE`, such as `SSH_AUTH_SOCK`), clipboard reads, credential files;
   - sealctl commands are matched by their subcommand (the first word after sealctl's global options, through `env`, `command`, `sudo`, `xargs`, `sh -c`, `eval`, `$(…)` and any path to the binary), never by words in their arguments: `sealctl run -e K=shop/buy -- …` is allowed.
+  - here-documents: the body of `<<'EOF'` (a quoted delimiter) is text and runs nothing; an unquoted body runs only its `$(…)` and backquoted commands, which are checked. When the line feeds a here-document to a program that may run its input (a shell, `source`, `eval`, `ssh`, `sudo`, `xargs`, …, also through a pipe), or its delimiter line is missing, the body is read as commands. `<<` inside `$(( ))` and `(( ))` is a shift, and `<<<` a here-string.
 - **SessionStart context**: one line, `sealctl: secrets are available by name through sealctl run (names: …). Values are never shown.` No session state, no licence.
 - **What the agent sees**: names, `****`, `Waiting for your phone`, exit codes and the error texts of 5.5. Never values, never the ask.
 - **What the developer sees**: the phone card with agent, repository, command, `user@host` and key names; the usage log on the phone; `sealctl status`.
