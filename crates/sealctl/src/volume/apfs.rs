@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
 use super::{Backend, Volume};
+use crate::exit::{self, fail};
 use crate::util::{check, random_secret, run_with_stdin};
 
 pub struct ApfsVolume;
@@ -191,6 +192,96 @@ pub fn verify(target: &str, passphrase: &[u8]) -> Result<bool> {
     Ok(out.status.success())
 }
 
+/// A volume UUID (any case) or a disk identifier (`disk3s5`, `/dev/disk3s5`).
+pub fn looks_like_id(target: &str) -> bool {
+    let t = target.strip_prefix("/dev/").unwrap_or(target);
+    sealctl_core::ids::parse_uuid(&t.to_lowercase()).is_some()
+        || t.strip_prefix("disk").is_some_and(|r| {
+            r.split_once('s').is_some_and(|(d, s)| {
+                !d.is_empty()
+                    && !s.is_empty()
+                    && d.bytes().all(|b| b.is_ascii_digit())
+                    && s.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+}
+
+/// One volume in `diskutil apfs list`.
+#[derive(Debug, PartialEq)]
+struct Listed {
+    name: String,
+    /// In lower case.
+    uuid: String,
+    dev: String,
+}
+
+/// Every APFS volume macOS knows, locked ones too (`diskutil apfs list -plist`, read through
+/// `plutil` as JSON).
+fn listed() -> Result<Vec<Listed>> {
+    let out = crate::util::system_cmd("diskutil")
+        .args(["apfs", "list", "-plist"])
+        .output()?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let json = check(
+        run_with_stdin(
+            crate::util::system_cmd("plutil").args(["-convert", "json", "-o", "-", "-"]),
+            &out.stdout,
+        )?,
+        "plutil -convert json",
+    )?;
+    Ok(parse_list(&json.stdout))
+}
+
+fn parse_list(json: &[u8]) -> Vec<Listed> {
+    let v: serde_json::Value = serde_json::from_slice(json).unwrap_or_default();
+    v["Containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|c| c["Volumes"].as_array().into_iter().flatten())
+        .filter_map(|v| {
+            Some(Listed {
+                name: v["Name"].as_str()?.to_string(),
+                uuid: v["APFSVolumeUUID"].as_str()?.to_lowercase(),
+                dev: v["DeviceIdentifier"].as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The UUID of the one volume named `name`: an exact match, or when there is none, a match
+/// ignoring case. Several with that name: an error that lists them.
+fn pick(vols: &[Listed], name: &str) -> Result<Option<String>> {
+    let mut found: Vec<&Listed> = vols.iter().filter(|v| v.name == name).collect();
+    if found.is_empty() {
+        let lower = name.to_lowercase();
+        found = vols.iter().filter(|v| v.name.to_lowercase() == lower).collect();
+    }
+    match found.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.uuid.clone())),
+        many => Err(fail(
+            exit::USAGE,
+            format!(
+                "{} APFS volumes are named {name}: {}. Give its disk identifier or UUID instead.",
+                many.len(),
+                many.iter()
+                    .map(|v| format!("{} (UUID {})", v.dev, v.uuid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+/// The UUID of the APFS volume named `name` (as Finder and Disk Utility show it), in lower case.
+/// `None` when no APFS volume has that name.
+pub fn uuid_by_name(name: &str) -> Result<Option<String>> {
+    pick(&listed()?, name)
+}
+
 /// An APFS volume found by its UUID or disk identifier: its UUID in lower case, whether it is
 /// mounted, and where. `None` when diskutil knows no APFS volume by that name.
 pub fn find(target: &str) -> Result<Option<(String, Option<String>)>> {
@@ -253,5 +344,66 @@ mod tests {
         assert_eq!(super::hint_in(out).as_deref(), Some("AbCd"));
         assert_eq!(super::hint_in("    Hint: my own words\n"), None);
         assert_eq!(super::hint_in("    Type: Disk User\n"), None);
+    }
+
+    fn vol(name: &str, uuid: &str, dev: &str) -> super::Listed {
+        super::Listed {
+            name: name.into(),
+            uuid: uuid.into(),
+            dev: dev.into(),
+        }
+    }
+
+    #[test]
+    fn the_list_gives_names_uuids_and_disks() {
+        let json = br#"{"Containers":[{"Volumes":[
+            {"Name":"Work","APFSVolumeUUID":"00C167BE-32EB-4BD7-936B-A4ACA1BF5A67","DeviceIdentifier":"disk7s2","Locked":true},
+            {"APFSVolumeUUID":"11C167BE-32EB-4BD7-936B-A4ACA1BF5A67","DeviceIdentifier":"disk7s3"}
+        ]},{"Volumes":[
+            {"Name":"Recovery","APFSVolumeUUID":"22C167BE-32EB-4BD7-936B-A4ACA1BF5A67","DeviceIdentifier":"disk3s3"}
+        ]}]}"#;
+        assert_eq!(
+            super::parse_list(json),
+            vec![
+                vol("Work", "00c167be-32eb-4bd7-936b-a4aca1bf5a67", "disk7s2"),
+                vol("Recovery", "22c167be-32eb-4bd7-936b-a4aca1bf5a67", "disk3s3"),
+            ]
+        );
+        assert!(super::parse_list(b"not json").is_empty());
+    }
+
+    #[test]
+    fn a_name_finds_one_volume() {
+        let vols = vec![
+            vol("Work", "a", "disk7s2"),
+            vol("work", "b", "disk8s2"),
+            vol("Recovery", "c", "disk1s4"),
+            vol("Recovery", "d", "disk3s3"),
+            vol("Photos", "e", "disk9s1"),
+        ];
+        // exact first, then ignoring case
+        assert_eq!(super::pick(&vols, "Work").unwrap().as_deref(), Some("a"));
+        assert_eq!(super::pick(&vols, "work").unwrap().as_deref(), Some("b"));
+        assert_eq!(super::pick(&vols, "photos").unwrap().as_deref(), Some("e"));
+        // no exact match and two ignoring case: which one is meant is unclear
+        let e = super::pick(&vols, "WORK").unwrap_err().to_string();
+        assert!(e.contains("2 APFS volumes are named WORK"), "{e}");
+        assert_eq!(super::pick(&vols, "Nope").unwrap(), None);
+        let e = super::pick(&vols, "Recovery").unwrap_err().to_string();
+        assert!(e.contains("2 APFS volumes are named Recovery"), "{e}");
+        assert!(
+            e.contains("disk1s4 (UUID c)") && e.contains("disk3s3 (UUID d)"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn ids_are_told_from_names() {
+        assert!(super::looks_like_id("00C167BE-32EB-4BD7-936B-A4ACA1BF5A67"));
+        assert!(super::looks_like_id("disk3s5"));
+        assert!(super::looks_like_id("/dev/disk3s5"));
+        assert!(!super::looks_like_id("disk3"));
+        assert!(!super::looks_like_id("Work"));
+        assert!(!super::looks_like_id("disk3s"));
     }
 }

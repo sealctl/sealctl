@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Changed
+
+- `sealctl seal volume` and `sealctl recover` take an APFS volume by the name Finder and Disk
+  Utility show, as well as by UUID or disk identifier. When several volumes share the name, the
+  error lists their disk identifiers to choose from.
+
 ## 0.7.0 - 2026-11-24
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes

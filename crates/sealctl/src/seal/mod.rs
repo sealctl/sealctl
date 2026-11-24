@@ -88,8 +88,20 @@ fn old_passphrase(what: &str) -> Result<Zeroizing<String>> {
     util::read_hidden(&format!("Passphrase of {what}: "))
 }
 
+/// The UUID of an APFS volume given by UUID, disk identifier or name, in lower case.
 fn uuid_of_apfs(target: &str) -> Result<String> {
-    let out = util::system_cmd("diskutil").args(["info", target]).output()?;
+    let missing = || {
+        fail(
+            exit::NOT_FOUND,
+            format!("No APFS volume, file or folder {target}. See diskutil apfs list."),
+        )
+    };
+    let id = if volume::apfs::looks_like_id(target) {
+        target.to_string()
+    } else {
+        volume::apfs::uuid_by_name(target)?.ok_or_else(missing)?
+    };
+    let out = util::system_cmd("diskutil").args(["info", &id]).output()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines()
         .find_map(|l| {
@@ -97,7 +109,7 @@ fn uuid_of_apfs(target: &str) -> Result<String> {
                 .strip_prefix("Volume UUID:")
                 .map(|r| r.trim().to_lowercase())
         })
-        .ok_or_else(|| fail(exit::NOT_FOUND, format!("No APFS volume {target}.")))
+        .ok_or_else(missing)
 }
 
 /// `sealctl seal volume <name> <target>`.
@@ -175,7 +187,7 @@ pub fn seal_volume_given(
     let opens = |pass: &[u8]| -> Result<bool> {
         match kind {
             Kind::Sparsebundle => volume::sparsebundle::verify(path.as_ref().expect("path"), pass),
-            Kind::Apfs => volume::apfs::verify(target, pass),
+            Kind::Apfs => volume::apfs::verify(apfs_uuid.as_deref().expect("uuid"), pass),
             Kind::Luks => volume::luks::verify(path.as_ref().expect("path"), pass),
         }
     };
