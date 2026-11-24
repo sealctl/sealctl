@@ -182,6 +182,7 @@ relay running (`--seats N` for a team, `--code` to claim a seat). After 30 days 
 | `SEALCTL_RELAY` / `--relay` | Relay origin (default `https://relay.sealctl.com`); recorded at pairing |
 | `SEALCTL_NO_DAEMON=1` | No daemon: each command asks the phone itself |
 | `SEALCTL_AGENT=1` | Treat this process as inside an AI agent |
+| `SEALCTL_AGENT=0` | Turn agent detection off (yours to set: the agent hooks deny an agent setting it). When an agent's own variable is set too, sealctl says so once on stderr |
 | `SEALCTL_NO_MASK=1` | No masking in `sealctl run` (ignored inside an agent) |
 | `SEALCTL_NO_SERVICE=1` | Do not install login services (also skipped when `HOME` is not your home folder) |
 | `SEALCTL_RESTIC`, `SEALCTL_SSH_DIR`, `SEALCTL_LOG` | restic binary, SSH folder, log level |
