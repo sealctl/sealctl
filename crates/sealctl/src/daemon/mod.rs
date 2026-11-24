@@ -42,6 +42,24 @@ const MOUNT_LIMIT: Duration = Duration::from_secs(120);
 /// How far the phone's clock may be behind the machine's for a `lock` message.
 const LOCK_SKEW_MS: u64 = 60_000;
 
+/// Whether to apply the machine message `msg`, moving the high-water `seq` in `machine.json`
+/// (protocol.md, Message body). Each install of the app numbers its messages by its own clock,
+/// so a `seq` at or below the mark can come from another install whose clock is behind. A
+/// `lock` applies whatever its `seq`: it is idempotent, and one made before this session is
+/// ignored by its time. Any other message applies only when its `seq` is above the mark. The
+/// mark never goes down.
+pub(crate) fn take_message(
+    file: &mut machine::MachineFile,
+    msg: &sealctl_core::wire::MachineMessage,
+) -> bool {
+    let new = msg.seq > file.msg_seq;
+    if new {
+        file.msg_seq = msg.seq;
+        let _ = file.save();
+    }
+    new || matches!(msg.kind, sealctl_core::wire::MessageKind::Lock { .. })
+}
+
 /// How long after its `releaseAt` a delayed action can still be pending: the relay deletes
 /// the record 15 minutes after it (protocol.md, Delayed approvals).
 const DELAYED_EXPIRES_MS: u64 = 15 * 60_000;
@@ -1812,17 +1830,16 @@ impl Daemon {
                 log::warn!("dropped a machine message that did not check out");
                 return;
             };
-            if m.seq <= paired.file.msg_seq {
+            if !take_message(&mut paired.file, &m) {
                 return;
             }
-            paired.file.msg_seq = m.seq;
-            let _ = paired.file.save();
             m
         };
         self.apply_message(msg).await;
     }
 
-    /// Applies a machine message whose `seq` is new (from the socket, or a report reply).
+    /// Applies a machine message that [`take_message`] took (from the socket, or a report
+    /// reply).
     pub async fn apply_message(self: &Arc<Self>, msg: sealctl_core::wire::MachineMessage) {
         use sealctl_core::wire::MessageKind;
         match msg.kind {
