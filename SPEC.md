@@ -679,12 +679,12 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 
 When the words change, the phone moves each machine to its new key (protocol.md, Phone key change). The daemon notices on its next relay call (`403`, or a wait closed with `unpaired` or `moved`), checks the move proof, and then, without any command:
 
-1. sends a `rewrap` request listing every object in `inventory.json` whose words are the old fingerprint (several requests if they do not fit);
+1. sends a `rewrap` request listing every object in `inventory.json` on the old seed (its fingerprint) (several requests if they do not fit);
 2. for each item, with the old and new keys from the reply:
 
 | Object | Rewrap |
 | --- | --- |
-| Secret store | Every `.sealed` file re-encrypted with the new file key (mode 1) or new own-approval key (mode 2), file by file with atomic renames; the `.id` file replaced last with the new words and check. Files still showing the old words in their header are rewrapped on the next run |
+| Secret store | Every `.sealed` file re-encrypted with the new file key (mode 1) or new own-approval key (mode 2), file by file with atomic renames; the `.id` file replaced last with the new seed and check. Files still showing the old seed in their header are rewrapped on the next run |
 | APFS volume | `diskutil apfs changePassphrase <uuid> -user disk` with old and new passphrases on stdin; new hint |
 | Sparse bundle | `hdiutil chpass -oldstdinpass -newstdinpass`; new `sealctl.id` |
 | LUKS | `cryptsetup luksAddKey --key-file /dev/fd/3 <file> /dev/fd/4`, then `luksRemoveKey` with the old key, then the token replaced |
@@ -692,9 +692,9 @@ When the words change, the phone moves each machine to its new key (protocol.md,
 
 3. updates `inventory.json`, sends a status, and logs `Rewrapped 12 objects to seed 4kPz` at `info`.
 
-Rewrap is confirmation level 2 on the phone: biometrics per request, and proximity. The daemon has no terminal, so it relies on the relay's `near`; a `not_near` answer leaves the objects on the old words, retried at the next daemon start, and `sealctl migrate --depth rewrap` at the machine's terminal sends the same request with a number (`On your phone, pick 23 if it asks.`).
+Rewrap is confirmation level 2 on the phone: biometrics per request, and proximity. The daemon has no terminal, so it relies on the relay's `near`; a `not_near` answer leaves the objects on the old seed, retried at the next daemon start, and `sealctl migrate --depth rewrap` at the machine's terminal sends the same request with a number (`On your phone, pick 23 if it asks.`).
 
-Rewrap needs each object reachable: an unmounted APFS volume can be rewrapped locked; a LUKS file and a sparse bundle need only the file; a restic repository needs its credentials (from the store). Objects that fail stay on the old words and are retried at every daemon start and listed by `sealctl migrate`.
+Rewrap needs each object reachable: an unmounted APFS volume can be rewrapped locked; a LUKS file and a sparse bundle need only the file; a restic repository needs its credentials (from the store). Objects that fail stay on the old seed and are retried at every daemon start and listed by `sealctl migrate`.
 
 ### 16.2 `sealctl migrate`
 
