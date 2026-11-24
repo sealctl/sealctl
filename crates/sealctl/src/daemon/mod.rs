@@ -1569,8 +1569,10 @@ impl Daemon {
         for v in mounted {
             let name = v.name.clone();
             let mp = v.mountpoint.clone();
+            // a volume whose state cannot be read may be mounted: it is closed all the same (or
+            // reported busy and tried again), never passed over as closed
             let r = tokio::task::spawn_blocking(move || {
-                if !v.is_open() {
+                if matches!(v.check_open(), Ok(false)) {
                     return Ok(false);
                 }
                 crate::volume::close(&v, force).map(|_| true)

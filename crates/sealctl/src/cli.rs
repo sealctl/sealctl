@@ -46,9 +46,9 @@ pub fn lock(force: bool, no_backup: bool) -> Result<i32> {
             code = exit::BUSY;
         }
     } else {
-        // no daemon: close what is open anyway
+        // no daemon: close what is open anyway (or may be: a state that cannot be read)
         for v in Volume::list()? {
-            if !v.manual && v.is_open() {
+            if !v.manual && !matches!(v.check_open(), Ok(false)) {
                 match volume::close(&v, force) {
                     Ok(()) => println!("Volume {} closed.", v.name),
                     Err(e) => {

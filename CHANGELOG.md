@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Fixed
+
+- `sealctl lock` no longer passes over a volume whose state it cannot read (`hdiutil info`
+  failing) as closed, which printed `Locked.` and exited 0 with the volume still mounted: it
+  tries to close it, and if that fails too reports it busy (exit 11) and retries every minute.
+
 ### Changed
 
 - `sealctl run` also masks values printed as hex, in lower or upper case, alongside the raw,
