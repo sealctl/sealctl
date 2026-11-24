@@ -905,7 +905,7 @@ fn a_write_with_a_session_key_from_before_a_store_move_is_refused() {
     let files_before = std::fs::read_dir(&store).unwrap().count();
     let (code, _, err) = env.run_in(&["secret", "set", "a/two"], canary().as_bytes());
     assert_eq!(code, 10, "refused: {err}");
-    assert!(err.contains("moved to new words"), "{err}");
+    assert!(err.contains("moved to a new seed"), "{err}");
     assert_eq!(
         std::fs::read_dir(&store).unwrap().count(),
         files_before,

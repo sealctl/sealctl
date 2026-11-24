@@ -274,7 +274,7 @@ fn recover_a_store_with_the_words() {
     assert!(out.is_empty());
     assert!(
         screen.contains(&format!(
-            "These words have fingerprint {}; this object was sealed with words {}.",
+            "These words are seed {}; this object was sealed with seed {}.",
             other_phone.fingerprint(),
             env.phone.fingerprint()
         )),

@@ -128,7 +128,7 @@ fn new_words_rewrap_every_object() {
     let (code, screen, kinds) = migrate(&env, &["--depth", "rewrap"], b.clone(), a.clone(), None);
     assert_eq!(code, 0, "{screen}");
     assert!(
-        screen.contains(&format!("to words {}.", b.fingerprint())),
+        screen.contains(&format!("to seed {}.", b.fingerprint())),
         "{screen}"
     );
     assert!(kinds.contains(&"Rewrap".to_string()), "{kinds:?}");
@@ -163,7 +163,7 @@ fn new_words_rewrap_every_object() {
     let (code, screen, _) = migrate(&env, &["--depth", "rewrap"], b.clone(), a.clone(), None);
     assert_eq!(code, 0, "{screen}");
     assert!(
-        screen.contains("on words") && screen.contains("already"),
+        screen.contains("on seed") && screen.contains("already"),
         "{screen}"
     );
 }
@@ -209,7 +209,7 @@ fn a_store_on_retired_words_goes_through_old_words() {
     assert_eq!(code, 10, "{err}");
     assert!(
         err.contains(&format!(
-            "Sealed with words {}; your phone has words {}.",
+            "Sealed with seed {}; your phone has seed {}.",
             x.fingerprint(),
             env.phone.fingerprint()
         )),
@@ -227,7 +227,10 @@ fn a_store_on_retired_words_goes_through_old_words() {
     assert_eq!(code, 0, "{screen}");
     assert!(kinds.contains(&"OldWords".to_string()), "{kinds:?}");
     assert!(
-        screen.contains(&format!("Type the words {} on your phone.", x.fingerprint())),
+        screen.contains(&format!(
+            "Type the 24 words of seed {} on your phone.",
+            x.fingerprint()
+        )),
         "{screen}"
     );
     let ((code, out, err), _) = env.with_phone(Answer::Session, || env.run(&["secret", "get", "shop/old"]));

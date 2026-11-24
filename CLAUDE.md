@@ -28,7 +28,8 @@ SPEC disagree, say so and fix one of them in the pull request; don't silently pi
 - Level 3 (unseal everything, show the words, delete relay data) waits two hours away from a
   trusted place; a place added by hand lifts that wait only after 24 hours.
 - Output uses these words and no others for the same things: Locked, Open, Waiting, One tap,
-  Places, words, phone, machine (SPEC 1).
+  Places, words, seed, phone, machine (SPEC 1). The 4-character fingerprint is shown as
+  `seed qHWf`; "words" is the 24 words the user writes down and types.
 - Claims in docs are true and checkable: no counts, badges, quotes or invented audits.
 
 ## The protocol is a contract
