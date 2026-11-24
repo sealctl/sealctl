@@ -210,7 +210,39 @@ fn denied_verb(verb: &str, sub: Option<&str>) -> Option<&'static str> {
 /// (as bash 4+ and zsh read it); without, a pattern's `)` closes an open `$(` (as bash 3.2, the
 /// macOS `/bin/bash` and `/bin/sh`, reads it inside double quotes). Shells differ here and a `)`
 /// can be misread either way, so callers check every reading.
+///
+/// Here-document bodies are text (only an unquoted body's substitutions are commands), unless
+/// anything in the command line may run its input as commands (see [`RUNS_INPUT`]): a body can
+/// reach such a program through a pipe or group that continues after it, so then every body is
+/// read as commands.
 fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String>> {
+    let cmds = read_commands(text, resume, track_case, true, 0);
+    let runs_input = cmds.iter().any(|words| {
+        words.iter().enumerate().any(|(n, w)| {
+            let base = w.rsplit('/').next().unwrap_or(w);
+            RUNS_INPUT.contains(&base) || (n == 0 && base == ".")
+        })
+    });
+    if runs_input {
+        read_commands(text, resume, track_case, false, 0)
+    } else {
+        cmds
+    }
+}
+
+/// How deeply here-documents inside here-documents (through `$(…)` in an unquoted body) are
+/// read as text; deeper ones are read as commands.
+const HERE_DOC_LEVELS: usize = 3;
+
+/// [`simple_commands`], with here-document bodies read as text (`here_docs`) or as commands;
+/// `level`: how deep in here-document bodies this text is.
+fn read_commands(
+    text: &str,
+    resume: bool,
+    track_case: bool,
+    here_docs: bool,
+    level: usize,
+) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
@@ -250,47 +282,61 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
         }
         *all_kw = true;
     };
-    // here-documents opened on the current line, read at its end; and where that line's
-    // commands start in `cmds`
+    // here-documents opened on the current line, read at its end
     let mut pending: Vec<HereDoc> = Vec::new();
-    let mut line_start = 0;
+    // after a `#` that starts a word, the rest of the line is a comment: a `<<` there opens no
+    // here-document (its text is still read as commands, which only errs towards denying)
+    let mut in_comment = false;
+    // open `$[ … ]` (old arithmetic): a `<<` there is a shift
+    let mut old_arith = 0usize;
     while i < cs.len() {
         let c = cs[i];
+        if quote.is_none() {
+            match c {
+                '#' if !in_word => in_comment = true,
+                '\n' => in_comment = false,
+                '$' if cs.get(i + 1) == Some(&'[') => old_arith += 1,
+                ']' if old_arith > 0 => old_arith -= 1,
+                _ => {}
+            }
+        }
         // a newline ending a line that opened here-documents: their bodies follow
         if quote.is_none() && c == '\n' && !pending.is_empty() {
             end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
             end_cmd(&mut words, &mut cmds, &mut all_kw);
             let docs = std::mem::take(&mut pending);
-            // a shell (or anything that may run its input as commands) reads the bodies as
-            // commands: leave them to be read as such, line by line
-            let runs_input = cmds[line_start..]
-                .iter()
-                .flatten()
-                .any(|w| RUNS_INPUT.contains(&w.rsplit('/').next().unwrap_or(w)));
-            if let Some((bodies, end)) = (!runs_input).then(|| here_bodies(&cs, i + 1, &docs)).flatten() {
+            // no delimiter line: the text is read as commands, line by line
+            if let Some((bodies, end)) = here_bodies(&cs, i + 1, &docs) {
                 for (doc, body) in docs.iter().zip(bodies) {
                     // an unquoted delimiter: `$(…)` and backquotes in the body still run
                     if !doc.quoted {
-                        cmds.extend(simple_commands(&as_double_quoted(&body), resume, track_case));
+                        // one level deeper; past HERE_DOC_LEVELS, bodies in it are commands,
+                        // which keeps the work linear in the text
+                        cmds.extend(read_commands(
+                            &as_double_quoted(&body),
+                            resume,
+                            track_case,
+                            level + 1 < HERE_DOC_LEVELS,
+                            level + 1,
+                        ));
                     }
                 }
                 // `end`: the newline after the last delimiter line, or the end of the text
                 i = end;
             }
-            line_start = cmds.len();
             i += 1;
             continue;
         }
-        if quote.is_none() && c == '\n' {
-            line_start = cmds.len() + usize::from(!words.is_empty() || in_word);
-        }
         // `<<` and `<<-` (not `<<<`, nor a shift inside `$(( ))` or `(( ))`): a here-document
-        if quote.is_none()
+        if here_docs
+            && quote.is_none()
             && c == '<'
             && cs.get(i + 1) == Some(&'<')
             && cs.get(i + 2) != Some(&'<')
             && (i == 0 || cs[i - 1] != '<')
             && !open.iter().any(|&(o, _)| o == 'A')
+            && !in_comment
+            && old_arith == 0
         {
             if let Some((doc, next)) = here_delimiter(&cs, i + 2) {
                 end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
@@ -403,8 +449,10 @@ struct HereDoc {
     quoted: bool,
 }
 
-/// Programs that may run their standard input as commands: a here-document fed to them (also
-/// through a pipe on the same line) is read as commands, as before here-documents were known.
+/// Programs that may run their standard input as commands. When any word of a command line
+/// names one (`.` only as a command), its here-documents are read as commands, as before
+/// here-documents were known: a body can reach such a program through a pipe, group or loop
+/// that continues after the body (`cat <<'EOF' |` … `EOF` / `sh`, `{ cat <<'EOF' … } | sh`).
 const RUNS_INPUT: &[&str] = &[
     "sh",
     "bash",
@@ -418,7 +466,6 @@ const RUNS_INPUT: &[&str] = &[
     "ash",
     "busybox",
     "source",
-    ".",
     "eval",
     "exec",
     "ssh",
@@ -430,7 +477,6 @@ const RUNS_INPUT: &[&str] = &[
     "osascript",
     "script",
     "expect",
-    "sealctl",
 ];
 
 /// The here-document whose operator ends just before `start`: its delimiter word and where the
@@ -1039,6 +1085,12 @@ mod tests {
             "cat <<A <<'B'\nsealctl buy\nA\n`sealctl recover`\nB",
             // without `-`, a tab-indented delimiter does not end the body (bash runs nothing)
             "cat <<EOF\n\tEOF\nsealctl buy\nEOF\n",
+            // a comment after the operator does not stop the here-document
+            "cat <<'EOF' # notes\nsealctl buy\nEOF",
+            // `#` inside a word is no comment
+            "cat a#b <<'EOF'\nsealctl buy\nEOF",
+            // `.` as an argument is no `source`
+            "git add . && git commit -m \"$(cat <<'EOF'\nNever run `sealctl buy`.\nEOF\n)\"",
         ] {
             assert!(bash(c).is_none(), "should allow: {c:?}: {:?}", bash(c));
         }
@@ -1070,6 +1122,23 @@ mod tests {
             "cat <<< x\nsealctl buy\nx",
             // the delimiter line must match exactly
             "cat <<'EOF'\nEOF \nsealctl buy\n EOF",
+            // a `<<` in a comment opens nothing (found by review)
+            "# note <<EOF\nsealctl buy\nEOF",
+            "echo x # see <<'EOF'\nsealctl buy\nEOF",
+            "ls;#<<EOF\nsealctl buy\nEOF",
+            // old arithmetic `$[ ]`: a shift
+            "x=$[1<<2]\nsealctl buy\n2]",
+            "x=$[ 1 << 2 ]\nsealctl buy\n2",
+            // the body reaches a shell through a pipe, group or loop continuing after it
+            "cat <<'EOF' |\nsealctl buy\nEOF\nsh",
+            "cat <<'EOF' | # notes\nsealctl buy\nEOF\nbash",
+            "{ cat <<'EOF'\nsealctl buy\nEOF\n} | sh",
+            "( cat <<'EOF'\nsealctl buy\nEOF\n) | /bin/zsh",
+            "for x in 1; do cat <<'EOF'\nsealctl buy\nEOF\ndone | sh",
+            "cat <<'EOF' \\\n| sh\nsealctl buy\nEOF",
+            ". /dev/stdin <<'EOF'\nsealctl buy\nEOF",
+            // here-documents nested deeper than HERE_DOC_LEVELS are read as commands
+            "cat <<A\n$(cat <<B\n$(cat <<C\n$(cat <<D\nsealctl buy\nD\n)\nC\n)\nB\n)\nA",
         ] {
             assert!(bash(c).is_some(), "should deny: {c:?}");
         }
@@ -1153,6 +1222,25 @@ mod tests {
         ] {
             assert!(bash(c).is_some(), "should deny: {c}");
         }
+    }
+
+    #[test]
+    fn nested_here_documents_are_checked_in_bounded_time() {
+        // each level of a here-document inside a here-document's `$(…)` is read again; past
+        // HERE_DOC_LEVELS they are commands, so the work stays linear
+        let started = std::time::Instant::now();
+        let n = 20_000;
+        let mut line = String::new();
+        for k in 0..n {
+            line.push_str(&format!("cat <<E{k}\n$("));
+        }
+        line.push_str("sealctl buy\n");
+        for k in (0..n).rev() {
+            line.push_str(&format!(")\nE{k}\n"));
+        }
+        assert!(bash(&line).is_some(), "should deny");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(15), "took {took:?}");
     }
 
     #[test]
