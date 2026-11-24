@@ -675,6 +675,11 @@ pub fn session_context() -> String {
         .and_then(|s| s.list())
         .map(|l| l.into_iter().map(|x| x.name).collect())
         .unwrap_or_default();
+    session_line(&names, crate::git::signs_through_sealctl())
+}
+
+/// The session line for these secret names; `signs`: git signs through sealctl here.
+fn session_line(names: &[String], signs: bool) -> String {
     let shown: Vec<&str> = names.iter().take(40).map(String::as_str).collect();
     let more = if names.len() > shown.len() {
         format!(" (+{} more)", names.len() - shown.len())
@@ -689,7 +694,7 @@ pub fn session_context() -> String {
             shown.join(", ")
         }
     );
-    if crate::git::signs_through_sealctl() {
+    if signs {
         format!("{line} {GIT_SIGNING_CONTEXT}")
     } else {
         line
@@ -711,6 +716,18 @@ mod tests {
         assert!(GIT_SIGNING_CONTEXT.contains("phone"));
         assert!(GIT_SIGNING_CONTEXT.contains("agent refused operation"));
         assert!(!GIT_SIGNING_CONTEXT.contains("  "), "{GIT_SIGNING_CONTEXT}");
+    }
+
+    #[test]
+    fn the_session_line_mentions_git_signing_only_where_git_signs_through_sealctl() {
+        let names = vec!["shop/stripe".to_string()];
+        let signs = session_line(&names, true);
+        assert!(signs.ends_with(GIT_SIGNING_CONTEXT), "{signs}");
+        assert!(signs.contains("names: shop/stripe"), "{signs}");
+        let plain = session_line(&names, false);
+        assert!(!plain.contains("agent refused operation"), "{plain}");
+        assert!(plain.ends_with("Values are never shown."), "{plain}");
+        assert!(session_line(&[], false).contains("names: none yet"));
     }
 
     #[test]
