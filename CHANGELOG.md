@@ -85,8 +85,6 @@ the sealctl phone app, and the 24 words alone open every object.
 - `sealctl lock` no longer passes over a volume whose state it cannot read (`hdiutil info`
   failing) as closed, which printed `Locked.` and exited 0 with the volume still mounted: it
   tries to close it, and if that fails too reports it busy (exit 11) and retries every minute.
-
-
 - A `lock` from the phone applies even when its message `seq` is below the highest the
   machine has seen: each install of the app numbers its messages by its own clock, so a lock
   from an install whose clock is behind another's was ignored. Other messages keep the `seq`
