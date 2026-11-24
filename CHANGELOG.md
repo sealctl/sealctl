@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Fixed
+
+- The phone's countdown for an Open session follows your work: the daemon sends a status when
+  activity moves the lock 2 minutes later (or anything moves it 1 minute earlier), at most once
+  every 2 minutes, instead of up to 15 minutes later.
+
 ### Changed
 
 - The AI agent skill and session line say that signed git commits, `git push` over SSH and `ssh`

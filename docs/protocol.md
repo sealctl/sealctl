@@ -526,7 +526,7 @@ Status body:
 | `inv` | Objects on this machine, when changed: `[{"p", "i", "w", "c", "o"}]` as in request `keys` |
 | `migrate` | Re-encryption: `{"items": [{"p", "i", "path", "s", "rw": <seconds>, "re": [<min s>, <max s>], "free": <bytes>, "done": <0 to 1>, "paused": <reason or null>}]}` |
 
-The machine sends a status when its state changes, when it holds unsent log entries (at most every 60 seconds), and at least every 15 minutes while Open.
+The machine sends a status when its state changes, when it holds unsent log entries (at most every 60 seconds), when its lock deadline (the time it locks unless more work comes: the last work moment plus the idle allowance, or `stop` if sooner) moved at least 2 minutes later or 1 minute earlier than the last status's `t` + `left` (at most every 2 minutes), and at least every 15 minutes while Open.
 
 Message body:
 

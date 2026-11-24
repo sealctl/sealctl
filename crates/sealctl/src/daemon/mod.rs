@@ -230,9 +230,10 @@ impl State {
         }
     }
 
-    /// The phone heard `state`.
-    fn told(&mut self, state: String, busy: Vec<sealctl_core::wire::BusyVolume>) {
+    /// The phone heard `state`, and the lock deadline `deadline` (`None` when Locked).
+    fn told(&mut self, state: String, busy: Vec<sealctl_core::wire::BusyVolume>, deadline: Option<u64>) {
         self.status_dirty = false;
+        self.told_deadline = deadline;
         if self.saved.told.as_deref() != Some(state.as_str()) {
             self.saved.told = Some(state.clone());
             save_saved(&self.saved);
@@ -298,6 +299,11 @@ struct State {
     busy: Vec<sealctl_core::wire::BusyVolume>,
     /// The busy volumes the last status told the phone.
     sent_busy: Vec<sealctl_core::wire::BusyVolume>,
+    /// The lock deadline the last status told the phone (its time plus its `left`, capped by
+    /// its `stop`), Unix ms; `None` when it said Locked.
+    told_deadline: Option<u64>,
+    /// When a status for a moved deadline was last tried (SPEC 6.6), Unix ms.
+    deadline_status_at: u64,
     keys_used_month: u64,
 }
 
@@ -1746,9 +1752,15 @@ impl Daemon {
         let _ = paired.file.save();
         let (state, log) = self.status_parts(seq);
         let busy = state.busy.clone();
+        let time = self.now();
+        // the deadline the phone counts down to
+        let deadline = state
+            .left
+            .map(|l| time.saturating_add(l.saturating_mul(1000)))
+            .map(|d| state.stop.map_or(d, |stop| d.min(stop)));
         let status = sealctl_core::wire::MachineStatus {
             version: 1,
-            time: self.now(),
+            time,
             seq,
             state: Some(state),
             log,
@@ -1774,7 +1786,7 @@ impl Daemon {
             drop(paired);
             let mut st = self.st();
             st.last_status = self.now();
-            st.told(s, busy);
+            st.told(s, busy, deadline);
             return Ok(());
         }
         let sealed = sealctl_core::channel::seal_status(&paired.keys, &paired.phone, &status)
@@ -1790,7 +1802,11 @@ impl Daemon {
         drop(paired);
         let mut st = self.st();
         st.last_status = self.now();
-        st.told(status.state.map(|s| s.session).unwrap_or_default(), busy);
+        st.told(
+            status.state.map(|s| s.session).unwrap_or_default(),
+            busy,
+            deadline,
+        );
         Ok(())
     }
 
@@ -1990,10 +2006,25 @@ impl Daemon {
             // `waiting`, so the end of the wait is told at the next sample.
             let word = st.state_word();
             let changed = word != "waiting" && st.sent_state != word;
+            // Work moves the lock deadline on, and the phone counts down from the last `left`
+            // it heard. A status that failed (or unsent uses) goes out within the minute anyway
+            // and carries the deadline, so this waits for it: a failure never adds a call.
+            let moved = word == "open"
+                && !st.status_dirty
+                && session::deadline_moved(
+                    n,
+                    Some(st.saved.deadline()),
+                    st.told_deadline,
+                    st.deadline_status_at,
+                );
+            if moved {
+                st.deadline_status_at = n;
+            }
             let due = st.open
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
                     || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000)
-                    || (changed && n.saturating_sub(st.last_status) >= 10 * 1000));
+                    || (changed && n.saturating_sub(st.last_status) >= 10 * 1000)
+                    || moved);
             // A Locked session whose last status still said Open, or told other busy volumes
             // (a lock's or a retry's status failed), tells the phone again every minute, once
             // no lock is running.
