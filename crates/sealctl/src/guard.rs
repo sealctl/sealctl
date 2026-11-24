@@ -34,15 +34,38 @@ pub fn agent_variables() -> impl Iterator<Item = &'static str> {
 /// The AI agent running this process, if one is recognisable. `SEALCTL_AGENT=1` forces it
 /// (for agents we don't recognise yet); `SEALCTL_AGENT=0` disables detection.
 pub fn ai_agent() -> Option<&'static str> {
+    if detection_off() {
+        return None;
+    }
     match std::env::var("SEALCTL_AGENT").ok().as_deref() {
-        Some("0") => return None,
         Some(v) if !v.is_empty() => return Some("an AI agent"),
         _ => {}
     }
+    agent_by_variables()
+}
+
+/// The agent named by one of its own variables (`CLAUDECODE`, `CODEX_THREAD_ID`, …).
+fn agent_by_variables() -> Option<&'static str> {
     AGENT_ENV
         .iter()
         .find(|(var, _)| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
         .map(|(_, name)| *name)
+}
+
+/// `SEALCTL_AGENT=0`: agent detection is off. A person sets it (agent hooks refuse it from an
+/// agent); when an agent's own variable is set as well, stderr says so once per process, so the
+/// switch is never silent.
+pub fn detection_off() -> bool {
+    if std::env::var("SEALCTL_AGENT").as_deref() != Ok("0") {
+        return false;
+    }
+    if let Some(agent) = agent_by_variables() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!("sealctl: agent detection is off (SEALCTL_AGENT=0) although {agent} is running");
+        });
+    }
+    true
 }
 
 /// Refuse to put a secret on stdout when an agent (or a terminal's scrollback) would keep it.

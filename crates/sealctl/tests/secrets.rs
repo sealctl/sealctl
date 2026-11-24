@@ -453,3 +453,38 @@ fn stand_in_spawner() {
         .unwrap();
     std::process::exit(st.code().unwrap_or(1));
 }
+
+/// `SEALCTL_AGENT=0` turns agent detection off; when an agent's own variable is set as well,
+/// stderr says so, once per process.
+#[test]
+fn agent_detection_off_is_said_when_an_agent_runs() {
+    let env = Env::fake(Default::default());
+    let notice = "sealctl: agent detection is off (SEALCTL_AGENT=0) although Claude Code is running";
+    let run = |vars: &[(&str, &str)], args: &[&str]| {
+        let mut c = env.cmd();
+        c.env_remove("SEALCTL_AGENT");
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        let o = c.args(args).stdin(std::process::Stdio::null()).output().unwrap();
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    };
+    // every command says it, once also when it asks who is reading several times
+    for args in [
+        &["status"][..],
+        &["run", "--", "true"][..],
+        &["secret", "get", "x/y"][..],
+        &["git", "credential", "get"][..],
+    ] {
+        let err = run(&[("SEALCTL_AGENT", "0"), ("CLAUDECODE", "1")], args);
+        assert_eq!(err.matches(notice).count(), 1, "{args:?}: {err}");
+        // detection stays off: not refused as an agent
+        assert!(!err.contains("inside Claude Code"), "{args:?}: {err}");
+        // no agent variable: nothing to say
+        let err = run(&[("SEALCTL_AGENT", "0")], args);
+        assert!(!err.contains("agent detection is off"), "{args:?}: {err}");
+        // detection on: nothing to say either
+        let err = run(&[("CLAUDECODE", "1")], args);
+        assert!(!err.contains("agent detection is off"), "{args:?}: {err}");
+    }
+}
