@@ -135,7 +135,7 @@ sealctl migrate --status          # the re-encryption job
 ### Taking over what you have, and handing it back
 
 ```sh
-sealctl seal volume safe <APFS UUID | bundle | LUKS file>  # your passphrase stops working
+sealctl seal volume safe <APFS volume | bundle | LUKS file>  # your passphrase stops working
 sealctl seal backup safe --repo <restic URL>             # your password is removed
 sealctl unseal volume safe                               # back under a new password of yours
 sealctl unseal --all                                     # everything, then sealctl itself
@@ -161,7 +161,7 @@ Delete the folder once the new passwords work. `--to keychain|op|bw|show` and
 sealctl recover ~/.local/share/sealctl/store/<store-id> --out ~/recovered
 sealctl recover ~/Vaults/work.sparsebundle
 sealctl recover ~/Vaults/safe.luks         # Linux: mounted at ~/Vaults/safe
-sealctl recover <APFS volume UUID>         # macOS: see diskutil apfs list
+sealctl recover <APFS volume>              # macOS: its name, UUID or disk (diskutil apfs list)
 sealctl recover s3:https://…/<repo-id> -- snapshots
 ```
 

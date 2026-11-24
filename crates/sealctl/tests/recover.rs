@@ -182,9 +182,24 @@ fn recover_an_apfs_volume_with_the_words() {
     let _ = Command::new("diskutil")
         .args(["apfs", "lockVolume", &uuid])
         .output();
+    assert_eq!(diskutil_info(&uuid, "Mounted").as_deref(), Some("No"));
 
-    // a disk identifier that is no APFS volume
+    // by the name Finder shows, in another case too
+    let (code, out, screen) = recover(other.path(), &name.to_uppercase(), Some(&env.phone.words()[..]));
+    assert_eq!(code, 0, "{screen}");
+    assert_eq!(out.trim(), mnt);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&mnt).join("hello.txt")).unwrap(),
+        "kept"
+    );
+    let _ = Command::new("diskutil")
+        .args(["apfs", "lockVolume", &uuid])
+        .output();
+
+    // a disk identifier that is no APFS volume, nor a name
     let (code, _, screen) = recover(other.path(), "disk999s9", None);
+    assert_eq!(code, 9, "{screen}");
+    let (code, _, screen) = recover(other.path(), &format!("{name}-none"), None);
     assert_eq!(code, 9, "{screen}");
     drop(image);
 }

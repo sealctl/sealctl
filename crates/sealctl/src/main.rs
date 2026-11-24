@@ -182,7 +182,7 @@ enum Cmd {
     Unseal(UnsealArgs),
     /// Open an object with the 24 words alone (no phone, no relay).
     Recover {
-        /// Store folder, .sealed file, sparse bundle, LUKS file, APFS volume UUID or restic repository.
+        /// Store folder, .sealed file, sparse bundle, LUKS file, APFS volume (name, UUID or disk) or restic repository.
         target: String,
         /// Write every secret into this folder.
         #[arg(long)]
@@ -494,7 +494,7 @@ struct SealArgs {
 
 #[derive(Subcommand)]
 enum SealCmd {
-    /// An APFS volume UUID, sparse bundle or LUKS file with your own passphrase.
+    /// An APFS volume (name, UUID or disk), sparse bundle or LUKS file with your own passphrase.
     Volume {
         name: String,
         target: String,

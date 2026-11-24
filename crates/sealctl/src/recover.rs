@@ -139,7 +139,7 @@ fn classify(target: &str) -> Result<Target> {
     if target.contains(':') && !p.exists() {
         return Ok(Target::Restic(target.to_string()));
     }
-    if !p.exists() && looks_like_apfs(target) {
+    if !p.exists() && crate::volume::apfs::looks_like_id(target) {
         if !cfg!(target_os = "macos") {
             return Err(fail(
                 exit::NOT_FOUND,
@@ -154,6 +154,14 @@ fn classify(target: &str) -> Result<Target> {
             format!("No APFS volume {target}. Is its disk connected? See diskutil apfs list."),
         ));
     }
+    // the volume name Finder and Disk Utility show
+    if cfg!(target_os = "macos") && !p.exists() {
+        if let Some(uuid) = crate::volume::apfs::uuid_by_name(target)? {
+            if let Some((uuid, mp)) = crate::volume::apfs::find(&uuid)? {
+                return Ok(Target::Apfs(uuid, mp));
+            }
+        }
+    }
     Err(fail(
         exit::NOT_FOUND,
         format!(
@@ -161,20 +169,6 @@ fn classify(target: &str) -> Result<Target> {
              restic repository."
         ),
     ))
-}
-
-/// A volume UUID (any case) or a disk identifier (`disk3s5`, `/dev/disk3s5`).
-fn looks_like_apfs(target: &str) -> bool {
-    let t = target.strip_prefix("/dev/").unwrap_or(target);
-    sealctl_core::ids::parse_uuid(&t.to_lowercase()).is_some()
-        || t.strip_prefix("disk").is_some_and(|r| {
-            r.split_once('s').is_some_and(|(d, s)| {
-                !d.is_empty()
-                    && !s.is_empty()
-                    && d.bytes().all(|b| b.is_ascii_digit())
-                    && s.bytes().all(|b| b.is_ascii_digit())
-            })
-        })
 }
 
 /// A mount point for a recovered LUKS file: `~/Vaults/<file name without .luks>`, which must be
