@@ -268,9 +268,8 @@ fn until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
 }
 
 /// Whether `hdiutil info` lists an image at `bundle`.
-#[cfg(feature = "test-hooks")]
 fn attached(bundle: &std::path::Path) -> bool {
-    let real = std::fs::canonicalize(bundle).unwrap();
+    let real = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
     let info = Command::new("hdiutil").arg("info").output().unwrap();
     let info = String::from_utf8_lossy(&info.stdout);
     info.lines().any(|l| {
@@ -283,11 +282,29 @@ fn attached(bundle: &std::path::Path) -> bool {
     })
 }
 
+/// What a failed check needs: a command's output, the daemon's log, and the `hdiutil info`
+/// blocks of this HOME's images (not the machine's other images).
+fn report(env: &Env, what: &str, (code, out, err): &(i32, String, String)) -> String {
+    let log = std::fs::read_to_string(env.h().join("s/sealctl/daemon.log")).unwrap_or_default();
+    let info = Command::new("hdiutil").arg("info").output().unwrap();
+    let home = std::fs::canonicalize(env.h()).unwrap();
+    let blocks: Vec<String> = String::from_utf8_lossy(&info.stdout)
+        .split("================================================")
+        .filter(|b| b.contains(env.h().to_str().unwrap()) || b.contains(home.to_str().unwrap()))
+        .map(str::to_owned)
+        .collect();
+    format!(
+        "{what}: exit {code}\n--- stdout\n{out}\n--- stderr\n{err}\n--- daemon.log\n{log}\n\
+         --- hdiutil info (exit {}, stderr {:?})\n{}",
+        info.status,
+        String::from_utf8_lossy(&info.stderr).trim(),
+        blocks.join("====\n")
+    )
+}
+
 /// Detaches the test's bundle however the test ends, so nothing stays attached.
-#[cfg(feature = "test-hooks")]
 struct Detach<'a>(&'a Env, std::path::PathBuf, std::path::PathBuf);
 
-#[cfg(feature = "test-hooks")]
 impl Drop for Detach<'_> {
     fn drop(&mut self) {
         if attached(&self.1) {
@@ -300,6 +317,177 @@ impl Drop for Detach<'_> {
                 .output();
         }
     }
+}
+
+/// `lock` (its exit code and output) closed volume `r`: it says so, and the image at `bundle`
+/// is no longer attached. On failure: the lock's output, daemon.log and `hdiutil info`.
+#[cfg(feature = "test-hooks")]
+fn closed_by(env: &Env, lock: &(i32, String, String), bundle: &std::path::Path) {
+    assert_eq!(lock.0, 0, "{}", report(env, "lock", lock));
+    assert!(
+        lock.1.contains("Volume r closed."),
+        "the lock closed the volume\n{}",
+        report(env, "lock", lock)
+    );
+    assert!(
+        !attached(bundle),
+        "the image is detached after the lock\n{}",
+        report(env, "lock", lock)
+    );
+}
+
+/// A stand-in `hdiutil` first on PATH: `body` (sh), then the real `/usr/bin/hdiutil`. Like
+/// the real one, a stand-in failure says nothing under `-quiet`. Returns the PATH to run with.
+fn stand_in_hdiutil(env: &Env, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.h().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("hdiutil"),
+        format!(
+            "#!/bin/sh\nquiet() {{ case \" $* \" in *' -quiet '*) return 0;; esac; return 1; }}\n\
+             {body}\nexec /usr/bin/hdiutil \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("hdiutil"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
+/// `sealctl args` with `path` as PATH (the daemon it starts gets it too).
+fn run_with_path(env: &Env, path: &str, args: &[&str]) -> (i32, String, String) {
+    let o = env
+        .cmd()
+        .env("PATH", path)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        o.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+/// `volume create r` (a 32 MB sparse bundle in the test HOME) with `path` as PATH.
+fn create_r(env: &Env, path: &str) -> (i32, String, String) {
+    let bundle = env.h().join("r.sparsebundle");
+    let mnt = env.h().join("mnt/r");
+    let (r, _) = env.with_phone(Answer::Session, || {
+        run_with_path(
+            env,
+            path,
+            &[
+                "volume",
+                "create",
+                "r",
+                "--kind",
+                "sparsebundle",
+                "--size",
+                "32m",
+                "--path",
+                bundle.to_str().unwrap(),
+                "--mountpoint",
+                mnt.to_str().unwrap(),
+            ],
+        )
+    });
+    r
+}
+
+/// `hdiutil create` refused as `Resource busy` (the disk images service busy with other
+/// images, as on a CI runner) once: `volume create` tries again and the volume is made.
+#[test]
+fn volume_create_tries_again_after_hdiutil_create_was_busy() {
+    let mut env = Env::new();
+    env.pair();
+    let once = env.h().join("create-was-busy");
+    let path = stand_in_hdiutil(
+        &env,
+        &format!(
+            "if [ \"$1\" = create ] && [ ! -e '{0}' ]; then\n  : > '{0}'\n  \
+             quiet \"$@\" || echo 'hdiutil: create failed - Resource busy' >&2\n  exit 1\nfi",
+            once.display()
+        ),
+    );
+    let bundle = env.h().join("r.sparsebundle");
+    let _detach = Detach(&env, bundle.clone(), env.h().join("mnt/r"));
+    let (code, _, err) = create_r(&env, &path);
+    assert!(once.exists(), "the stand-in was asked");
+    assert_eq!(code, 0, "{err}");
+    assert!(attached(&bundle));
+}
+
+/// Any other `hdiutil create` failure is reported at once, with hdiutil's reason (not an
+/// empty `hdiutil create failed:`), and not tried again.
+#[test]
+fn volume_create_reports_why_hdiutil_create_failed() {
+    let mut env = Env::new();
+    env.pair();
+    let calls = env.h().join("create-calls");
+    let path = stand_in_hdiutil(
+        &env,
+        &format!(
+            "if [ \"$1\" = create ]; then\n  echo x >> '{}'\n  \
+             quiet \"$@\" || echo 'hdiutil: create failed - No space left on device' >&2\n  \
+             exit 1\nfi",
+            calls.display()
+        ),
+    );
+    let (code, _, err) = create_r(&env, &path);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("hdiutil create failed: hdiutil: create failed - No space left on device"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap().lines().count(),
+        1,
+        "not tried again"
+    );
+}
+
+/// A lock that cannot tell whether a volume is open (`hdiutil info` fails) does not pass over
+/// it as closed: it tries to close it, and when that fails too, reports it busy (exit 11, tried
+/// again every minute, SPEC 6.5) rather than "Locked." with the volume still mounted. A
+/// stand-in `hdiutil` on PATH, for the daemon too, fails `info` while `hdiutil-info-fails`
+/// exists and runs the real one otherwise.
+#[test]
+fn a_lock_that_cannot_list_the_images_reports_the_volume_busy() {
+    let mut env = Env::new();
+    env.pair();
+    // the daemon started for the pairing has the plain PATH; the next command starts another
+    env.stop_daemon();
+    let fails = env.h().join("hdiutil-info-fails");
+    let path = stand_in_hdiutil(
+        &env,
+        &format!(
+            "if [ \"$1\" = info ] && [ -e '{}' ]; then\n  \
+             echo 'hdiutil: info failed - stand-in' >&2\n  exit 1\nfi",
+            fails.display()
+        ),
+    );
+    let bundle = env.h().join("r.sparsebundle");
+    let (code, _, err) = create_r(&env, &path);
+    assert_eq!(code, 0, "{err}");
+    let _detach = Detach(&env, bundle.clone(), env.h().join("mnt/r"));
+    std::fs::write(&fails, b"").unwrap();
+    let lock = run_with_path(&env, &path, &["lock"]);
+    std::fs::remove_file(&fails).unwrap();
+    // the image is still attached: finding its device for the detach needs `hdiutil info` too
+    assert!(attached(&bundle));
+    assert_eq!(
+        lock.0,
+        11,
+        "busy, not Locked with the volume mounted\n{}",
+        report(&env, "lock", &lock)
+    );
+    assert!(
+        lock.1.contains("Volume r could not be checked"),
+        "the lock names the volume\n{}",
+        report(&env, "lock", &lock)
+    );
 }
 
 /// A lock while an `open` is mounting an auto volume (SPEC 6.5): the lock's unmount waits for
@@ -330,9 +518,8 @@ fn a_lock_while_an_open_mounts_a_volume_leaves_it_closed() {
     assert_eq!(code, 0, "{err}");
     let _detach = Detach(&env, bundle.clone(), mnt.clone());
     std::fs::write(mnt.join("keep.txt"), canary()).unwrap();
-    let (code, _, err) = env.run(&["lock"]);
-    assert_eq!(code, 0, "{err}");
-    assert!(!attached(&bundle), "closed by the lock");
+    let lock = env.run(&["lock"]);
+    closed_by(&env, &lock, &bundle);
 
     let state = env.h().join("s/sealctl");
     let hold = state.join("test-hold-mount");
@@ -344,7 +531,7 @@ fn a_lock_while_an_open_mounts_a_volume_leaves_it_closed() {
         c.args(args).stdin(Stdio::null());
         std::thread::spawn(move || c.output().unwrap())
     };
-    let ((), _) = env.with_phone(Answer::Session, || {
+    let (lock, _) = env.with_phone(Answer::Session, || {
         let open = spawn(&["open"]);
         assert!(until(60, || held.exists()), "the daemon stopped before the mount");
         let lock = spawn(&["lock"]);
@@ -356,14 +543,19 @@ fn a_lock_while_an_open_mounts_a_volume_leaves_it_closed() {
         // the mount goes on after the lock began
         std::fs::remove_file(&hold).unwrap();
         let lock = lock.join().unwrap();
-        assert!(lock.status.success(), "{}", String::from_utf8_lossy(&lock.stderr));
         open.join().unwrap();
+        lock
     });
+    let lock = (
+        lock.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&lock.stdout).into_owned(),
+        String::from_utf8_lossy(&lock.stderr).into_owned(),
+    );
+    closed_by(&env, &lock, &bundle);
     assert!(
         !mnt.join("keep.txt").exists(),
         "the volume is not mounted after the lock"
     );
-    assert!(!attached(&bundle), "the image is detached after the lock");
     let (_, out, _) = env.run(&["status", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["state"], "locked", "{out}");

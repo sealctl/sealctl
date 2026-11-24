@@ -219,9 +219,16 @@ impl Volume {
         )
     }
 
-    /// Mounted?
+    /// Mounted? A state that cannot be read counts as closed; [`Volume::check_open`] says so.
     pub fn is_open(&self) -> bool {
-        backend(self.kind).is_unlocked(self).unwrap_or(false)
+        self.check_open().unwrap_or(false)
+    }
+
+    /// Mounted, or an error when the state cannot be read (`hdiutil info` failing).
+    pub fn check_open(&self) -> Result<bool> {
+        backend(self.kind)
+            .is_unlocked(self)
+            .with_context(|| format!("Volume {} could not be checked", self.name))
     }
 
     /// Mounted at its mount point ([`Backend::is_mounted`]).
@@ -507,7 +514,7 @@ pub fn holder(mountpoint: &Path) -> Option<(String, u64)> {
 /// Unmounts; a busy volume names the process holding it (exit 11).
 pub fn close(vol: &Volume, force: bool) -> Result<()> {
     let be = backend(vol.kind);
-    if !be.is_unlocked(vol)? {
+    if !vol.check_open()? {
         return Ok(());
     }
     if let Err(e) = be.lock(vol, force) {

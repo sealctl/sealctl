@@ -33,20 +33,38 @@ struct Attachment {
     mounts: Vec<String>,
 }
 
-/// The attachments of the image at `path`, from `hdiutil info`.
+/// The attachments of the image at `path`, from `hdiutil info`. While an image attaches or
+/// detaches (this one, or another one beside it), `hdiutil info` can list it without its
+/// devices (`blockcount : <unknown>`, no `/dev` lines), and still exit 0; read as it is, that
+/// is "not attached", and a lock would pass over a mounted volume or report it closed while
+/// it stays mounted. So an incomplete listing of this image is read again, every 100 ms for a
+/// second at most, and is an error if it stays incomplete.
 fn attachments(path: &std::path::Path) -> Result<Vec<Attachment>> {
-    let out = check(
-        crate::util::system_cmd("hdiutil").arg("info").output()?,
-        "hdiutil info",
-    )?;
+    const READS: u32 = 10;
     let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    Ok(parse_info(&String::from_utf8_lossy(&out.stdout), |image| {
-        std::fs::canonicalize(image).unwrap_or_else(|_| image.into()) == want
-    }))
+    for read in 1..=READS {
+        let out = check(
+            crate::util::system_cmd("hdiutil").arg("info").output()?,
+            "hdiutil info",
+        )?;
+        let found = parse_info(&String::from_utf8_lossy(&out.stdout), |image| {
+            std::fs::canonicalize(image).unwrap_or_else(|_| image.into()) == want
+        });
+        match found {
+            Some(found) => return Ok(found),
+            None if read < READS => std::thread::sleep(std::time::Duration::from_millis(100)),
+            None => {}
+        }
+    }
+    bail!(
+        "hdiutil info lists {} without its devices (an image attaching or detaching?)",
+        path.display()
+    )
 }
 
-/// The attachments in `hdiutil info` text whose image-path passes `is_ours`.
-fn parse_info(text: &str, is_ours: impl Fn(&str) -> bool) -> Vec<Attachment> {
+/// The attachments in `hdiutil info` text whose image-path passes `is_ours`; `None` when one
+/// of them is listed incomplete (no `/dev` entries, or its size `<unknown>`).
+fn parse_info(text: &str, is_ours: impl Fn(&str) -> bool) -> Option<Vec<Attachment>> {
     let mut found = Vec::new();
     for block in text.split("================================================") {
         let image = block.lines().find_map(|l| {
@@ -57,10 +75,15 @@ fn parse_info(text: &str, is_ours: impl Fn(&str) -> bool) -> Vec<Attachment> {
         if !is_ours(image) {
             continue;
         }
+        let unknown = block.lines().any(|l| {
+            l.strip_prefix("blockcount")
+                .is_some_and(|r| r.trim_start_matches([' ', ':', '\t']).trim() == "<unknown>")
+        });
         let devs: Vec<&str> = block.lines().filter(|l| l.starts_with("/dev/")).collect();
         // the first entity is the whole image
-        let Some(disk) = devs.first().and_then(|l| l.split('\t').next()) else {
-            continue;
+        let disk = devs.first().and_then(|l| l.split('\t').next());
+        let (Some(disk), false) = (disk, unknown) else {
+            return None;
         };
         let mounts = devs
             .iter()
@@ -72,7 +95,7 @@ fn parse_info(text: &str, is_ours: impl Fn(&str) -> bool) -> Vec<Attachment> {
             mounts,
         });
     }
-    found
+    Some(found)
 }
 
 /// Mount points of attached images whose image-path equals `path` (from `hdiutil info`); an
@@ -88,6 +111,34 @@ pub fn attached_mounts(path: &std::path::Path) -> Result<Vec<String>> {
     Ok(mounts)
 }
 
+/// `hdiutil create`: an encrypted APFS sparse bundle at `path` (which must not exist), with
+/// `pass` on stdin. Never `-quiet`: that closes hdiutil's stdout and stderr, and a failure
+/// would say nothing about why. A create refused as `Resource busy` (the disk images service
+/// busy with other images) that left nothing at `path` is tried again, three times in all, a
+/// second apart; any other failure is reported at once, with hdiutil's reason.
+pub fn create_image(path: &std::path::Path, size: &str, volname: &str, pass: &[u8]) -> Result<()> {
+    const TRIES: u32 = 3;
+    for attempt in 1..=TRIES {
+        let out = run_with_stdin(
+            crate::util::system_cmd("hdiutil")
+                .args(["create", "-size", size, "-type", "SPARSEBUNDLE", "-fs", "APFS"])
+                .args(["-encryption", "AES-256", "-stdinpass", "-volname", volname])
+                .arg(path),
+            pass,
+        )?;
+        let busy = !out.status.success()
+            && String::from_utf8_lossy(&out.stderr).contains("Resource busy")
+            && !path.exists();
+        if !busy || attempt == TRIES {
+            check(out, "hdiutil create")?;
+            return Ok(());
+        }
+        log::info!("hdiutil create: resource busy, trying again ({attempt}/{TRIES})");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Ok(())
+}
+
 /// Detaches every attachment of the image at `path`, wherever it is mounted. Just after a
 /// mount or a write, macOS services (Spotlight, fseventsd) can hold the volume for a moment,
 /// so a detach without `force` is tried three times, a second apart, before the volume is
@@ -97,7 +148,7 @@ fn detach_all(path: &std::path::Path, force: bool) -> Result<()> {
     for a in attachments(path)? {
         for attempt in 1..=TRIES {
             let mut cmd = crate::util::system_cmd("hdiutil");
-            cmd.args(["detach", "-quiet"]);
+            cmd.arg("detach");
             if force {
                 cmd.arg("-force");
             }
@@ -123,23 +174,7 @@ impl Backend for Sparsebundle {
         let path = v.path.clone().context("sparsebundle needs a path")?;
         let id = crate::util::new_uuid()?;
         let pass = key_for(&id)?;
-        let out = run_with_stdin(
-            crate::util::system_cmd("hdiutil")
-                .args([
-                    "create",
-                    "-quiet",
-                    "-size",
-                    size,
-                    "-type",
-                    "SPARSEBUNDLE",
-                    "-fs",
-                    "APFS",
-                ])
-                .args(["-encryption", "AES-256", "-stdinpass", "-volname", &v.name])
-                .arg(&path),
-            pass.as_bytes(),
-        )?;
-        check(out, "hdiutil create")?;
+        create_image(&path, size, &v.name, pass.as_bytes())?;
         v.id = id.clone();
         Ok(pass)
     }
@@ -157,7 +192,7 @@ impl Backend for Sparsebundle {
     fn unlock(&self, v: &Volume, passphrase: &[u8]) -> Result<()> {
         let path = v.path.as_ref().context("sparsebundle needs a path")?;
         let mut cmd = crate::util::system_cmd("hdiutil");
-        cmd.args(["attach", "-quiet", "-stdinpass", "-owners", "on"]);
+        cmd.args(["attach", "-stdinpass", "-owners", "on"]);
         let default_mp = std::path::Path::new("/Volumes").join(&v.name);
         if v.mountpoint != default_mp {
             std::fs::create_dir_all(&v.mountpoint)?;
@@ -406,7 +441,7 @@ image-path      : /Users/u/Vaults/v.sparsebundle
     /// Every attachment of the image is found, with its whole disk, wherever it is mounted.
     #[test]
     fn attachments_of_an_image_wherever_mounted() {
-        let got = parse_info(INFO, |p| p == "/Users/u/Vaults/v.sparsebundle");
+        let got = parse_info(INFO, |p| p == "/Users/u/Vaults/v.sparsebundle").unwrap();
         assert_eq!(
             got,
             vec![
@@ -420,6 +455,53 @@ image-path      : /Users/u/Vaults/v.sparsebundle
                 },
             ]
         );
-        assert!(parse_info(INFO, |p| p == "/nowhere").is_empty());
+        assert!(parse_info(INFO, |p| p == "/nowhere").unwrap().is_empty());
+    }
+
+    /// `hdiutil info` as it lists an image attaching or detaching beside others (macOS, with
+    /// `hdiutil: info: cannot find IO media` on stderr and exit 0): no devices, size unknown.
+    const INFO_IN_FLUX: &str = "framework       : 710
+driver          : 710
+images          : 2
+================================================
+image-path      : /Users/u/Vaults/steady.sparsebundle
+blockcount      : 65536
+writeable       : TRUE
+/dev/disk5\tGUID_partition_scheme\t
+/dev/disk5s1\t7C3457EF-0000-11AA-AA11-00306543ECAC\t
+/dev/disk7\tEF57347C-0000-11AA-AA11-00306543ECAC\t
+/dev/disk7s1\t41504653-0000-11AA-AA11-00306543ECAC\t/Users/u/mnt/steady
+================================================
+image-path      : /Users/u/Vaults/v.sparsebundle
+image-type      : sparse bundle disk image
+blockcount      : <unknown>
+blocksize       : <unknown>
+writeable       : <unknown>
+mounting mode   : <unknown>
+framework name  : DiskImages
+";
+
+    /// An image listed without its devices is neither attached nor detached: the listing is
+    /// incomplete (read again), never "not attached". The other images in it read as usual.
+    #[test]
+    fn an_image_listed_without_its_devices_is_an_incomplete_listing() {
+        assert_eq!(
+            parse_info(INFO_IN_FLUX, |p| p == "/Users/u/Vaults/v.sparsebundle"),
+            None
+        );
+        let steady = parse_info(INFO_IN_FLUX, |p| p == "/Users/u/Vaults/steady.sparsebundle");
+        assert_eq!(
+            steady,
+            Some(vec![Attachment {
+                disk: "/dev/disk5".into(),
+                mounts: vec!["/Users/u/mnt/steady".into()],
+            }])
+        );
+        // the devices listed, the size not yet: incomplete too
+        let half = INFO_IN_FLUX.replace(
+            "framework name  : DiskImages\n",
+            "framework name  : DiskImages\n/dev/disk9\tGUID_partition_scheme\t\n",
+        );
+        assert_eq!(parse_info(&half, |p| p == "/Users/u/Vaults/v.sparsebundle"), None);
     }
 }
