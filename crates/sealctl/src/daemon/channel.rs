@@ -236,16 +236,8 @@ pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
                             d.ack(ack);
                         }
                         for msg in reply.msgs {
-                            let new = {
-                                let mut paired = d.paired.lock().await;
-                                let new = msg.seq > paired.file.msg_seq;
-                                if new {
-                                    paired.file.msg_seq = msg.seq;
-                                    let _ = paired.file.save();
-                                }
-                                new
-                            };
-                            if new {
+                            let take = super::take_message(&mut d.paired.lock().await.file, &msg);
+                            if take {
                                 d.apply_message(msg).await;
                             }
                         }

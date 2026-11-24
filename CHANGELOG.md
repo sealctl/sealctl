@@ -16,6 +16,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   `releaseAt` + 2,400 s (900 s when not cancelled), and cancelled records do not count toward
   the 4 per phone but do toward 16 in all. The fake relay keeps cancelled records as long.
 
+### Fixed
+
+- A `lock` from the phone applies even when its message `seq` is below the highest the
+  machine has seen: each install of the app numbers its messages by its own clock, so a lock
+  from an install whose clock is behind another's was ignored. Other messages keep the `seq`
+  rule, and the highest `seq` seen never goes down.
+
 ## 0.7.0 - 2026-11-23
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes

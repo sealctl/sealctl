@@ -410,6 +410,73 @@ async fn a_lock_made_just_after_the_approval_locks_despite_clock_skew() {
     assert!(d.st().open);
 }
 
+/// `msg` sealed by the phone for `d`, as the relay hands it over.
+async fn sealed(d: &Daemon, phone: &sealctl_core::PhoneKeys, msg: MachineMessage) -> String {
+    use base64::Engine;
+    let p = d.paired.lock().await;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    sealctl_core::seal_machine_message(
+        phone,
+        p.file.machine.clone(),
+        b64.encode(p.keys.box_public()),
+        msg,
+    )
+    .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lock_from_an_install_whose_seq_is_behind_still_locks() {
+    let (d, phone) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    // Each install of the app numbers its messages by its own clock. Install A's clock is
+    // ahead of install B's: A's message sets the high-water mark above B's next seq.
+    let ahead = t0() + 120_000;
+    let a = MachineMessage {
+        version: 1,
+        time: ahead,
+        seq: ahead,
+        kind: MessageKind::Ack { ack: 0 },
+    };
+    d.on_message(&sealed(&d, &phone, a).await).await;
+    assert_eq!(d.paired.lock().await.file.msg_seq, ahead);
+    // a message other than `lock` with a seq at or below the mark is still ignored
+    let old = MachineMessage {
+        version: 1,
+        time: t0() + 1_000,
+        seq: t0() + 1_000,
+        kind: MessageKind::Answers {
+            answers: vec![sealctl_core::wire::Answer {
+                agent: "Claude Code".into(),
+                repository: "r".into(),
+                names: vec!["k".into()],
+                last: t0(),
+            }],
+            more: true,
+        },
+    };
+    d.on_message(&sealed(&d, &phone, old).await).await;
+    assert!(
+        d.st().answers_parts.is_empty(),
+        "an old answers message is ignored"
+    );
+    // install B's Lock, made during this session, has a seq below the mark
+    let lock = lock_message(t0() + 2_000, t0() + 2_000, "phone");
+    d.on_message(&sealed(&d, &phone, lock).await).await;
+    settle().await;
+    assert!(!d.st().open, "the lock applies whatever its seq");
+    assert_eq!(
+        d.paired.lock().await.file.msg_seq,
+        ahead,
+        "an older seq does not lower the mark"
+    );
+    // a lock held from before this session stays ignored, old seq or not
+    open(&d, &store_items()).await;
+    let held = lock_message(t0() - 86_400_000, t0() - 86_400_000, "phone");
+    d.on_message(&sealed(&d, &phone, held).await).await;
+    settle().await;
+    assert!(d.st().open);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_session_grant_answered_after_a_lock_is_not_kept_for_the_next_session() {
     let (d, _) = testing::daemon(DEAD);
