@@ -32,6 +32,32 @@ pub struct Saved {
     pub told: Option<String>,
 }
 
+/// A status goes out while Open when the lock deadline moved this much later than the one the
+/// last status told the phone (SPEC 6.6): work moves it on all the time, and the phone counts
+/// down from the last `left` it heard.
+pub const DEADLINE_LATER_MS: u64 = 2 * 60_000;
+
+/// ... or this much earlier: a wall clock set back (less than the minute that locks), or a move
+/// to another time zone bringing 02:00, and so the hard stop, closer. The allowance itself
+/// never shrinks while Open.
+pub const DEADLINE_EARLIER_MS: u64 = 60_000;
+
+/// At most one status for a moved deadline in this time, sent or failed.
+pub const DEADLINE_STATUS_EVERY_MS: u64 = 2 * 60_000;
+
+/// Whether the lock deadline moved enough to tell the phone at `now`. `deadline` is the
+/// session's lock deadline now (`None` unless Open), `told` the one the last status implied
+/// (its time plus its `left`, capped by its `stop`; `None` when it said Locked), `last` when
+/// the last status for a moved deadline was tried.
+pub fn deadline_moved(now: u64, deadline: Option<u64>, told: Option<u64>, last: u64) -> bool {
+    let (Some(deadline), Some(told)) = (deadline, told) else {
+        return false;
+    };
+    let moved = deadline.saturating_sub(told) >= DEADLINE_LATER_MS
+        || told.saturating_sub(deadline) >= DEADLINE_EARLIER_MS;
+    moved && now.saturating_sub(last) >= DEADLINE_STATUS_EVERY_MS
+}
+
 /// `min(cap, base + rate × minutes worked)`, in seconds.
 pub fn idle_allowance(cap: u64, base: u64, rate: u64, worked: u64) -> u64 {
     cap.min(base.saturating_add(rate.saturating_mul(worked)))
@@ -123,6 +149,14 @@ impl Saved {
         allowance.saturating_sub(idle)
     }
 
+    /// When the session locks unless more work comes, Unix ms: the last work moment plus the
+    /// idle allowance, or the hard stop when that comes first.
+    pub fn deadline(&self) -> u64 {
+        let allowance = idle_allowance(self.cap, self.base, self.rate, self.worked);
+        let idle = self.last_work.saturating_add(allowance.saturating_mul(1000));
+        self.first_open.map_or(idle, |f| idle.min(hard_stop(f)))
+    }
+
     /// Past the hard stop at `now`?
     pub fn past_hard_stop(&self, now: u64) -> bool {
         self.first_open.is_some_and(|f| now >= hard_stop(f))
@@ -177,6 +211,54 @@ mod tests {
         s.reset_credit();
         assert_eq!(s.worked, 0);
         assert!(s.first_open.is_none());
+    }
+
+    #[test]
+    fn a_moved_deadline_is_told_by_two_minutes_later_or_one_earlier() {
+        let now = 1_800_000_000_000u64;
+        let told = now + 1_800_000;
+        let last = now - 10 * 60_000;
+        let moved = |d: u64, last: u64| deadline_moved(now, Some(d), Some(told), last);
+        // later: 1:59 is not enough, 2:00 is
+        assert!(!moved(told + 119_000, last));
+        assert!(moved(told + 120_000, last));
+        // not moved at all
+        assert!(!moved(told, last));
+        // at most once every 2 minutes for this reason
+        assert!(!moved(told + 600_000, now - 119_000));
+        assert!(moved(told + 600_000, now - 120_000));
+        // earlier: 59 s is not enough, a minute is
+        assert!(!moved(told - 59_000, last));
+        assert!(moved(told - 60_000, last));
+        assert!(!moved(told - 600_000, now - 60_000));
+        // Locked: no deadline; the last status said Locked: nothing to compare
+        assert!(!deadline_moved(now, None, Some(told), last));
+        assert!(!deadline_moved(now, Some(told + 600_000), None, last));
+        // the first status for a moved deadline after the daemon started
+        assert!(deadline_moved(now, Some(told + 600_000), Some(told), 0));
+    }
+
+    #[test]
+    fn the_deadline_is_the_last_work_plus_the_allowance_or_the_hard_stop() {
+        let t0 = 1_800_000_000_000u64;
+        let mut s = Saved {
+            first_open: Some(t0),
+            cap: 14_400,
+            base: 1_800,
+            rate: 120,
+            ..Saved::default()
+        };
+        s.work(t0);
+        // 1,800 s + 120 s for the minute of the open
+        assert_eq!(s.deadline(), t0 + 1_920_000);
+        // it agrees with `left` at any time before it
+        for idle in [0, 15_000, 600_000] {
+            assert_eq!(t0 + idle + s.left(t0 + idle) * 1000, s.deadline());
+        }
+        // close to the hard stop, the hard stop
+        let stop = hard_stop(t0);
+        s.last_work = stop - 60_000;
+        assert_eq!(s.deadline(), stop);
     }
 
     #[test]
