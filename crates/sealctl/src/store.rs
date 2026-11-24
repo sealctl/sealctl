@@ -274,7 +274,7 @@ impl Store {
         crate::util::lock_named(
             &self.lock_file(),
             crate::util::LockHow::Shared,
-            &|| "The secret store is moving to new words (sealctl migrate). Try again once it ends.".into(),
+            &|| "The secret store is moving to a new seed (sealctl migrate). Try again once it ends.".into(),
             &mut || {},
         )
     }
@@ -308,7 +308,7 @@ impl Store {
                 if f.check != key.check() {
                     return Err(fail(
                         exit::WRONG_KEY,
-                        "The secret store moved to new words since this session opened. Lock \
+                        "The secret store moved to a new seed since this session opened. Lock \
                          (sealctl lock) and try again.",
                     ));
                 }

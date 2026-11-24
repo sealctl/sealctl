@@ -36,7 +36,7 @@ Every key in sealctl, where it comes from and where it lives. The sections below
 | Words | 24 BIP39 English words, 256 bits of entropy | 24 words | Paper card | Everything; typed only on the phone or into `sealctl recover` |
 | Seed | BIP39 from the words, empty passphrase | 64 bytes | Nowhere: computed, then wiped | Input to the root |
 | Root | `HKDF(seed, "sealctl/v1/root", 32)` | 32 bytes | Phone keychain, readable while the phone is unlocked; a synced backup item | Input to every key below |
-| Words fingerprint | 4 characters from `derive(root, "fingerprint", 8)` | 4 characters | Card, `.id` files, `sealctl status` | Says which words sealed an object |
+| Words fingerprint | 4 characters from `derive(root, "fingerprint", 8)` | 4 characters | Card, `.id` files, `sealctl status` (as `seed qHWf`) | Says which seed, and so which words, sealed an object |
 | Phone identity | `derive(root, "phone:identity", 32)`, an Ed25519 seed | 32 bytes | Phone (stored apart from the root, readable after first unlock) | Signs relay calls, replies and machine messages; its public key is the phone's id |
 | Phone box key | `derive(root, "phone:box", 32)`, an X25519 private key | 32 bytes | Phone, with the identity | Machines encrypt requests and status to its public key |
 | State key | `derive(root, "state", 32)` | 32 bytes | Phone | Encrypts the phone's state blob on the relay |
@@ -94,7 +94,7 @@ fp = n as 4 base58 digits, most significant first, padded with "1" (the zero dig
      alphabet: 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
 ```
 
-The fingerprint is case-sensitive. It names a set of words. It is not secret and does not check any key.
+The fingerprint is case-sensitive. It names a set of words and the seed they make; user-facing output labels it `seed <fp>` (`seed qHWf`). It is not secret and does not check any key.
 
 ### Key check
 

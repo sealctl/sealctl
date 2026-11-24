@@ -237,7 +237,7 @@ pub fn volume_ls(json_out: bool) -> Result<()> {
     }
     for v in vols {
         println!(
-            "{:<16} {:<14} {:<7} {}  words {}",
+            "{:<16} {:<14} {:<7} {}  seed {}",
             v.name,
             v.kind.label(),
             if v.is_open() { "Open" } else { "closed" },
@@ -301,7 +301,7 @@ pub fn volume_import(
         };
         vol.save()?;
         eprintln!(
-            "Registered volume {name} (words {}). Open it with: sealctl volume open {name}",
+            "Registered volume {name} (seed {}). Open it with: sealctl volume open {name}",
             vol.words
         );
         return Ok(());

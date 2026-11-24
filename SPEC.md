@@ -8,7 +8,7 @@ This spec says how sealctl is built: the command line tool, the shared Rust core
 
 ## 1. Terms the CLI uses
 
-Output uses these words and no others for the same things: **Locked**, **Open**, **Waiting**, **One tap**, **Places**, **words**, **phone**, **machine**.
+Output uses these words and no others for the same things: **Locked**, **Open**, **Waiting**, **One tap**, **Places**, **words**, **seed**, **phone**, **machine**.
 
 | Term | Meaning on this machine |
 | --- | --- |
@@ -16,7 +16,9 @@ Output uses these words and no others for the same things: **Locked**, **Open**,
 | Locked | No keys in memory; volumes unmounted |
 | Open | Keys in memory; the user and known agents use them without asking |
 | Waiting | A request is on the phone. The CLI prints `Waiting for your phone` and gives up after 5 minutes (on the wall clock too: after the machine slept past them, the wait ends within a second of waking) |
-| Words fingerprint | 4 characters naming the words that sealed an object (protocol.md) |
+| Words | The 24 words the user writes down and types (`recover`, `--words`, the phone app) |
+| Seed | What the 24 words make: the BIP39 seed and the root derived from it, which every key comes from (protocol.md). Output names a seed by its fingerprint: `seed qHWf` |
+| Seed fingerprint | 4 characters naming the seed that sealed an object (protocol.md: words fingerprint) |
 | Tag | 4 characters from the pairing key, shown as `#k7m2` |
 | Object | Anything sealed with a derived key: the secret store, an own-approval secret, a volume, a backup repository |
 
@@ -240,7 +242,7 @@ Commands with `--json` print exactly one JSON object on stdout, UTF-8, keys in c
 | 7 | Relay limit reached (`429`) |
 | 8 | Refused: inside an AI agent, or needs a terminal |
 | 9 | Not found: secret, volume, backup, object |
-| 10 | Wrong words or wrong key: check mismatch, retired words, words fingerprint mismatch |
+| 10 | Wrong words or wrong key: check mismatch, retired seed, seed fingerprint mismatch |
 | 11 | Volume busy |
 | 12 | Clock off by more than 5 minutes |
 | 13 | Stopped part way: `seal` or `unseal` did some steps and kept its journal; run it again with `--resume` |
@@ -263,8 +265,8 @@ Every error is one line on stderr starting with `sealctl: `, then at most one li
 | 429 network or key | `sealctl: Too many requests from this network. Try again in <n> s.` |
 | Clock | `sealctl: This computer's clock is <n> minutes off. Set the time automatically and try again.` (uses the relay's `time` when given) |
 | Agent refusal | `sealctl: Not inside an AI agent: <what>. Use sealctl run -- <command>.` |
-| Retired words | `sealctl: Sealed with words 7Hq3, retired 2028-03-02. Type them on the phone to move this object to your current words.` |
-| Other words | `sealctl: Sealed with words 7Hq3; your phone has words qHWf.` |
+| Retired seed | `sealctl: Sealed with seed 7Hq3, retired 2028-03-02. Type its 24 words on the phone to move this object to your current seed.` |
+| Other seed | `sealctl: Sealed with seed 7Hq3; your phone has seed qHWf.` |
 | Busy volume | `sealctl: Volume safe is busy: node (pid 4211) has files open.` |
 | Wrong number picked (`no_match`) | `sealctl: The number picked on your phone was not 59. Nothing was changed.` |
 | Held after a wrong number (`held`) | `sealctl: Your phone holds sensitive requests from this machine for an hour after a wrong number. Try again after 11:42.` |
@@ -422,8 +424,8 @@ Exit 5 when the code expires unpaired. The machine gate (`402` on the phone's si
 | Open; an agent uses a secret it has not used in this repository in this session | `agent` | `Waiting for your phone` unless the phone remembers the answer |
 | Open; a secret set with `--own-approval` | `own`, every time | `Waiting for your phone` |
 | Open; a new volume, backup or own-approval secret is created, or a manual volume is opened | `keys` | Usually nothing (automatic while the phone is unlocked) |
-| Any; the phone key changed | `rewrap`, `lvl` 2 | `Moving to your new words…` on stderr if a command waits on it. Level 2: biometrics on the phone, and `near`, since the daemon has no terminal for a number (16.1) |
-| Any; an object sealed with retired words is used | `old_words` | The retired-words message (5.5), exit 10; the phone asks for the words |
+| Any; the phone key changed | `rewrap`, `lvl` 2 | Level 2: biometrics on the phone, and `near`, since the daemon has no terminal for a number (16.1) |
+| Any; an object sealed with a retired seed is used | `old_words` | The retired-seed message (5.5), exit 10; the phone asks for that seed's 24 words |
 | `sealctl seal` of a new object | `keys` | `Waiting for your phone` unless automatic (level 1: nothing changes hands) |
 | `sealctl seal` of an existing object | `keys` with `ctx.subject` `{"k": "machine", "n": "seal"}`, `lvl` 2, `match` | `Waiting for your phone. On your phone, pick 47 if it asks.` Level 2 on the phone |
 | `sealctl unseal <object>` | `unseal` with the plan, `lvl` 2, `match` | `Waiting for your phone. On your phone, pick 47 if it asks.` Level 2. With `--words`, no request |
@@ -454,7 +456,7 @@ Global flags: `-v` (more logging to stderr, never values), `--relay <origin>`, `
 
 ```text
 Open · 3 h 12 min left · hard stop 02:00
-dev@mbp.example.com #k7m2 · words qHWf
+dev@mbp.example.com #k7m2 · seed qHWf
 Store     7 secrets · ~/.local/share/sealctl/store/0f8c6d2e…
 Volumes   safe (APFS) mounted at /Volumes/safe · backup 12 min ago
           clients (sparse bundle) closed
@@ -590,7 +592,7 @@ The helpers print values by design, to the program that called them. Inside an a
 | Command | Does |
 | --- | --- |
 | `sealctl volume create <name> [--kind apfs\|sparsebundle\|luks] [--size 50g] [--container diskN] [--path P] [--mountpoint M] [--manual]` | Section 13; mounted at once; `--manual` means not mounted when the session opens |
-| `sealctl volume ls [--json]` | Name, kind, Open or closed, mountpoint, words, last backup |
+| `sealctl volume ls [--json]` | Name, kind, Open or closed, mountpoint, seed, last backup |
 | `sealctl volume open <name>`, `sealctl volume close <name> [--force]` | Mount or unmount one volume |
 | `sealctl volume import <name> <image path or APFS volume (name, UUID or disk)> [--kind] [--mountpoint]` | Alias of `sealctl seal volume` (section 18.2): registers a volume already sealed with these words, or takes over one of the user's own |
 | `sealctl volume rm <name> [--delete-data]` | Forgets it; `--delete-data` destroys it after typing the name |
@@ -637,7 +639,7 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 - A new store: `uuid v4` id, folder `~/.local/share/sealctl/store/<store-id>/`, the key from the first `open` (item without `w`/`c`), `.id` written last.
 - `--own-approval`: a mode 2 file. Its key is asked with a `keys` request at creation and an `own` request at every use; it lives in daemon memory until that command exits. Its check goes into the `.id` file's `own` map.
 - Listing, removing and the names in `SessionStart` read the folder only; they need no key.
-- Writes through the daemon hold the store's write lock shared around the write itself, after any phone answer, and never wait (busy: exit 11, `The secret store is moving to new words`); a rewrap (16.1) holds it exclusive from listing the files to writing the new `.id`, waiting up to a minute for writes under way. The lock is `~/.local/state/sealctl/locks/store-<store-id>.lock`, on the machine, never in the store folder (which may be synced, or on a file system without locks); only a lock held by another process is busy, any other locking error is reported as it is. A value under the store key is written only with the key whose check the `.id` file names: a session opened before the store moved to new words holds the old key, and such a write is refused (exit 10) rather than sealed where neither the new key nor the words in its header open it.
+- Writes through the daemon hold the store's write lock shared around the write itself, after any phone answer, and never wait (busy: exit 11, `The secret store is moving to a new seed`); a rewrap (16.1) holds it exclusive from listing the files to writing the new `.id`, waiting up to a minute for writes under way. The lock is `~/.local/state/sealctl/locks/store-<store-id>.lock`, on the machine, never in the store folder (which may be synced, or on a file system without locks); only a lock held by another process is busy, any other locking error is reported as it is. A value under the store key is written only with the key whose check the `.id` file names: a session opened before the store moved to a new seed holds the old key, and such a write is refused (exit 10) rather than sealed where neither the new key nor the seed its header names opens it.
 - A store folder synced between machines works on all of them: the key depends on the store id and the words only. Two machines writing the same file at once: last rename wins; `secret ls` shows `modified` so the user can see it.
 
 ## 13. Volumes
@@ -677,22 +679,22 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 
 When the words change, the phone moves each machine to its new key (protocol.md, Phone key change). The daemon notices on its next relay call (`403`, or a wait closed with `unpaired` or `moved`), checks the move proof, and then, without any command:
 
-1. sends a `rewrap` request listing every object in `inventory.json` whose words are the old fingerprint (several requests if they do not fit);
+1. sends a `rewrap` request listing every object in `inventory.json` on the old seed (its fingerprint) (several requests if they do not fit);
 2. for each item, with the old and new keys from the reply:
 
 | Object | Rewrap |
 | --- | --- |
-| Secret store | Every `.sealed` file re-encrypted with the new file key (mode 1) or new own-approval key (mode 2), file by file with atomic renames; the `.id` file replaced last with the new words and check. Files still showing the old words in their header are rewrapped on the next run |
+| Secret store | Every `.sealed` file re-encrypted with the new file key (mode 1) or new own-approval key (mode 2), file by file with atomic renames; the `.id` file replaced last with the new seed and check. Files still showing the old seed in their header are rewrapped on the next run |
 | APFS volume | `diskutil apfs changePassphrase <uuid> -user disk` with old and new passphrases on stdin; new hint |
 | Sparse bundle | `hdiutil chpass -oldstdinpass -newstdinpass`; new `sealctl.id` |
 | LUKS | `cryptsetup luksAddKey --key-file /dev/fd/3 <file> /dev/fd/4`, then `luksRemoveKey` with the old key, then the token replaced |
 | Restic repository | `restic key add --user sealctl --host sealctl-<new fp>` with old and new passwords on fds, then `restic key remove <old key id>` (a rewrap that finds the new key there already, after a stop between the two, still removes the old one); on S3-compatible storage with versioning, the old versions of that `keys/` object are deleted (`ListObjectVersions`, `DeleteObjects`); where that is impossible, `sealctl migrate` says `Old key file versions remain in <bucket>; delete them in the provider's console.` |
 
-3. updates `inventory.json`, sends a status, and logs `Rewrapped 12 objects to words 4kPz` at `info`.
+3. updates `inventory.json`, sends a status, and logs `Rewrapped 12 objects to seed 4kPz` at `info`.
 
-Rewrap is confirmation level 2 on the phone: biometrics per request, and proximity. The daemon has no terminal, so it relies on the relay's `near`; a `not_near` answer leaves the objects on the old words, retried at the next daemon start, and `sealctl migrate --depth rewrap` at the machine's terminal sends the same request with a number (`On your phone, pick 23 if it asks.`).
+Rewrap is confirmation level 2 on the phone: biometrics per request, and proximity. The daemon has no terminal, so it relies on the relay's `near`; a `not_near` answer leaves the objects on the old seed, retried at the next daemon start, and `sealctl migrate --depth rewrap` at the machine's terminal sends the same request with a number (`On your phone, pick 23 if it asks.`).
 
-Rewrap needs each object reachable: an unmounted APFS volume can be rewrapped locked; a LUKS file and a sparse bundle need only the file; a restic repository needs its credentials (from the store). Objects that fail stay on the old words and are retried at every daemon start and listed by `sealctl migrate`.
+Rewrap needs each object reachable: an unmounted APFS volume can be rewrapped locked; a LUKS file and a sparse bundle need only the file; a restic repository needs its credentials (from the store). Objects that fail stay on the old seed and are retried at every daemon start and listed by `sealctl migrate`.
 
 ### 16.2 `sealctl migrate`
 
@@ -700,7 +702,7 @@ Run by a person on each machine that holds volumes or backups to re-encrypt.
 
 ```text
 $ sealctl migrate
-Moving from words 7Hq3 to 4kPz. Measured: disk 410 MB/s, upload 9 MB/s, download 40 MB/s.
+Moving from seed 7Hq3 to 4kPz. Measured: disk 410 MB/s, upload 9 MB/s, download 40 MB/s.
 
   object                    size    rewrap   re-encrypt
   secret store (7 files)    12 KB   done     -
@@ -741,9 +743,9 @@ A launchd job `com.sealctl.migrate` or systemd user service `sealctl-migrate.ser
 
 `sealctl migrate --scan [PATH...]` (default: home, `/Volumes`, mounted disks) finds objects by their markers: `*.id` files with `"sealctl": 1`, `sealctl.id` in sparse bundles, LUKS files (magic `LUKS\xba\xbe` with a `sealctl` token), APFS volumes (`diskutil apfs list -plist`, hint `sealctl <fp>`), and backup configs. It adds them to `inventory.json`, prints them, and sends a `report` with the `inv` field. After a restore from paper alone, the phone's plan cannot check completeness; the CLI says `Your phone has no inventory from before; only what machines report is listed.` when the phone's reply says so.
 
-### 16.5 Retired words
+### 16.5 Retired seed
 
-An object whose words are neither the phone's current words (`w` in any reply) nor rewrapped gives the retired-words message when used (exit 10). `sealctl migrate` lists such objects and, on `y`, sends one `old_words` request with `old` set; the phone asks the user to type those words and replies with old and new keys; the machine rewraps as in 16.1.
+An object whose seed is neither the phone's current seed (`w` in any reply) nor rewrapped gives the retired-seed message when used (exit 10). `sealctl migrate` lists such objects and, on `y`, sends one `old_words` request with `old` set; the phone asks the user to type that seed's 24 words and replies with old and new keys; the machine rewraps as in 16.1.
 
 ## 17. `sealctl recover`
 
@@ -755,9 +757,9 @@ sealctl recover <store folder | .sealed file | sparse bundle | LUKS file | APFS 
 ```
 
 1. Refused inside an AI agent and without a terminal on stdin (exit 8): the words must be typed by a person.
-2. Reads the object's marker for its kind, id and words fingerprint. A LUKS file is known by its header; its id is the LUKS UUID (`cryptsetup luksUUID`) and its marker the LUKS2 token `sealctl` (`cryptsetup luksDump --dump-json-metadata`, without root when the file is readable, else through `sudo`). An APFS volume is given by its volume UUID (any case), disk identifier (`disk3s5`) or name (section 18.2); its id is the volume UUID in lower case (`diskutil info`) and its marker the passphrase hint `sealctl <fp>` (`diskutil apfs listUsers`), which names the words but holds no check. A marker that is missing (the LUKS token is written best effort) skips step 4: the key is still checked in step 5.
+2. Reads the object's marker for its kind, id and seed fingerprint. A LUKS file is known by its header; its id is the LUKS UUID (`cryptsetup luksUUID`) and its marker the LUKS2 token `sealctl` (`cryptsetup luksDump --dump-json-metadata`, without root when the file is readable, else through `sudo`). An APFS volume is given by its volume UUID (any case), disk identifier (`disk3s5`) or name (section 18.2); its id is the volume UUID in lower case (`diskutil info`) and its marker the passphrase hint `sealctl <fp>` (`diskutil apfs listUsers`), which names the seed but holds no check. A marker that is missing (the LUKS token is written best effort) skips step 4: the key is still checked in step 5.
 3. Asks for the 24 words one at a time with no echo (`Word 1 of 24:`); the first four letters are enough; an unknown prefix asks again; a failed checksum asks again from the start, three tries.
-4. Computes the root, compares its fingerprint with the marker: on a mismatch, `These words have fingerprint qHWf; this object was sealed with words 7Hq3.` and exit 10.
+4. Computes the root, compares its fingerprint with the marker: on a mismatch, `These words are seed qHWf; this object was sealed with seed 7Hq3.` and exit 10.
 5. Derives the object's key, checks it against the marker's check, then:
 
 | Target | Result |
@@ -1177,7 +1179,7 @@ Each milestone ends with its acceptance tests green in CI.
 7. **Keyboardless machines** (design open decision): only sealctl uses count as work there, as specified.
 8. **APFS hint readability.** Whether `diskutil apfs listUsers` shows the passphrase hint must be checked on macOS 15 and 26; if not, `migrate --scan` reads the words of a locked APFS volume only from `inventory.json`. On macOS 27.2 it shows `Hint: sealctl <fp>` for a locked volume, and `recover` reads it there (tests/recover.rs runs on CI's macOS too).
 9. **CI runners and Claude on the web.** `SEALCTL_NO_DAEMON=1` and the printed pairing link make them work, but each ephemeral runner would pair anew. A pairing that outlives the runner (a long-lived key in the CI secret store) is not designed.
-10. **Fingerprint case.** The 4-character words fingerprint is base58 and case-sensitive, as in the design's examples; handwriting may confuse `k`/`K`. A lower-case base32 form would be easier to copy.
+10. **Fingerprint case.** The 4-character seed fingerprint is base58 and case-sensitive, as in the design's examples; handwriting may confuse `k`/`K`. A lower-case base32 form would be easier to copy.
 11. **"nothing written to disk"** in the monthly summary is a statement sealctl can only make about itself.
 12. **Reading keys from 1Password, Vault, Doppler** (design open decision): not planned as a live source. The planned `seal secret --from-op` and `--from-bw` read one value once.
 13. **APFS and sparse bundles swap their passphrase in one step.** There is no second slot to add first, so the check runs right after the swap and a failed check swaps back (18.1). Confirm on macOS 15 and 26 that `diskutil apfs unlockVolume -verify` works on a mounted volume and on a locked one. On macOS 27.2 `-verify` refuses without a user named by UUID (`-user <volume uuid>`, which sealctl passes) and works on a locked volume.

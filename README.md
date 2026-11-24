@@ -47,7 +47,7 @@ Backups need [restic](https://restic.net); Linux volumes need `cryptsetup`.
 
 ```sh
 sealctl pair          # scan the QR code with the sealctl app (or open the printed link on the phone)
-sealctl status        # Locked · dev@mbp.example.com #k7m2 · words qHWf
+sealctl status        # Locked · dev@mbp.example.com #k7m2 · seed qHWf
 sealctl ai install    # skills, hooks and deny rules for Claude Code, Codex, Gemini CLI, …
 ```
 
@@ -127,7 +127,7 @@ When you change the words on the phone, it moves each machine to its new key and
 rewraps every object by itself. At the machine's terminal:
 
 ```sh
-sealctl migrate --depth rewrap    # objects that could not be rewrapped, or sealed with retired words
+sealctl migrate --depth rewrap    # objects that could not be rewrapped, or sealed with a retired seed
 sealctl migrate                   # the table, then re-encrypt sparse bundles and restic repositories
 sealctl migrate --status          # the re-encryption job
 ```

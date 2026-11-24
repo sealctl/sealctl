@@ -39,8 +39,9 @@ The phone's root comes from the 24 words (BIP39 seed, then HKDF); every object k
 folder name, volume UUID, repository folder). A machine keeps only its pairing key and box key
 (`machine.json`, 0600). Object keys reach a machine only inside a reply sealed to a one-time
 key of that request, and live in daemon memory while the session is Open (or for one command).
-Each object carries a public `.id` file or marker with the words fingerprint and a key check,
-so a wrong key is noticed before it is used and `recover` can check the words.
+Each object carries a public `.id` file or marker with the seed fingerprint (`seed qHWf`: it
+names the seed the 24 words make) and a key check, so a wrong key is noticed before it is used
+and `recover` can check the words.
 
 ## Approvals
 

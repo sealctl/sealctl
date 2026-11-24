@@ -61,7 +61,7 @@ pub fn check_fingerprint(root: &Root, words: &str) -> Result<()> {
     if fp != words {
         return Err(fail(
             exit::WRONG_KEY,
-            format!("These words have fingerprint {fp}; this object was sealed with words {words}."),
+            format!("These words are seed {fp}; this object was sealed with seed {words}."),
         ));
     }
     Ok(())

@@ -174,7 +174,7 @@ pub fn seal_volume_given(
             if ours {
                 return Err(fail(
                     exit::USAGE,
-                    format!("{target} is sealed already (words {}).", f.words),
+                    format!("{target} is sealed already (seed {}).", f.words),
                 ));
             }
             leftover = Some(f);
@@ -197,8 +197,8 @@ pub fn seal_volume_given(
                 exit::WRONG_KEY,
                 format!(
                     "That passphrase does not open {target}. Check it and try again. The bundle has \
-                     the marker of a seal that did not finish (words {}): if your passphrase is right, \
-                     that seal changed it already, and sealctl recover opens it with those words.",
+                     the marker of a seal that did not finish (seed {}): if your passphrase is right, \
+                     that seal changed it already, and sealctl recover opens it with the 24 words of that seed.",
                     f.words
                 ),
             ));
@@ -333,7 +333,7 @@ pub fn seal_volume_given(
     volume::write_marker(&vol)?;
     vol.save()?;
     eprintln!(
-        "Sealed volume {name} ({}) with words {fp}. Your old passphrase no longer opens it.",
+        "Sealed volume {name} ({}) with seed {fp}. Your old passphrase no longer opens it.",
         kind.label()
     );
     Ok(())
@@ -488,7 +488,7 @@ pub fn seal_backup_given(
         })?;
     }
     eprintln!(
-        "Sealed backup {name} with words {fp}.{}",
+        "Sealed backup {name} with seed {fp}.{}",
         if keep_old {
             " Your password still opens it too."
         } else {

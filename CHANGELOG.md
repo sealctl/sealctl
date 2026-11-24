@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Changed
 
+- Output names the 4-character fingerprint of your 24 words as the seed: `seed 6qdC` instead of
+  `words 6qdC` (`volume ls`, `status`, `seal`, `migrate`, `recover` and error messages). JSON
+  keys, flags and stored files are unchanged.
 - `sealctl seal volume` and `sealctl recover` take an APFS volume by the name Finder and Disk
   Utility show, as well as by UUID or disk identifier. When several volumes share the name, the
   error lists their disk identifiers to choose from.

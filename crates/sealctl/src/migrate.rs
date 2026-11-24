@@ -378,7 +378,7 @@ pub fn rewrap_all(show: bool, old_words: bool) -> Result<Outcome> {
             b.keys = sub_items.clone();
             b.ctx = Some(ctx.clone());
             if show {
-                eprintln!("Type the words {fp} on your phone.");
+                eprintln!("Type the 24 words of seed {fp} on your phone.");
             }
             let (reply, _) = match send(&mut paired, b, show) {
                 Ok(r) => r,
@@ -608,7 +608,7 @@ pub fn table() -> Result<Vec<serde_json::Value>> {
 }
 
 fn print_table(rows: &[serde_json::Value], words: Option<&str>) {
-    println!("  {:<34} {:>9}  {:<6}  re-encrypt", "object", "size", "words");
+    println!("  {:<34} {:>9}  {:<6}  re-encrypt", "object", "size", "seed");
     for r in rows {
         let re = match r["reencrypt"].as_array() {
             Some(a) => format!(
@@ -707,7 +707,7 @@ pub fn run(o: Opts) -> Result<()> {
         return if out.failed.is_empty() && out.retired.is_empty() {
             Ok(())
         } else {
-            Err(fail(exit::WRONG_KEY, "Some objects stay on old words."))
+            Err(fail(exit::WRONG_KEY, "Some objects stay on an old seed."))
         };
     }
     // re-encrypt: the table, then the job for sparse bundles and restic repositories
@@ -801,18 +801,14 @@ fn runner_running(state: &Path) -> Result<bool> {
 
 fn report_outcome(out: &Outcome) {
     if !out.rewrapped.is_empty() {
-        eprintln!(
-            "Rewrapped {} objects to words {}.",
-            out.rewrapped.len(),
-            out.words
-        );
+        eprintln!("Rewrapped {} objects to seed {}.", out.rewrapped.len(), out.words);
     }
     if out.rewrapped.is_empty() && out.failed.is_empty() && out.retired.is_empty() {
-        eprintln!("Every object is on words {} already.", out.words);
+        eprintln!("Every object is on seed {} already.", out.words);
     }
     for (fp, objs) in &out.retired {
         eprintln!(
-            "Sealed with words {fp}: {}. Type those words on the phone: sealctl migrate --depth rewrap",
+            "Sealed with seed {fp}: {}. Type its 24 words on the phone: sealctl migrate --depth rewrap",
             objs.join(", ")
         );
     }

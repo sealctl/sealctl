@@ -149,7 +149,7 @@ fn recover_an_apfs_volume_with_the_words() {
     assert!(out.is_empty());
     assert!(
         screen.contains(&format!(
-            "These words have fingerprint {}; this object was sealed with words {}.",
+            "These words are seed {}; this object was sealed with seed {}.",
             other_phone.fingerprint(),
             env.phone.fingerprint()
         )),
@@ -279,7 +279,7 @@ fn recover_a_luks_file_with_the_words() {
     assert!(out.is_empty());
     assert!(
         screen.contains(&format!(
-            "this object was sealed with words {}.",
+            "this object was sealed with seed {}.",
             env.phone.fingerprint()
         )),
         "{screen}"

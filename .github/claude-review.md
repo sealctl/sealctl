@@ -22,7 +22,7 @@ order of priority (skip the areas the change does not touch):
 4. **Protocol and SPEC consistency.** Behaviour that differs from `SPEC.md` or
    `docs/protocol.md` without changing them in the same pull request; any change to the test
    vectors (a protocol break); words the product does not use (Locked, Open, Waiting, One tap,
-   Places, words, phone, machine).
+   Places, words, seed, phone, machine).
 5. **Concurrency and timing.** Locks or guards held across an `await`; races between a timer
    and a request; wall clock where a monotonic clock is needed (or the reverse: sleep and clock
    changes); retry or reconnect loops without a pause, backoff or `429` handling.

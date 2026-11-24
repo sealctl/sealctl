@@ -176,10 +176,7 @@ pub fn status(json_out: bool) -> Result<i32> {
         "{} #{}{}",
         p.file.name,
         p.file.tag,
-        words
-            .as_ref()
-            .map(|w| format!(" · words {w}"))
-            .unwrap_or_default()
+        words.as_ref().map(|w| format!(" · seed {w}")).unwrap_or_default()
     );
     if let Some(s) = &store {
         let short: String = s.id.chars().take(8).collect();

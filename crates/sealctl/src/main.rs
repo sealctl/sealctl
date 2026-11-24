@@ -143,7 +143,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Move objects to new words (rewrap, old words) or re-encrypt them under new keys.
+    /// Move objects to a new seed (rewrap, retired seed) or re-encrypt them under new keys.
     Migrate {
         /// The re-encryption job: per object, state and notes.
         #[arg(long)]
@@ -151,7 +151,7 @@ enum Cmd {
         /// Find objects by their markers (default: home and /Volumes).
         #[arg(long, num_args = 0..)]
         scan: Option<Vec<PathBuf>>,
-        /// rewrap: same data key, new words; re-encrypt: new keys and a copy of the data.
+        /// rewrap: same data key, new seed; re-encrypt: new keys and a copy of the data.
         #[arg(long, default_value = "re-encrypt", value_parser = ["rewrap", "re-encrypt"])]
         depth: String,
         #[arg(long)]

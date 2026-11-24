@@ -249,7 +249,7 @@ pub fn refusal(reply: &ReplyBody, number: Option<u8>, words_hint: Option<&str>) 
         "wrong_key" => fail(exit::WRONG_KEY, "Your phone's words do not open this object."),
         "retired_words" => fail(
             exit::WRONG_KEY,
-            "This object is sealed with retired words. Type them on the phone to move it to your current words.",
+            "This object is sealed with a retired seed. Type its 24 words on the phone to move it to your current seed.",
         ),
         "outside_plan" => fail(exit::ERROR, "Your phone refused a key outside the approved plan."),
         "plan_expired" => fail(
@@ -303,12 +303,12 @@ pub fn key_error(
     match (err, retired) {
         ("retired_words", Some(date)) => fail(
             exit::WRONG_KEY,
-            format!("Sealed with words {words}, retired {date}. Type them on the phone to move this object to your current words."),
+            format!("Sealed with seed {words}, retired {date}. Type its 24 words on the phone to move this object to your current seed."),
         ),
         _ => match phone_words {
             Some(pw) if pw != words => fail(
                 exit::WRONG_KEY,
-                format!("Sealed with words {words}; your phone has words {pw}."),
+                format!("Sealed with seed {words}; your phone has seed {pw}."),
             ),
             _ => fail(
                 exit::WRONG_KEY,
