@@ -52,8 +52,9 @@ jobs:
   # -------------------------------------------------------------- changes ----
   # The free plan runs 5 macOS jobs at a time. On pull requests the macOS packaging jobs
   # (build macos, brew install, nix on macOS) run only when packaging files change; ci.yml's
-  # macOS test job builds and tests every change on macOS anyway. Push, tag and manual runs
-  # always run everything. None of these jobs is a required check, and a skipped job passes.
+  # macOS test job builds and tests every change on macOS anyway. Push, tag and manual runs,
+  # and pull requests labelled `ci:full`, always run everything. None of these jobs is a
+  # required check, and a skipped job passes.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -72,6 +73,11 @@ jobs:
         run: |
           if [ "$EVENT" != pull_request ]; then
             echo "macos=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name' | grep -qx 'ci:full'; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+            echo "macOS packaging jobs: true (label ci:full)"
             exit 0
           fi
           files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')

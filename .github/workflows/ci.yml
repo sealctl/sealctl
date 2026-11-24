@@ -34,8 +34,39 @@ jobs:
         run: rustup toolchain install
       - run: cargo fmt --all --check
 
+  # Which suites this pull request needs (SPEC 23, "Test selection"): scripts/select-tests.py
+  # maps the changed files through .github/test-map. `test (ubuntu-latest)` runs the whole
+  # `cargo test` on every pull request; the macOS tests and the test-hooks steps run only the
+  # suites the change can affect. A path the map does not know, the label `ci:full`, and every
+  # run that is not a pull request (main, tags, schedules, manual runs) select everything. If
+  # this job fails, `test` runs everything (its outputs are then empty, never "false").
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      full: ${{ steps.select.outputs.full }}
+      it: ${{ steps.select.outputs.it }}
+      cargo_test: ${{ steps.select.outputs.cargo_test }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: python3 -B scripts/select-tests.py --github
+
   test:
     name: test (${{ matrix.os }})
+    needs: changes
+    # a required check: it always runs, and with everything when `changes` failed
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -72,23 +103,52 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      # the test selection itself: example file lists and the suites they select
+      - name: Test selection tests
+        if: runner.os == 'Linux'
+        run: python3 -B scripts/select-tests-test.py
       # Integration tests run the real binary in temporary HOMEs against the in-process fake
       # relay and a scripted phone, with the real OS tools (hdiutil on macOS, restic).
-      - run: cargo test --locked
+      # Linux: everything, on every pull request.
+      - if: runner.os == 'Linux'
+        run: cargo test --locked
+      # macOS: the crates and integration tests the `changes` job selected (`cargo test`
+      # arguments per crate, separated by `;`), or everything
+      - name: cargo test (selected)
+        if: runner.os == 'macOS'
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
+          RUNS: ${{ needs.changes.outputs.cargo_test }}
+        run: |
+          if [ "$FULL" != false ]; then
+            cargo test --locked
+            exit 0
+          fi
+          IFS=';' read -ra runs <<< "$RUNS"
+          [ "${#runs[@]}" -gt 0 ] || echo "No Rust tests selected for this change (see the changes job)"
+          for args in "${runs[@]}"; do
+            echo "cargo test --locked $args"
+            # shellcheck disable=SC2086 # one word per argument
+            cargo test --locked $args
+          done
+      # The test-hooks steps run with their integration test (or everything).
       # tests that kill a run at a set point of its journal (SEALCTL_TEST_KILL, test-hooks only)
-      - run: cargo test --locked -p sealctl --features test-hooks --test unseal resume_after_a_kill
+      - if: needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' unseal ')
+        run: cargo test --locked -p sealctl --features test-hooks --test unseal resume_after_a_kill
       # long operations against each other: kill points, stand-in restic, a phone that holds
       # requests, and the phone's clock moved on (every test of the file, hooks included)
-      - run: cargo test --locked -p sealctl --features test-hooks --test long_ops
+      - if: needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' long_ops ')
+        run: cargo test --locked -p sealctl --features test-hooks --test long_ops
       # requests on the phone against locks and the clock: hold points in the daemon
       # (test-hold-<point>) and a wall clock moved on (test-clock-ahead-ms), every test of the file
-      - run: cargo test --locked -p sealctl --features test-hooks --test daemon
+      - if: needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' daemon ')
+        run: cargo test --locked -p sealctl --features test-hooks --test daemon
       # sparse bundles: runs resumed after a kill, and a lock while an open mounts (the daemon's
       # `mount` hold point)
-      - if: runner.os == 'macOS'
+      - if: runner.os == 'macOS' && (needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' volumes '))
         run: cargo test --locked -p sealctl --features test-hooks --test volumes -- resumed a_lock_while_an_open_mounts
       # the keychain store, in the keychain file made above (macOS runner only)
-      - if: runner.os == 'macOS'
+      - if: runner.os == 'macOS' && (needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' stores '))
         run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture
 
   msrv:
