@@ -54,6 +54,27 @@ Tests that kill a run at a set point and resume it need the test hooks:
 - Add tests for pure logic (parsing, formats, plans).
 - Update `CHANGELOG.md` under *Unreleased*.
 
+## Claude on GitHub (maintainers)
+
+Every pull request from a branch of this repository gets an AI review from Claude: inline
+comments on real problems, each marked **blocker**, **should fix** or **nit**, and one summary
+comment that is updated on every push. It is advice, not a required check. What it looks for is
+in [`.github/claude-review.md`](.github/claude-review.md); the rules it holds code to are in
+[`CLAUDE.md`](CLAUDE.md). Label a pull request `skip-claude-review` to skip it, or
+`claude-review` to review a Dependabot pull request or one that changes only generated or lock
+files.
+
+Collaborators can also ask Claude directly in an issue or pull request comment:
+
+- `@claude review this again`
+- `@claude explain this change`
+- `@claude fix the failing test`
+- `@claude <task>` on an issue: Claude pushes a `claude/` branch and links a pull request.
+
+Claude follows `CLAUDE.md`. It can push commits to the pull request's branch when asked, but it
+never merges, force-pushes, deploys, tags or changes workflows: a maintainer still reviews and
+merges. Comments from people who are not collaborators are ignored.
+
 ## Code of conduct
 
 This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
