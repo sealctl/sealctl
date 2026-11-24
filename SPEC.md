@@ -240,12 +240,14 @@ notifications = false                    # no desktop notifications (5.2, 6.6); 
 
 | Request | Text |
 | --- | --- |
-| A git signature through the SSH agent (`ssh-keygen -Y sign -n git`) | `Sign a git commit · sealctl/app · Claude Code`; `Sign a git tag`, `Sign a git push` by the git command above it. The repository from the signing program's folder; the agent from its environment (Linux) or the agent program among its parent processes |
+| A git signature through the SSH agent (`ssh-keygen -Y sign -n git`, the executable by the kernel's record, the rest from its command line) | `Sign a git commit · sealctl/app · Claude Code`; `Sign a git tag`, `Sign a git push` by the git command above it. The repository from the signing program's folder; the agent from its environment (Linux) or the agent program among its parent processes |
 | Another SSH agent signature | `SSH login to github.com` (the host from `ssh`'s command line), else `SSH login with key work`; `Sign with SSH key work` for other `ssh-keygen -Y sign`; `Use SSH key work` for any other program |
 | A volume | `Open volume safe` |
 | A backup | `Back up safe` |
 | Secrets | `Use git/github.com`, `Use 2 secrets for npm test` (with `sealctl run`: the program and its first plain word, nothing else of the command line) |
 | The session alone | `Open sealctl` |
+
+For the SSH agent the text comes from the program that connected, which the daemon does not verify: code running as the user can start `ssh-keygen` or `ssh` with arguments of its choosing. The notification only says to look at the phone; the phone's card, made from the request itself, is what is approved (`docs/threat-model.md`).
 
 ### 5.3 JSON
 

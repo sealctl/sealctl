@@ -52,6 +52,12 @@ machine when the phone approves. Wire formats and keys: [protocol.md](protocol.m
   make git itself print a token (its trace output with redaction turned off, a credential
   helper of its own, a command one of git's transports runs from its configuration). Hooks
   deny the known ways when installed, and every value given out is a use the phone logs.
+- **A desktop notification that misnames the request.** For the SSH agent, the notification's
+  text ("Sign a git commit · sealctl/app", "SSH login to github.com") comes from the program
+  that connected: its executable, arguments, folder and parent processes. Code running as you
+  can run `ssh-keygen` or `ssh` with arguments of its choosing, so the text is a hint to look
+  at the phone, not a verified statement. What is approved is what the phone shows, which
+  comes from the request itself.
 - **Programs run with `sealctl run`.** They get the values they are given, by design. Trusting
   a project file trusts the names it maps for the commands run there, not what those commands
   do with the values.

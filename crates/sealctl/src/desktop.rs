@@ -178,6 +178,9 @@ fn program(cmd: &str) -> Option<String> {
 
 /// What an SSH agent signature is for, from the process that asked (`chain[0]`, then its
 /// parents): `ssh-keygen -Y sign -n git` run by `git commit` signs a commit, `ssh host` logs in.
+/// Programs are matched by the executable the kernel ran; their arguments are what they say.
+/// Unverified: a hint for the user to look at the phone, whose card is what is approved
+/// (SPEC 5.2, docs/threat-model.md).
 pub fn ssh_about(
     key: &str,
     chain: &[crate::caller::Proc],
@@ -991,6 +994,31 @@ mod tests {
         // a name that is not a host name is not shown
         assert_eq!(login(&["ssh", "h\u{202e}ost"]), "SSH login with key work");
         assert_eq!(ssh_about("work", &[], None, None).what, "Use SSH key work");
+        // programs are known by the executable the kernel ran, not by the name they give
+        let posing = p(
+            "/tmp/x/helper",
+            &["ssh-keygen", "-Y", "sign", "-n", "git", "-f", "k", "f"],
+        );
+        let posing_git = p("/tmp/x/other", &["git", "commit"]);
+        assert_eq!(
+            ssh_about("work", &[posing, posing_git.clone()], None, None).what,
+            "Use SSH key work"
+        );
+        let posing_ssh = p("/tmp/x/helper", &["ssh", "github.com"]);
+        assert_eq!(
+            ssh_about("work", &[posing_ssh], None, None).what,
+            "Use SSH key work"
+        );
+        // a real ssh-keygen under a program that only says it is git: a commit is the default
+        let keygen = p(
+            "/usr/bin/ssh-keygen",
+            &["ssh-keygen", "-Y", "sign", "-n", "git", "-f", "k", "f"],
+        );
+        let tag_claim = p("/tmp/x/other", &["git", "tag"]);
+        assert_eq!(
+            ssh_about("work", &[keygen, tag_claim], None, None).what,
+            "Sign a git commit"
+        );
     }
 
     #[test]
