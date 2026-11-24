@@ -39,6 +39,11 @@ fn shim_path() -> Result<std::path::PathBuf> {
     Ok(paths::config_dir()?.join("git-ssh-keygen"))
 }
 
+/// Does git sign through sealctl here (`sealctl git setup` wrote the `gpg.ssh.program` shim)?
+pub fn signs_through_sealctl() -> bool {
+    shim_path().is_ok_and(|p| p.is_file())
+}
+
 /// `~/.config/sealctl/git-ssh-keygen`: runs `sealctl git ssh-keygen "$@"`.
 fn write_shim(exe: &std::path::Path) -> Result<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;

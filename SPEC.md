@@ -619,7 +619,7 @@ The helpers print values by design, to the program that called them. Inside an a
 
 The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents.md).
 
-- **Skill** (`sealctl-secrets`, `SKILL.md`): when a command prints `Waiting for your phone`, tell the user to approve on their phone and wait; do not retry or loop; a declined request (exit 4) means stop and ask the user. Values are never needed: use `sealctl run`. The skill never mentions price or `sealctl buy`.
+- **Skill** (`sealctl-secrets`, `SKILL.md`): when a command prints `Waiting for your phone`, tell the user to approve on their phone and wait; do not retry or loop; a declined request (exit 4) means stop and ask the user. Values are never needed: use `sealctl run`. Signed git commits and tags, `git push` over SSH and `ssh` ask the phone without printing anything (git hides the signer's output): tell the user to approve in the app, not on the computer; `agent refused operation` means declined or unanswered, so tell the user and run it again when they are ready, and never switch to unsigned commits unless asked. The skill never mentions price or `sealctl buy`.
 - **Claude Code hooks** in `~/.claude/settings.json` (events `UserPromptSubmit`, `PreToolUse` for `Bash|Write|Edit|MultiEdit|Read|Grep|NotebookEdit`, `SessionStart`), command `<stable sealctl path> hook claude`, timeout 15 s.
 - **Denials** (all agents with hooks, and Claude Code `permissions.deny`):
   - reading anything under the store folder, `*.sealed`, `machine.json`, `~/.local/state/sealctl/`;
@@ -628,7 +628,7 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
   - setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`, `env -u …`);
   - environment dumps, `cat .env`, `printenv VAR`, clipboard reads, credential files;
   - sealctl commands are matched by their subcommand (the first word after sealctl's global options, through `env`, `command`, `sudo`, `xargs`, `sh -c`, `eval`, `$(…)` and any path to the binary), never by words in their arguments: `sealctl run -e K=shop/buy -- …` is allowed.
-- **SessionStart context**: one line, `sealctl: secrets are available by name through sealctl run (names: …). Values are never shown.` No session state, no licence.
+- **SessionStart context**: one line, `sealctl: secrets are available by name through sealctl run (names: …). Values are never shown.` Where git signs through sealctl (the `sealctl git setup` shim exists), it adds: `Signed git commits and tags, git push over SSH and ssh wait silently for approval in the sealctl app on the user's phone (not on this computer); "agent refused operation" means it was declined or not answered in time.` No session state, no licence.
 - **What the agent sees**: names, `****`, `Waiting for your phone`, exit codes and the error texts of 5.5. Never values, never the ask.
 - **What the developer sees**: the phone card with agent, repository, command, `user@host` and key names; the usage log on the phone; `sealctl status`.
 - Tests (section 22) assert that no command run with an agent variable set ever prints a value or the ask.
