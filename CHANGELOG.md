@@ -6,42 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
-### Fixed
-
-- A sparse bundle listed by `hdiutil info` without its devices (as macOS lists an image while
-  it or another one attaches or detaches) is no longer read as not attached: sealctl reads
-  the list again, for a second at most. Before, a lock could pass over a mounted volume or
-  report it closed while it stayed mounted, and an open could detach the volume it had just
-  mounted (`image attached but not mounted`).
-- `hdiutil` failures name their reason: sealctl no longer runs `hdiutil create`, `attach` or
-  `detach` with `-quiet`, which closes hdiutil's output and left errors as an empty
-  `hdiutil create failed:`. A create refused as `Resource busy` that left nothing behind is
-  tried again, three times in all, a second apart.
-- `sealctl lock` no longer passes over a volume whose state it cannot read (`hdiutil info`
-  failing) as closed, which printed `Locked.` and exited 0 with the volume still mounted: it
-  tries to close it, and if that fails too reports it busy (exit 11) and retries every minute.
-
-### Changed
-
-- `sealctl run` also masks values printed as hex, in lower or upper case, alongside the raw,
-  base64, base64url and URL-encoded forms.
-- A leak test stores a canary and checks that none of those forms reaches the output of
-  `sealctl run`, `daemon.log`, or any file in the config, state and data folders.
-- protocol.md, Delayed approvals (planned), matches the relay: a cancel keeps the record until
-  `releaseAt` + 2,400 s (900 s when not cancelled), and cancelled records do not count toward
-  the 4 per phone but do toward 16 in all. The fake relay keeps cancelled records as long.
-- `SEALCTL_AGENT=0` (agent detection off) is documented, and when an agent's own variable is
-  also set, sealctl says on stderr, once per command, that detection is off although that agent
-  is running.
-
-### Fixed
-
-- A `lock` from the phone applies even when its message `seq` is below the highest the
-  machine has seen: each install of the app numbers its messages by its own clock, so a lock
-  from an install whose clock is behind another's was ignored. Other messages keep the `seq`
-  rule, and the highest `seq` seen never goes down.
-
-## 0.7.0 - 2026-11-23
+## 0.7.0 - 2026-11-24
 
 Keys for developers and their AI agents: API keys, SSH and git signing keys, encrypted volumes
 and backups, opened only when your phone approves. Every key is derived from 24 words held by
@@ -92,3 +57,35 @@ the sealctl phone app, and the 24 words alone open every object.
 - `THIRD-PARTY-NOTICES.md`: the licence texts of every crate in the binary, generated with
   cargo-about (`scripts/notices.sh`) and shipped in every tarball, .deb, .rpm, PKGBUILD,
   Homebrew and Nix package.
+
+### Changed
+
+- `sealctl run` also masks values printed as hex, in lower or upper case, alongside the raw,
+  base64, base64url and URL-encoded forms.
+- A leak test stores a canary and checks that none of those forms reaches the output of
+  `sealctl run`, `daemon.log`, or any file in the config, state and data folders.
+- protocol.md, Delayed approvals (planned), matches the relay: a cancel keeps the record until
+  `releaseAt` + 2,400 s (900 s when not cancelled), and cancelled records do not count toward
+  the 4 per phone but do toward 16 in all. The fake relay keeps cancelled records as long.
+- `SEALCTL_AGENT=0` (agent detection off) is documented, and when an agent's own variable is
+  also set, sealctl says on stderr, once per command, that detection is off although that agent
+  is running.
+
+### Fixed
+
+- A sparse bundle listed by `hdiutil info` without its devices (as macOS lists an image while
+  it or another one attaches or detaches) is no longer read as not attached: sealctl reads
+  the list again, for a second at most. Before, a lock could pass over a mounted volume or
+  report it closed while it stayed mounted, and an open could detach the volume it had just
+  mounted (`image attached but not mounted`).
+- `hdiutil` failures name their reason: sealctl no longer runs `hdiutil create`, `attach` or
+  `detach` with `-quiet`, which closes hdiutil's output and left errors as an empty
+  `hdiutil create failed:`. A create refused as `Resource busy` that left nothing behind is
+  tried again, three times in all, a second apart.
+- `sealctl lock` no longer passes over a volume whose state it cannot read (`hdiutil info`
+  failing) as closed, which printed `Locked.` and exited 0 with the volume still mounted: it
+  tries to close it, and if that fails too reports it busy (exit 11) and retries every minute.
+- A `lock` from the phone applies even when its message `seq` is below the highest the
+  machine has seen: each install of the app numbers its messages by its own clock, so a lock
+  from an install whose clock is behind another's was ignored. Other messages keep the `seq`
+  rule, and the highest `seq` seen never goes down.
