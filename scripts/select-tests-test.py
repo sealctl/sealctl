@@ -16,8 +16,8 @@ spec.loader.exec_module(sel)
 
 CRATES = sel.workspace()
 RULES = sel.load_map()
-ALL_IT = {"daemon", "long_ops", "migrate", "pairing", "scan", "seal_from", "secrets", "session",
-          "stores", "unseal", "volumes"}
+ALL_IT = {"daemon", "leak", "long_ops", "migrate", "pairing", "project", "recover", "scan", "seal_from",
+          "secrets", "session", "stores", "unseal", "volumes"}
 
 
 def run(*files, reason=None):
@@ -42,21 +42,22 @@ class Examples(unittest.TestCase):
     def test_volume_change(self):
         r = run("crates/sealctl/src/volume/mod.rs", "crates/sealctl/tests/volumes.rs", "CHANGELOG.md")
         self.assertFalse(r["full"])
-        self.assertEqual(r["it"], ["long_ops", "migrate", "seal_from", "unseal", "volumes"])
+        self.assertEqual(r["it"], ["long_ops", "migrate", "recover", "seal_from", "unseal", "volumes"])
         self.assertEqual(r["unit"], ["sealctl"])
         self.assertFalse(r["fuzz"])
         self.assertEqual(r["cargo_test"], [
-            "-p sealctl --lib --bins --test long_ops --test migrate --test seal_from --test unseal --test volumes"])
+            "-p sealctl --lib --bins --test long_ops --test migrate --test recover --test seal_from --test unseal"
+            " --test volumes"])
 
     def test_daemon_change_runs_its_suites_and_fuzz(self):
         r = run("crates/sealctl/src/daemon/mod.rs")
         self.assertEqual(set(r["it"]), {"daemon", "session", "secrets", "volumes", "long_ops", "unseal",
-                                        "migrate", "pairing"})
+                                        "migrate", "pairing", "leak"})
         self.assertTrue(r["fuzz"])
 
     def test_agent_change(self):
         r = run("crates/sealctl/src/ai/policy.rs", "crates/sealctl/src/ai/SKILL.md")
-        self.assertEqual(r["it"], ["secrets", "unseal"])
+        self.assertEqual(r["it"], ["project", "secrets", "unseal"])
         self.assertFalse(r["fuzz"])
 
     def test_parser_change_runs_fuzz(self):

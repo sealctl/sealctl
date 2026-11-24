@@ -58,28 +58,28 @@ crates/sealctl/src/status.rs                all
 # ---- crates/sealctl/src: modules with their own suites -----------------------------------------
 # the session daemon: every key request passes through it; scan, stores and seal_from use it
 # only to fetch keys. One line per file, so a new file in daemon/ runs everything.
-crates/sealctl/src/daemon/mod.rs            daemon session secrets volumes long_ops unseal migrate pairing
-crates/sealctl/src/daemon/client.rs         daemon session secrets volumes long_ops unseal migrate pairing
-crates/sealctl/src/daemon/channel.rs        daemon session secrets volumes long_ops unseal migrate pairing
+crates/sealctl/src/daemon/mod.rs            daemon session secrets volumes long_ops unseal migrate pairing leak
+crates/sealctl/src/daemon/client.rs         daemon session secrets volumes long_ops unseal migrate pairing leak
+crates/sealctl/src/daemon/channel.rs        daemon session secrets volumes long_ops unseal migrate pairing leak
 crates/sealctl/src/daemon/session.rs        daemon session secrets
 # unit-test seams and timing tests, compiled only for `cargo test` (unit:sealctl covers them)
 crates/sealctl/src/daemon/testing.rs        none
 crates/sealctl/src/daemon/timing_tests.rs   none
 # volumes (hdiutil, APFS, LUKS) and backups (restic), and the launchd/systemd services they use
-crates/sealctl/src/volume/**                volumes migrate long_ops unseal seal_from
+crates/sealctl/src/volume/**                volumes migrate long_ops unseal seal_from recover
 crates/sealctl/src/backup.rs                volumes migrate long_ops unseal seal_from daemon
 crates/sealctl/src/service.rs               volumes migrate long_ops unseal daemon
 # changing words, recovery from the words
 crates/sealctl/src/migrate.rs               migrate long_ops
-crates/sealctl/src/recover.rs               session migrate unseal seal_from
+crates/sealctl/src/recover.rs               session migrate unseal seal_from recover
 # seal and unseal: run folders, journals, where passwords go
-crates/sealctl/src/seal/**                  unseal stores seal_from volumes long_ops migrate
+crates/sealctl/src/seal/**                  unseal stores seal_from volumes long_ops migrate project
 # AI agents: hooks, policy, the skill file
-crates/sealctl/src/ai/**                    secrets unseal
+crates/sealctl/src/ai/**                    secrets unseal project
 # `sealctl run`, .env files and scan
-crates/sealctl/src/project.rs               secrets session daemon long_ops migrate scan volumes
+crates/sealctl/src/project.rs               secrets session daemon long_ops migrate scan volumes project leak
 crates/sealctl/src/dotenv.rs                scan secrets seal_from long_ops
-crates/sealctl/src/scan.rs                  scan long_ops
+crates/sealctl/src/scan.rs                  scan long_ops project
 # SSH agent, git signing and credentials, the caller chain of credential helpers
 crates/sealctl/src/ssh.rs                   session secrets stores seal_from unseal daemon
 crates/sealctl/src/git.rs                   session secrets
@@ -100,9 +100,12 @@ crates/sealctl/src/seal/handback.rs         fuzz
 
 # ---- integration tests: the file itself ------------------------------------------------------
 crates/sealctl/tests/daemon.rs              daemon
+crates/sealctl/tests/leak.rs                leak
 crates/sealctl/tests/long_ops.rs            long_ops
 crates/sealctl/tests/migrate.rs             migrate
 crates/sealctl/tests/pairing.rs             pairing
+crates/sealctl/tests/project.rs             project
+crates/sealctl/tests/recover.rs             recover
 crates/sealctl/tests/scan.rs                scan
 crates/sealctl/tests/seal_from.rs           seal_from
 crates/sealctl/tests/secrets.rs             secrets
