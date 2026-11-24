@@ -24,8 +24,8 @@ needed: use `sealctl run`.
 ## Signed commits, git push and ssh
 
 On a machine where sealctl serves SSH keys (`sealctl git setup`, `sealctl ssh`), a signed
-`git commit` or `git tag`, `git push` over SSH and `ssh` ask the user's **phone**, not the
-Mac. They print nothing while they wait: git hides the signer's output.
+`git commit` or `git tag`, `git push` over SSH and `ssh` ask the user's **phone**, not this
+computer. They print nothing while they wait: git hides the signer's output.
 
 - If such a command seems stuck, tell the user to approve the request in the sealctl app on
   their phone. There is no prompt on the computer. Let the command keep waiting.
@@ -33,7 +33,8 @@ Mac. They print nothing while they wait: git hides the signer's output.
   answered in time. Tell the user, and run the command again once they are ready to approve.
   Do not switch to unsigned commits (`--no-gpg-sign`, `commit.gpgsign=false`) or another key
   unless the user asks for that.
-- `sealctl status` shows whether the session is Locked or Open (it never asks the phone).
+- `sealctl status` shows whether the session is Locked, Open or Waiting for the phone (it never
+  asks the phone itself).
 
 ## Store a secret
 
