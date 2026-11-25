@@ -107,12 +107,25 @@ fn rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
+static UNATTENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process waits for the phone where nobody sees its output: a credential helper (git and
+/// the AWS CLI keep its stderr from the user or the agent until it ends) or the backup schedule.
+/// Its requests always show a desktop notification (SPEC 5.2).
+pub fn unattended() {
+    UNATTENDED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Sends `op` and returns the answer; errors keep their exit codes.
 pub fn call(mut op: Value) -> Result<Value> {
     op["v"] = json!(1);
     op["cli"] = json!(VERSION);
     if op.get("notify").is_none() {
-        op["notify"] = json!(term::reader() == term::Reader::Pipe && !term::stderr_tty());
+        // A person at a terminal and an agent both read `Waiting for your phone` on stderr; a
+        // pipe or service with stderr going nowhere, or an unattended helper, gets a
+        // notification
+        let silent = term::reader() == term::Reader::Pipe && !term::stderr_tty();
+        op["notify"] = json!(silent || UNATTENDED.load(std::sync::atomic::Ordering::Relaxed));
     }
     if no_daemon() {
         crate::machine::load()?;

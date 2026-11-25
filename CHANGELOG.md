@@ -6,14 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
-### Fixed
+### Added
 
-- The phone's countdown for an Open session follows your work: the daemon sends a status when
-  activity moves the lock 2 minutes later (or anything moves it 1 minute earlier), at most once
-  every 2 minutes, instead of up to 15 minutes later.
+- macOS: desktop notifications come from `sealctl Notifier.app` (in the release tarball,
+  installed by Homebrew into `libexec`) under the name sealctl with its icon, instead of Script
+  Editor; macOS asks once whether sealctl may notify. Linux: notifications go over D-Bus with
+  the sealctl icon and desktop entry, which the packages now install.
+- `notifications = false` in `config.toml` turns desktop notifications off.
 
 ### Changed
 
+- Desktop notifications say what waits for your phone: "Approve on your phone" with the request
+  in the phone's words (`Sign a git commit · sealctl/app · Claude Code`, `SSH login to
+  github.com`, `Open volume safe`, `Back up safe`, `Use 2 secrets for npm test`), names only. The
+  answer replaces it: `Signed` or `Approved`, `Declined`, `Expired: nothing was signed`.
+- Level 3 notices are titled sealctl and no longer start with `sealctl:`.
 - The AI agent skill and session line say that signed git commits, `git push` over SSH and `ssh`
   wait silently for approval on the phone, and what `agent refused operation` means, so agents
   no longer look for a prompt on the computer or fall back to unsigned commits.
@@ -22,13 +29,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   longer read as commands, and `echo $SSH_AUTH_SOCK` and other variables ending in `_SOCK`,
   `_PID`, `_DIR`, `_PATH` or `_FILE` may be printed. Here-documents fed to a shell, and
   substitutions in unquoted ones, are still checked.
-
 - Output names the 4-character fingerprint of your 24 words as the seed: `seed 6qdC` instead of
   `words 6qdC` (`volume ls`, `status`, `seal`, `migrate`, `recover` and error messages). JSON
   keys, flags and stored files are unchanged.
 - `sealctl seal volume` and `sealctl recover` take an APFS volume by the name Finder and Disk
   Utility show, as well as by UUID or disk identifier. When several volumes share the name, the
   error lists their disk identifiers to choose from.
+
+### Fixed
+
+- The phone's countdown for an Open session follows your work: the daemon sends a status when
+  activity moves the lock 2 minutes later (or anything moves it 1 minute earlier), at most once
+  every 2 minutes, instead of up to 15 minutes later.
+- Requests that nobody sees waiting (the SSH agent and git signing, the git and AWS credential
+  helpers, the backup schedule) always show a desktop notification, also when an AI agent made
+  them. Before, a daemon started from an agent's shell showed none, so a signed `git commit` run
+  by an agent waited silently.
 
 ## 0.7.0 - 2026-11-24
 

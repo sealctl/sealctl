@@ -40,5 +40,7 @@ package() {
   install -Dm644 completions/sealctl.bash "\$pkgdir/usr/share/bash-completion/completions/sealctl"
   install -Dm644 completions/_sealctl "\$pkgdir/usr/share/zsh/site-functions/_sealctl"
   install -Dm644 completions/sealctl.fish "\$pkgdir/usr/share/fish/vendor_completions.d/sealctl.fish"
+  install -Dm644 sealctl.desktop "\$pkgdir/usr/share/applications/sealctl.desktop"
+  install -Dm644 sealctl.png "\$pkgdir/usr/share/icons/hicolor/256x256/apps/sealctl.png"
 }
 EOF

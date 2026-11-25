@@ -55,7 +55,10 @@ and `recover` can check the words.
 | `unseal <object>` | `unseal` with the plan, number match | 2 |
 | `unseal --all` | `unseal` with the plan, number match, delay away from trusted places | 3 |
 
-The CLI prints `Waiting for your phone` once, with the number when one is shown. The phone
+The CLI prints `Waiting for your phone` once, with the number when one is shown. Where nobody
+sees that line (the SSH agent and git signing, credential helpers, the backup schedule), a
+desktop notification names what waits, `Approve on your phone: Sign a git commit · sealctl/app`,
+and shows the answer in its place (SPEC 5.2). The phone
 decides the level; the CLI can only raise it. A level 3 approval comes back with a plan
 signature over the plan hash, the request id and the not-before time; the CLI checks it and
 acts only on objects named by the plan. Delayed approvals are held by the relay and can be

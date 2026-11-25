@@ -132,6 +132,39 @@ pub fn import_given(src: &Path, name: &str, given: Option<&[u8]>) -> Result<Stri
 #[derive(Clone)]
 struct Agent {
     daemon: Arc<Daemon>,
+    /// The process at the other end of the agent socket (`ssh`, `ssh-keygen`), when known.
+    peer: Option<i32>,
+}
+
+/// One [`Agent`] per connection, knowing the process that connected.
+struct Agents {
+    daemon: Arc<Daemon>,
+}
+
+impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for Agents {
+    fn new_session(&mut self, socket: &tokio::net::UnixStream) -> impl Session {
+        Agent {
+            daemon: self.daemon.clone(),
+            peer: socket.peer_cred().ok().and_then(|c| c.pid()),
+        }
+    }
+}
+
+/// What a signature with key `name` is for, from the process that asked: a git commit or tag
+/// (with its repository and agent), an SSH login (with its host), or the key (SPEC 5.2).
+fn about_signature(name: &str, peer: Option<i32>) -> crate::desktop::About {
+    let Some(pid) = peer else {
+        return crate::desktop::ssh_about(name, &[], None, None);
+    };
+    let chain = crate::caller::chain(pid, 12);
+    let agent = crate::guard::agent_in_env(&crate::caller::env_of(pid))
+        .or_else(|| crate::caller::agent_in(&chain))
+        .map(str::to_owned);
+    let repo = crate::caller::cwd_of(pid)
+        .and_then(|cwd| crate::approve::repo_of(&cwd))
+        .map(|r| r.name)
+        .filter(|r| !r.is_empty());
+    crate::desktop::ssh_about(name, &chain, repo, agent)
 }
 
 fn agent_err(msg: impl std::fmt::Display) -> AgentError {
@@ -171,6 +204,11 @@ impl Session for Agent {
             .find(|n| read_public(n).is_ok_and(|k| k.key_data() == wanted))
             .ok_or_else(|| agent_err("unknown key"))?;
         let ev: Events = Arc::new(|_| {});
+        let peer = self.peer;
+        let key = name.clone();
+        let about = tokio::task::spawn_blocking(move || about_signature(&key, peer))
+            .await
+            .ok();
         let vals = self
             .daemon
             .op_values(
@@ -180,7 +218,9 @@ impl Session for Agent {
                     cmd: format!("ssh signature with {name}"),
                     cwd: String::new(),
                     subject: Some(("ssh".into(), name.clone())),
+                    // nobody watches a terminal: git hides the signer's output
                     notify: true,
+                    about,
                 },
                 &ev,
             )
@@ -279,7 +319,7 @@ pub fn start_agent(daemon: Arc<Daemon>) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
     tokio::spawn(async move {
-        if let Err(e) = listen(listener, Agent { daemon }).await {
+        if let Err(e) = listen(listener, Agents { daemon }).await {
             log::warn!("SSH agent: {e}");
         }
     });

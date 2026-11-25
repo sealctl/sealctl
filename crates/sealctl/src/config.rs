@@ -20,6 +20,10 @@ pub struct Config {
     /// The store folder (`~/.local/share/sealctl/store/<store-id>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    /// Desktop notifications while a request waits for the phone and for level 3 notices
+    /// (SPEC 5.2); `false` turns them off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
 }
 
 impl Config {

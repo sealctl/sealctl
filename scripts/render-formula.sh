@@ -38,6 +38,9 @@ class Sealctl < Formula
 
   def install
     bin.install "sealctl"
+    # desktop notifications under the name "sealctl" with its icon (SPEC 5.2); sealctl finds
+    # it in ../libexec
+    libexec.install "sealctl Notifier.app" if OS.mac?
     doc.install "THIRD-PARTY-NOTICES.md"
     bash_completion.install "completions/sealctl.bash" => "sealctl"
     zsh_completion.install "completions/_sealctl"
@@ -55,6 +58,7 @@ class Sealctl < Formula
   test do
     assert_match version.to_s, shell_output("#{bin}/sealctl --version")
     assert_match "pair", shell_output("#{bin}/sealctl --help")
+    assert_predicate libexec/"sealctl Notifier.app/Contents/MacOS/sealctl-notifier", :executable? if OS.mac?
   end
 end
 EOF

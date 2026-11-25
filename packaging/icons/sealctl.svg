@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="sealctl">
+  <!-- The app icon (sealctl/.github brand/app-icon.svg) on a desktop tile: the macOS icon grid's
+       824 px rounded square with 100 px margins, so it sits beside other apps' icons. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#b4232c"/>
+  <g transform="translate(100 100) scale(0.8046875) translate(174.08 174.08) scale(21.1200)">
+    <path d="M16 2.5 L27.5 6.8 V15.2 C27.5 22.3 22.6 27.4 16 29.8 C9.4 27.4 4.5 22.3 4.5 15.2 V6.8 Z" transform="translate(1.6 1.5) scale(0.9)" fill="#ffffff"/>
+    <path d="M12.8 11 L17.6 15.8 L12.8 20.6" fill="none" stroke="#b4232c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

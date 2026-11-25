@@ -54,12 +54,18 @@ libc = "0.2"
 security-framework = "3"
 core-foundation = "0.10"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# desktop notifications over D-Bus (org.freedesktop.Notifications); the same zbus 4 that keyring
+# already brings for the Secret Service, so no new crate
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+
 [features]
 # Tests only: the keychain service name can be overridden (SEALCTL_TEST_KEYCHAIN_SERVICE), a run
 # can kill itself at a journal point (SEALCTL_TEST_KILL), the daemon stops at a hold point while
 # a file test-hold-<point> is in the state folder (writing test-held-<point>), and a request's
 # wait reads the wall clock moved on by the milliseconds in test-clock-ahead-ms there (each
-# check that goes on appends them to test-clock-went-on). Never enabled in release builds.
+# check that goes on appends them to test-clock-went-on), and desktop notifications are written to
+# the file SEALCTL_TEST_NOTIFY_LOG names instead of being shown. Never enabled in release builds.
 test-hooks = []
 
 [dev-dependencies]
@@ -94,6 +100,9 @@ assets = [
     ["completions/sealctl.bash", "usr/share/bash-completion/completions/sealctl", "644"],
     ["completions/_sealctl", "usr/share/zsh/vendor-completions/_sealctl", "644"],
     ["completions/sealctl.fish", "usr/share/fish/vendor_completions.d/sealctl.fish", "644"],
+    # the desktop entry and icon that desktop notifications name (SPEC 5.2)
+    ["../../packaging/linux/sealctl.desktop", "usr/share/applications/sealctl.desktop", "644"],
+    ["../../packaging/icons/sealctl-256.png", "usr/share/icons/hicolor/256x256/apps/sealctl.png", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -111,6 +120,9 @@ assets = [
     { source = "completions/sealctl.bash", dest = "/usr/share/bash-completion/completions/sealctl", mode = "644" },
     { source = "completions/_sealctl", dest = "/usr/share/zsh/site-functions/_sealctl", mode = "644" },
     { source = "completions/sealctl.fish", dest = "/usr/share/fish/vendor_completions.d/sealctl.fish", mode = "644" },
+    # the desktop entry and icon that desktop notifications name (SPEC 5.2)
+    { source = "../../packaging/linux/sealctl.desktop", dest = "/usr/share/applications/sealctl.desktop", mode = "644" },
+    { source = "../../packaging/icons/sealctl-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/sealctl.png", mode = "644" },
 ]
 
 [package.metadata.generate-rpm.recommends]

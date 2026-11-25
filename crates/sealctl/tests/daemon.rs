@@ -1036,3 +1036,99 @@ fn a_daemon_stopped_by_its_service_manager_locks_first() {
     assert!(gone, "the daemon exits");
     assert!(session("locked"), "the phone hears the session lock");
 }
+
+/// git hides its signer's output, so a signature that waits for the phone shows a desktop
+/// notification that says what it signs, and how it ended in its place. Also when an agent runs
+/// git and the daemon was started from the agent's shell (SPEC 5.2): the daemon used to stay
+/// quiet whenever its own environment named an agent.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_git_signature_from_an_agent_shows_a_desktop_notification() {
+    if !common::have("ssh-keygen") || !common::have("git") {
+        return;
+    }
+    let mut env = Env::new();
+    env.pair();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&["ssh", "keygen", "ed25519", "--comment", "t@test"])
+    });
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = env.run(&["git", "setup"]);
+    assert_eq!(code, 0, "{err}");
+    env.run(&["lock"]);
+    // the next daemon starts from the agent's git, with notifications written to a file
+    env.stop_daemon();
+    let log = env.h().join("notifications.log");
+    let repo = env.h().join("app");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .env_clear()
+            .env("HOME", env.h())
+            .env("PATH", std::env::var("PATH").unwrap())
+            .env("XDG_STATE_HOME", env.h().join("s"))
+            .env("SEALCTL_NO_SERVICE", "1")
+            .env("SEALCTL_RELAY", &env.origin)
+            .env("SEALCTL_TEST_NOTIFY_LOG", &log)
+            .env("CLAUDECODE", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@test")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@test")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+    };
+    assert!(git(&["init", "-q"]).status.success());
+    assert!(
+        git(&["remote", "add", "origin", "https://github.com/acme/app.git"])
+            .status
+            .success()
+    );
+    let (o, asked) = env.with_phone(Answer::Session, || {
+        git(&["commit", "-q", "--allow-empty", "-m", "signed"])
+    });
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(asked, vec!["Open"]);
+    let mut shown = String::new();
+    assert!(
+        until(10, || {
+            shown = std::fs::read_to_string(&log).unwrap_or_default();
+            shown.contains("Signed |")
+        }),
+        "notifications: {shown}"
+    );
+    let lines: Vec<&str> = shown.lines().collect();
+    assert_eq!(lines.len(), 2, "{shown}");
+    let id = lines[0].split(':').next().unwrap().trim_start_matches("show ");
+    // the agent is read from git's environment on Linux, from the process tree on macOS
+    let what = if cfg!(target_os = "linux") {
+        "Sign a git commit · acme/app · Claude Code"
+    } else {
+        "Sign a git commit · acme/app"
+    };
+    assert!(
+        lines[0].starts_with(&format!("show {id}: Approve on your phone | {what}")),
+        "{shown}"
+    );
+    assert!(
+        lines[1].starts_with(&format!("update {id}: Signed | {what}")),
+        "{shown}"
+    );
+    std::fs::remove_file(&log).unwrap();
+
+    // the same commit again, declined on the phone: the notification says so
+    env.run(&["lock"]);
+    let (o, _) = env.with_phone(Answer::Deny, || {
+        git(&["commit", "-q", "--allow-empty", "-m", "again"])
+    });
+    assert!(!o.status.success());
+    assert!(
+        until(10, || {
+            shown = std::fs::read_to_string(&log).unwrap_or_default();
+            shown.contains("Declined |")
+        }),
+        "notifications: {shown}"
+    );
+}
