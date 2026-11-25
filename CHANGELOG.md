@@ -13,6 +13,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   Editor; macOS asks once whether sealctl may notify. Linux: notifications go over D-Bus with
   the sealctl icon and desktop entry, which the packages now install.
 - `notifications = false` in `config.toml` turns desktop notifications off.
+- Where git signs through sealctl, the agent hooks deny turning commit or tag signing off or
+  pointing it at another program or key: `git -c commit.gpgsign=false`, `--no-gpg-sign`,
+  `git config commit.gpgsign false` or `--unset` (any scope or file), `gpg.format`,
+  `gpg.ssh.program` and `user.signingkey`, the same through `GIT_CONFIG_KEY_<n>`, and
+  `sealctl git setup --undo`, also through `env`, `sudo`, `sh -c`, `eval` and `$(…)`. The
+  request on the phone is your approval; only you change it. Reading config, `git commit -S`
+  and `git tag -s` are fine, and nothing changes where git does not sign through sealctl.
 
 ### Changed
 
