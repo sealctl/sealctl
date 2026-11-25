@@ -1,6 +1,6 @@
 ---
 name: sealctl-secrets
-description: Store and use API keys, tokens and other credentials with sealctl (approved on the user's phone) without ever seeing their values. Use whenever a task needs a credential — running a command or tests that need an API key, a .env file, "store this key", "which keys do I have", or when the user is about to paste a secret.
+description: Store and use API keys, tokens and other credentials with sealctl (approved on the user's phone) without ever seeing their values. Use whenever a task needs a credential — running a command or tests that need an API key, a .env file, "store this key", "which keys do I have", or when the user is about to paste a secret — and when a signed git commit or tag, git push or ssh waits or fails with "agent refused operation".
 ---
 
 # Secrets with sealctl
@@ -20,6 +20,21 @@ needed: use `sealctl run`.
 3. When a sealctl command prints `Waiting for your phone`, tell the user to approve on their
    phone and wait. Do not retry or loop.
 4. A declined request (exit code 4) means stop and ask the user what they want.
+
+## Signed commits, git push and ssh
+
+On a machine where sealctl serves SSH keys (`sealctl git setup`, `sealctl ssh`), a signed
+`git commit` or `git tag`, `git push` over SSH and `ssh` ask the user's **phone**, not this
+computer. They print nothing while they wait: git hides the signer's output.
+
+- If such a command seems stuck, tell the user to approve the request in the sealctl app on
+  their phone. There is no prompt on the computer. Let the command keep waiting.
+- `agent refused operation` (or `signing failed`) means the phone declined it or nobody
+  answered in time. Tell the user, and run the command again once they are ready to approve.
+  Do not switch to unsigned commits (`--no-gpg-sign`, `commit.gpgsign=false`) or another key
+  unless the user asks for that.
+- `sealctl status` shows whether the session is Locked, Open or Waiting for the phone (it never
+  asks the phone itself).
 
 ## Store a secret
 

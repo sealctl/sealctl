@@ -956,25 +956,60 @@ pub fn session_context() -> String {
         .and_then(|s| s.list())
         .map(|l| l.into_iter().map(|x| x.name).collect())
         .unwrap_or_default();
+    session_line(&names, crate::git::signs_through_sealctl())
+}
+
+/// The session line for these secret names; `signs`: git signs through sealctl here.
+fn session_line(names: &[String], signs: bool) -> String {
     let shown: Vec<&str> = names.iter().take(40).map(String::as_str).collect();
     let more = if names.len() > shown.len() {
         format!(" (+{} more)", names.len() - shown.len())
     } else {
         String::new()
     };
-    format!(
+    let line = format!(
         "sealctl: secrets are available by name through sealctl run (names: {}{more}). Values are never shown.",
         if shown.is_empty() {
             "none yet".to_string()
         } else {
             shown.join(", ")
         }
-    )
+    );
+    if signs {
+        format!("{line} {GIT_SIGNING_CONTEXT}")
+    } else {
+        line
+    }
 }
+
+/// Added to the session line where git signs through sealctl: the signer prints nothing while
+/// the phone is asked, so an agent would otherwise look for a prompt on the computer.
+pub const GIT_SIGNING_CONTEXT: &str = "Signed git commits and tags, git push over SSH and ssh \
+    wait silently for approval in the sealctl app on the user's phone (not on this computer); \
+    \"agent refused operation\" means it was declined or not answered in time.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_git_signing_line_names_the_phone() {
+        assert!(GIT_SIGNING_CONTEXT.contains("phone"));
+        assert!(GIT_SIGNING_CONTEXT.contains("agent refused operation"));
+        assert!(!GIT_SIGNING_CONTEXT.contains("  "), "{GIT_SIGNING_CONTEXT}");
+    }
+
+    #[test]
+    fn the_session_line_mentions_git_signing_only_where_git_signs_through_sealctl() {
+        let names = vec!["shop/stripe".to_string()];
+        let signs = session_line(&names, true);
+        assert!(signs.ends_with(GIT_SIGNING_CONTEXT), "{signs}");
+        assert!(signs.contains("names: shop/stripe"), "{signs}");
+        let plain = session_line(&names, false);
+        assert!(!plain.contains("agent refused operation"), "{plain}");
+        assert!(plain.ends_with("Values are never shown."), "{plain}");
+        assert!(session_line(&[], false).contains("names: none yet"));
+    }
 
     #[test]
     fn prompts_with_keys_are_blocked() {
