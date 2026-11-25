@@ -155,8 +155,17 @@ pub fn about(body: &RequestBody) -> About {
     }
 }
 
-/// The program a `sealctl run -- <command>` runs, with its first word when that is a plain one:
-/// `npm test`, `cargo build`, `make`. Nothing else of the command line, which may hold values.
+/// Second words shown after the program: common subcommands only. Any other argument may be a
+/// value (`vault login <token>`), so it is never shown.
+const SUBCOMMANDS: &[&str] = &[
+    "test", "build", "run", "start", "dev", "serve", "check", "lint", "fmt", "install", "ci", "deploy",
+    "publish", "release", "push", "pull", "fetch", "clone", "migrate", "plan", "apply", "up", "down", "exec",
+    "bench", "doc", "clippy", "compose",
+];
+
+/// The program a `sealctl run -- <command>` runs, with its first word when that is a known
+/// subcommand ([`SUBCOMMANDS`]): `npm test`, `cargo build`, `make`. Nothing else of the command
+/// line, which may hold values.
 fn program(cmd: &str) -> Option<String> {
     let (_, rest) = cmd
         .split_once(" -- ")
@@ -170,7 +179,7 @@ fn program(cmd: &str) -> Option<String> {
     if !plain(first) {
         return None;
     }
-    match words.next().filter(|w| plain(w) && !w.starts_with('-')) {
+    match words.next().filter(|w| SUBCOMMANDS.contains(w)) {
         Some(w) => Some(format!("{first} {w}")),
         None => Some(first.to_string()),
     }
@@ -929,6 +938,16 @@ mod tests {
             Some("psql")
         );
         assert_eq!(program("git credential get"), None);
+        // a second word that is not a known subcommand may be a value: never shown
+        for (cmd, shown) in [
+            ("run -- vault login hvs.CAESIabc123", "vault"),
+            ("run -- docker login ghp_abcdef0123", "docker"),
+            ("run -- deploy-tool sk-abc123", "deploy-tool"),
+            ("run -- cargo build", "cargo build"),
+            ("run -- terraform apply", "terraform apply"),
+        ] {
+            assert_eq!(program(cmd).as_deref(), Some(shown), "{cmd}");
+        }
     }
 
     #[test]
