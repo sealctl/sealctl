@@ -519,7 +519,8 @@ pub fn holder(mountpoint: &Path) -> Option<(String, u64)> {
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Unmounts; a busy volume names the process holding it (exit 11). A refusal that names a
-/// process is reported at once; one that names none is tried again for up to `SETTLE`.
+/// process, or after which the volume's state cannot be read, is reported at once; one that
+/// names none is tried again for up to `SETTLE`.
 /// Callers in the daemon run this off its async threads.
 pub fn close(vol: &Volume, force: bool) -> Result<()> {
     let be = backend(vol.kind);
@@ -538,11 +539,11 @@ pub fn close(vol: &Volume, force: bool) -> Result<()> {
                 format!("Volume {} is busy: {p} (pid {pid}) has files open.", vol.name),
             ));
         }
-        if !be.is_unlocked(vol).unwrap_or(true) {
-            return Ok(());
-        }
-        if force || std::time::Instant::now() + pause > until {
-            return Err(fail(exit::BUSY, format!("Volume {} is busy: {e:#}", vol.name)));
+        // a state that cannot be read is reported at once, as before (SPEC 6.5 step 3)
+        match be.is_unlocked(vol) {
+            Ok(false) => return Ok(()),
+            Ok(true) if !force && std::time::Instant::now() + pause <= until => {}
+            _ => return Err(fail(exit::BUSY, format!("Volume {} is busy: {e:#}", vol.name))),
         }
         log::info!(
             "{}: unmount refused with no process named, trying again: {e:#}",
