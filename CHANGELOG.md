@@ -21,6 +21,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   github.com`, `Open volume safe`, `Back up safe`, `Use 2 secrets for npm test`), names only. The
   answer replaces it: `Signed` or `Approved`, `Declined`, `Expired: nothing was signed`.
 - Level 3 notices are titled sealctl and no longer start with `sealctl:`.
+- protocol.md, Delayed approvals: a level 3 action on the phone (showing the words, deleting
+  the relay data, leaving) can be finished up to an hour after its delay ends, instead of 15
+  minutes: the relay keeps a record with no machine until `releaseAt` + 3,600 s, and a cancel
+  never shortens it. A machine's delayed reply is still kept 900 s (2,400 s once cancelled).
+  The fake relay does the same.
 - The AI agent skill and session line say that signed git commits, `git push` over SSH and `ssh`
   wait silently for approval on the phone, and what `agent refused operation` means, so agents
   no longer look for a prompt on the computer or fall back to unsigned commits. They also commit

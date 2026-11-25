@@ -67,11 +67,12 @@ fn a_reply_with_a_bad_delay_is_refused_first() {
     }
 }
 
-/// protocol.md, Delayed approvals: `expires` is `releaseAt` + 900 s, and a cancel moves it to
-/// `releaseAt` + 2,400 s (the 30-minute plan window plus the 300 s signature window twice).
-/// Cancelled tombstones do not count toward the 4 live records, but 16 records in all is the cap.
+/// protocol.md, Delayed approvals: a record with no machine (an action on the phone) has
+/// `expires` = `releaseAt` + 3,600 s, and a cancel, which moves a machine's record to
+/// `releaseAt` + 2,400 s, never shortens it. Cancelled tombstones do not count toward the 4 live
+/// records, but 16 records in all is the cap.
 #[test]
-fn a_cancelled_record_is_kept_longer_and_counts_toward_sixteen() {
+fn a_cancelled_record_is_kept_and_counts_toward_sixteen() {
     let relay = FakeRelay::start(Options::default());
     let phone = Phone::new(&relay.origin);
     let path = format!("/v1/phones/{}/delayed", phone.id());
@@ -82,19 +83,19 @@ fn a_cancelled_record_is_kept_longer_and_counts_toward_sixteen() {
     let (s, v) = add(0);
     assert_eq!(s, 201);
     let release_at = v["releaseAt"].as_u64().unwrap();
-    assert_eq!(v["expires"].as_u64(), Some(release_at + 900_000));
+    assert_eq!(v["expires"].as_u64(), Some(release_at + 3_600_000));
     rt().block_on(phone.cancel(&rid(0))).unwrap();
     let (s, v) = rt()
         .block_on(phone.call("GET", &format!("{path}/{}", rid(0)), None))
         .unwrap();
     assert_eq!(s, 200);
     assert_eq!(v["state"], "cancelled");
-    assert_eq!(v["expires"].as_u64(), Some(release_at + 2_400_000), "{v}");
+    assert_eq!(v["expires"].as_u64(), Some(release_at + 3_600_000), "{v}");
     let (s, v) = rt().block_on(phone.call("GET", &path, None)).unwrap();
     assert_eq!(s, 200);
     assert_eq!(
         v["delayed"][0]["expires"].as_u64(),
-        Some(release_at + 2_400_000),
+        Some(release_at + 3_600_000),
         "{v}"
     );
 
