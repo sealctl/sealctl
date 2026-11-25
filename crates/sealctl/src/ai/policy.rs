@@ -997,6 +997,8 @@ mod tests {
     fn the_git_signing_line_names_the_phone() {
         assert!(GIT_SIGNING_CONTEXT.contains("phone"));
         assert!(GIT_SIGNING_CONTEXT.contains("agent refused operation"));
+        // agents must not wait for the user's go-ahead before committing
+        assert!(GIT_SIGNING_CONTEXT.contains("without asking first"));
         assert!(!GIT_SIGNING_CONTEXT.contains("  "), "{GIT_SIGNING_CONTEXT}");
     }
 
