@@ -1,7 +1,7 @@
 //! What AI agents may do with secrets — the same rules for every tool. Each tool's hook adapter
 //! (see `mod.rs`) turns these verdicts into that tool's hook output.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -37,6 +37,13 @@ pub fn prompt(text: &str) -> Option<String> {
 
 const PRINT_CREDENTIAL: &str = "printing a credential variable would put it into the conversation.";
 
+const ENV_DUMP: &str =
+    "dumping the environment can reveal secrets. Inspect specific non-secret variables instead.";
+
+const EXPORTED: &str = "listing exported variables can reveal secrets.";
+
+const CREDENTIAL_FILE: &str = "this file holds credentials and must not be read into the conversation. Programs get secrets via `sealctl run -- <command>`.";
+
 /// Ends of variable names that hold where something is, not a credential (`SSH_AUTH_SOCK`,
 /// `SSH_AGENT_PID`, `PASSWORD_STORE_DIR`, `KEY_FILE`): printing them shows no secret.
 const HARMLESS_SUFFIXES: &[&str] = &["_SOCK", "_SOCKET", "_PID", "_DIR", "_PATH", "_FILE"];
@@ -69,12 +76,12 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
     P.get_or_init(|| {
         [
             (
-                r"(?:^|[\s|;&(])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|awk|sed|cut|cp|base64)\s[^|;&]*(?:\.sealed\b|machine\.json|\.local/state/sealctl|\.local/share/sealctl)",
+                r"(?:^|[\s|;&(])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|awk|sed|cut|cp|base64)\s[^|;&\n]*(?:\.sealed\b|machine\.json|\.local/state/sealctl|\.local/share/sealctl)",
                 "sealctl's own files are not for the conversation. Use `sealctl secret ls` for names and `sealctl run` for values.",
             ),
             (
                 r"(?:^|[|;&(`]|\$\()\s*(?:sudo\s+)?(?:printenv|env|set|export\s+-p|declare\s+-x)\s*(?:$|[|;&)>`])",
-                "dumping the environment can reveal secrets. Inspect specific non-secret variables instead.",
+                ENV_DUMP,
             ),
             (
                 r#"\b(?:echo|printf|print)\b[^|;&]*\$\{?[A-Za-z_]*(?:KEY|TOKEN|SECRET|PASSW|PASS|CREDENTIAL|AUTH)[A-Za-z_]*"#,
@@ -86,10 +93,10 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
             ),
             (
                 r"(?:^|[|;&(`]|\$\()\s*(?:export|declare\s+-[a-zA-Z]*[px]|typeset\s+-[a-zA-Z]*x|compgen\s+-v)\s*(?:$|[|;&)>`])",
-                "listing exported variables can reveal secrets.",
+                EXPORTED,
             ),
             (
-                r"(?:os\.environ|process\.env|ENV\.to_h|System\.getenv\(\))(?:\s*\)|\s*$|\s*[;'\x22])",
+                r"(?m)(?:os\.environ|process\.env|ENV\.to_h|System\.getenv\(\)|Deno\.env\.toObject\(\))(?:\s*\)|[ \t]*$|\s*[;'\x22])|%ENV\b",
                 "dumping the whole environment can reveal secrets.",
             ),
             (
@@ -97,8 +104,8 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
                 "this prints a credential.",
             ),
             (
-                r"(?:^|[\s|;&(])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|awk|sed|cut|sort|diff|cp|source|\.)\s[^|;&]*(?:\.aws/credentials|\.npmrc|\.netrc|\.git-credentials|\.docker/config\.json|\.dev\.vars|\.pypirc|\.config/gh/hosts\.yml|\.kube/config|\.env[A-Za-z0-9_.*-]*)(?:$|[\s'\x22;|&)])",
-                "this file holds credentials and must not be read into the conversation. Programs get secrets via `sealctl run -- <command>`.",
+                r"(?:^|[\s|;&('\x22])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|awk|sed|cut|sort|diff|cp|source|\.)\s(?:[^|;&\n]*[\s/'\x22=:<])?(?:\.aws/credentials|\.npmrc|\.netrc|\.git-credentials|\.docker/config\.json|\.dev\.vars|\.pypirc|\.config/gh/hosts\.yml|\.kube/config|\.env[A-Za-z0-9_.*-]*)(?:$|[\s'\x22;|&)])",
+                CREDENTIAL_FILE,
             ),
             (
                 r"<\s*\.env\b",
@@ -113,7 +120,7 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
                 "reading a password from the keychain would put it into the conversation.",
             ),
             (
-                r"(?:^|[\s|;&(])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|ag|awk|sed|cut|sort|source|\.)\s(?:[^|;&]*[\s/'\x22])?\.env(?:rc|\.(?:local|development|production|staging|test|prod|dev))?(?:$|[\s'\x22;|&)])",
+                r"(?:^|[\s|;&('\x22])(?:cat|less|more|head|tail|bat|nl|tac|strings|xxd|od|grep|rg|ag|awk|sed|cut|sort|source|\.)\s(?:[^|;&\n]*[\s/'\x22])?\.env(?:rc|\.(?:local|development|production|staging|test|prod|dev))?(?:$|[\s'\x22;|&)])",
                 "`.env` files hold secrets. Move them into sealctl: `sealctl secret import-env .env --prefix <project> --delete`, then use `sealctl run`.",
             ),
         ]
@@ -139,16 +146,21 @@ pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
 /// [`bash_in`]; `signs`: git signs through sealctl here, so turning signing off or pointing it
 /// elsewhere is denied (elsewhere the user may not sign at all).
 fn bash_check(command: &str, cwd: Option<&str>, signs: bool) -> Option<String> {
+    if let Some(why) = sealctl_check(command, signs) {
+        return Some(format!("sealctl: {why}"));
+    }
+    // quoted here-document bodies that `cat` or `tee` only write to a file nothing else on the
+    // line uses are left out; every other body is checked
+    let (data_only, interpreter) = without_data_bodies(command);
+    // a backslash-newline joins two lines into one command
+    let data_only = data_only.replace("\\\n", "");
     // mentions of example files only: fine
     // `--exclude='.env*'` names a file in order NOT to read it
     static EXCLUDE: OnceLock<Regex> = OnceLock::new();
     let exclude = EXCLUDE.get_or_init(|| Regex::new(r"--exclude(?:-dir|-from)?=\S+").expect("valid"));
-    let mut probe = exclude.replace_all(command, "").into_owned();
+    let mut probe = exclude.replace_all(&data_only, "").into_owned();
     for safe in SAFE_ENV_FILES {
         probe = probe.replace(safe, "EXAMPLE_FILE");
-    }
-    if let Some(why) = sealctl_check(command, signs) {
-        return Some(format!("sealctl: {why}"));
     }
     for (re, why) in deny_patterns() {
         if re.is_match(&probe) {
@@ -157,6 +169,20 @@ fn bash_check(command: &str, cwd: Option<&str>, signs: bool) -> Option<String> {
             }
             return Some(format!("sealctl: {why}"));
         }
+    }
+    // `printenv`, `env`, `export` as commands, also on a line of their own in a body a shell reads
+    if let Some(why) = dumps_environment(&data_only) {
+        return Some(format!("sealctl: {why}"));
+    }
+    // code an interpreter runs (`python3 - <<'EOF'`, `node -e '…'`) opening a `.env` or
+    // credentials file by a quoted path: `open('.env')`, `readFileSync("config/.env.local")`
+    static CODE_OPENS: OnceLock<Regex> = OnceLock::new();
+    let code_opens = CODE_OPENS.get_or_init(|| {
+        Regex::new(r#"['"`](?:[^'"`\s]*/)?(?:\.env(?:rc|\.[A-Za-z0-9_.-]+)?|\.aws/credentials|\.npmrc|\.netrc|\.git-credentials|\.docker/config\.json|\.dev\.vars|\.pypirc|\.config/gh/hosts\.yml|\.kube/config)\\*['"`]"#)
+            .expect("valid")
+    });
+    if interpreter && code_opens.is_match(&probe) {
+        return Some(format!("sealctl: {CREDENTIAL_FILE}"));
     }
     // `grep -r` reads hidden files such as .env (ripgrep skips them by default)
     if let Some(dir) = cwd {
@@ -236,6 +262,260 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
     }
 }
 
+/// Interpreters: programs that run code from an argument (`python3 -c`, `node -e`), from
+/// standard input (`python3 -`, `node`) or from a file. Version suffixes are ignored
+/// (`python3.12`, `pypy3`). Only used to judge whether quoted `.env` paths in a command line are
+/// code that opens them; which here-document bodies are checked does not depend on this list
+/// (see [`writes_to_files`]).
+const INTERPRETERS: &[&str] = &[
+    "python",
+    "pypy",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "tsx",
+    "ts-node",
+    "ruby",
+    "irb",
+    "perl",
+    "php",
+    "lua",
+    "luajit",
+    "Rscript",
+    "julia",
+    "pwsh",
+    "powershell",
+    "tclsh",
+    "jshell",
+    "groovy",
+];
+
+/// The pieces of a word: split at spaces, quotes, `;`, `|`, `&`, `(`, `)`, `` ` ``, `<`, `>` and
+/// `=`, so that a program named inside `sh -c "node -e …"` or a file named in `>out.txt` or
+/// `--file=out.txt` is found.
+fn pieces(word: &str) -> impl Iterator<Item = &str> {
+    word.split(|c: char| c.is_whitespace() || "'\";|&()`<>=".contains(c))
+        .filter(|p| !p.is_empty())
+}
+
+/// The last path component of `path`.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Whether a word of the command line, or a piece of one, names an interpreter.
+fn names_interpreter(cmds: &[Vec<String>]) -> bool {
+    cmds.iter().flatten().flat_map(|w| pieces(w)).any(|p| {
+        let name = file_name(p).trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+        INTERPRETERS.contains(&name)
+    })
+}
+
+/// `NAME=value`.
+fn is_assignment(w: &str) -> bool {
+    w.split_once('=').is_some_and(|(k, _)| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The files a command writes its here-document body to, when it is a known file writer and
+/// the body goes nowhere else: `cat` with its output redirected to a file (`> f`, `>> f`, `>| f`,
+/// `&> f`), or `tee` (also `sudo tee`, `tee -a`) with file arguments. `/dev/null` counts as a
+/// file and is not returned. `None` for anything else: another program, a command whose output
+/// goes on through a pipe (`piped`), a redirection to another descriptor (`>&2`) or a device
+/// (`/dev/stdout`, `/proc/…`), and `tee` whose own output is not redirected while the line has
+/// a pipe, group, subshell or substitution (`flow`) that could pass it on.
+fn writes_to_files(words: &[String], piped: bool, flow: bool) -> Option<Vec<String>> {
+    if piped {
+        return None;
+    }
+    let mut i = 0;
+    while words.get(i).is_some_and(|w| is_assignment(w)) {
+        i += 1;
+    }
+    if words.get(i).is_some_and(|w| file_name(w) == "sudo") {
+        i += 1;
+        while let Some(w) = words.get(i).filter(|w| w.starts_with('-')) {
+            i += if matches!(
+                w.as_str(),
+                "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-r" | "-t" | "-U"
+            ) {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    let prog = file_name(words.get(i)?);
+    if prog != "cat" && prog != "tee" {
+        return None;
+    }
+    let (mut stdout, mut files) = (Vec::new(), Vec::new());
+    let mut j = i + 1;
+    while j < words.len() {
+        let w = &words[j];
+        j += 1;
+        let digits = w.find(|c: char| !c.is_ascii_digit()).unwrap_or(w.len());
+        let (fd, rest) = w.split_at(digits);
+        let op = ["&>>", "&>", ">>", ">|", ">", "<<<", "<>", "<"]
+            .into_iter()
+            .find(|op| rest.starts_with(op));
+        let Some(op) = op else {
+            if prog == "tee" && !(w.starts_with('-') && w.len() > 1) {
+                files.push(w.clone());
+            }
+            continue;
+        };
+        let mut target = rest[op.len()..].to_string();
+        if target.is_empty() {
+            target = words.get(j)?.clone();
+            j += 1;
+        }
+        if op.starts_with('<') || !(op.starts_with('&') || fd.is_empty() || fd == "1") {
+            continue;
+        }
+        if target.starts_with('&') {
+            return None;
+        }
+        stdout.push(target);
+    }
+    let is_file = |t: &String| t == "/dev/null" || !(t.starts_with("/dev/") || t.starts_with("/proc/"));
+    if !stdout.iter().chain(&files).all(is_file) {
+        return None;
+    }
+    let ok = match prog {
+        "cat" => !stdout.is_empty(),
+        _ => !stdout.is_empty() || (!files.is_empty() && !flow),
+    };
+    ok.then(|| {
+        stdout
+            .into_iter()
+            .chain(files)
+            .filter(|t| t != "/dev/null")
+            .collect()
+    })
+}
+
+/// Quoted here-document bodies (see [`parse_commands`]) and what feeds on them.
+#[derive(Default)]
+struct BodyUses {
+    bodies: Vec<BodyUse>,
+    /// The line has a pipe, group, subshell or command substitution outside quotes.
+    flow: bool,
+}
+
+/// A quoted here-document body: the character range it was read from, the words of the
+/// command it is the input of, and whether that command's output goes on through a pipe.
+struct BodyUse {
+    span: (usize, usize),
+    words: Vec<String>,
+    piped: bool,
+}
+
+/// `command` without the bodies of its quoted here-documents (`<<'EOF'`) that are only written
+/// to files (see [`writes_to_files`]) and whose files no other word of the line names: the
+/// body is then data that nothing in the command line reads or runs. Every other body stays and
+/// is checked: one fed to a shell, an interpreter or any other program (`node -`, `awk -f -`,
+/// `make -f -`, `psql`, `gh pr create --body-file -`), piped on, or written to a file the same
+/// line then uses (`cat > d.mjs <<'EOF'` … `node d.mjs`). Unquoted bodies (`<<EOF`, where `$VARS`
+/// and `$(…)` expand) stay, and so do bodies the readings of the line disagree on. Also
+/// whether a word names an interpreter (see [`INTERPRETERS`]).
+fn without_data_bodies(command: &str) -> (String, bool) {
+    let mut all = Vec::new();
+    let mut common: Option<Vec<(usize, usize)>> = None;
+    for (resume, track_case) in READINGS {
+        let mut uses = BodyUses::default();
+        let cmds = parse_commands(command, resume, track_case, true, 0, &mut uses);
+        // how often each file name is named by the line's words
+        let mut named: HashMap<&str, usize> = HashMap::new();
+        for p in cmds.iter().flatten().flat_map(|w| pieces(w)) {
+            *named.entry(file_name(p)).or_default() += 1;
+        }
+        let data: HashSet<(usize, usize)> = uses
+            .bodies
+            .iter()
+            .filter(|b| {
+                writes_to_files(&b.words, b.piped, uses.flow).is_some_and(|files| {
+                    files.iter().all(|f| {
+                        let f = file_name(f);
+                        let own = b
+                            .words
+                            .iter()
+                            .flat_map(|w| pieces(w))
+                            .filter(|p| file_name(p) == f);
+                        named.get(f).copied().unwrap_or(0) <= own.count()
+                    })
+                })
+            })
+            .map(|b| b.span)
+            .collect();
+        common = Some(match common {
+            None => uses
+                .bodies
+                .iter()
+                .map(|b| b.span)
+                .filter(|s| data.contains(s))
+                .collect(),
+            Some(c) => c.into_iter().filter(|s| data.contains(s)).collect(),
+        });
+        all.extend(cmds);
+    }
+    let interpreter = names_interpreter(&all);
+    let spans = common.unwrap_or_default();
+    if spans.is_empty() {
+        return (command.to_string(), interpreter);
+    }
+    // the spans are in order and do not overlap: one pass keeps the text between them
+    let mut kept = String::with_capacity(command.len());
+    let mut next = spans.iter().peekable();
+    for (i, c) in command.chars().enumerate() {
+        while next.peek().is_some_and(|&&(_, end)| end <= i) {
+            next.next();
+        }
+        if !next.peek().is_some_and(|&&(start, _)| start <= i) {
+            kept.push(c);
+        }
+    }
+    (kept, interpreter)
+}
+
+/// Why a command line dumps the environment, if one of its simple commands (see
+/// [`simple_commands`]: bodies fed to a shell are commands too) is `printenv`, `env`, `set`,
+/// `export`, `declare -x` and the like with nothing to run or show. Read as commands, so a line
+/// that is only `env` inside a quoted commit message or a here-document is not one.
+fn dumps_environment(command: &str) -> Option<&'static str> {
+    for (resume, track_case) in READINGS {
+        for words in simple_commands(command, resume, track_case) {
+            let mut i = 0;
+            while words.get(i).is_some_and(|w| is_assignment(w) || is_keyword(w)) {
+                i += 1;
+            }
+            let start = i;
+            if words.get(i).is_some_and(|w| w == "sudo") {
+                i += 1;
+            }
+            let Some(prog) = words.get(i) else { continue };
+            if !matches!(
+                prog.as_str(),
+                "printenv" | "env" | "set" | "export" | "declare" | "typeset" | "compgen"
+            ) {
+                continue;
+            }
+            let line = words[start..].join(" ");
+            if let Some((_, why)) = deny_patterns()
+                .iter()
+                .find(|(re, why)| (*why == ENV_DUMP || *why == EXPORTED) && re.is_match(&line))
+            {
+                return Some(why);
+            }
+        }
+    }
+    None
+}
+
 /// How deeply here-documents inside here-documents (through `$(…)` in an unquoted body) are
 /// read as text; deeper ones are read as commands.
 const HERE_DOC_LEVELS: usize = 3;
@@ -248,6 +528,27 @@ fn read_commands(
     track_case: bool,
     here_docs: bool,
     level: usize,
+) -> Vec<Vec<String>> {
+    parse_commands(
+        text,
+        resume,
+        track_case,
+        here_docs,
+        level,
+        &mut BodyUses::default(),
+    )
+}
+
+/// [`read_commands`], also noting in `data` the bodies of quoted here-documents opened in `text`
+/// itself (not in a nested body), as character ranges of `text`, with the command each one is
+/// the input of; and whether `text` has a pipe, group, subshell or substitution.
+fn parse_commands(
+    text: &str,
+    resume: bool,
+    track_case: bool,
+    here_docs: bool,
+    level: usize,
+    data: &mut BodyUses,
 ) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let mut words: Vec<String> = Vec::new();
@@ -282,7 +583,17 @@ fn read_commands(
             *in_word = false;
         }
     };
-    let end_cmd = |words: &mut Vec<String>, cmds: &mut Vec<Vec<String>>, all_kw: &mut bool| {
+    // the command each pending here-document is the input of, once it has ended, and whether
+    // its output goes on through a pipe
+    let mut owners: Vec<Option<(Vec<String>, bool)>> = Vec::new();
+    let end_cmd = |words: &mut Vec<String>,
+                   cmds: &mut Vec<Vec<String>>,
+                   all_kw: &mut bool,
+                   owners: &mut Vec<Option<(Vec<String>, bool)>>,
+                   piped: bool| {
+        for owner in owners.iter_mut().filter(|o| o.is_none()) {
+            *owner = Some((words.clone(), piped));
+        }
         if !words.is_empty() {
             cmds.push(std::mem::take(words));
         }
@@ -309,13 +620,17 @@ fn read_commands(
         // a newline ending a line that opened here-documents: their bodies follow
         if quote.is_none() && c == '\n' && !pending.is_empty() {
             end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-            end_cmd(&mut words, &mut cmds, &mut all_kw);
+            end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, false);
             let docs = std::mem::take(&mut pending);
+            let fed = std::mem::take(&mut owners);
             // no delimiter line: the text is read as commands, line by line
             if let Some((bodies, end)) = here_bodies(&cs, i + 1, &docs) {
-                for (doc, body) in docs.iter().zip(bodies) {
-                    // an unquoted delimiter: `$(…)` and backquotes in the body still run
-                    if !doc.quoted {
+                for ((doc, (body, span)), owner) in docs.iter().zip(bodies).zip(fed) {
+                    if doc.quoted {
+                        let (words, piped) = owner.unwrap_or_default();
+                        data.bodies.push(BodyUse { span, words, piped });
+                    } else {
+                        // an unquoted delimiter: `$(…)` and backquotes in the body still run
                         // one level deeper; past HERE_DOC_LEVELS, bodies in it are commands,
                         // which keeps the work linear in the text
                         cmds.extend(read_commands(
@@ -347,6 +662,7 @@ fn read_commands(
             if let Some((doc, next)) = here_delimiter(&cs, i + 2) {
                 end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
                 pending.push(doc);
+                owners.push(None);
                 i = next;
                 continue;
             }
@@ -368,16 +684,18 @@ fn read_commands(
                 // a command substitution inside double quotes runs a command too; the quotes
                 // resume after it
                 '`' => {
+                    data.flow = true;
                     quote = None;
                     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, false);
                     open.push(('`', true));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
+                    data.flow = true;
                     quote = None;
                     i += 1;
                     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, false);
                     open.push(('(', true));
                 }
                 c => word.push(c),
@@ -399,25 +717,31 @@ fn read_commands(
                 '&' if i > 0 && matches!(cs[i - 1], '>' | '<') => word.push(c),
                 '&' if cs.get(i + 1) == Some(&'>') => word.push(c),
                 '|' | ';' | '&' | '\n' | '{' | '}' => {
+                    // `|` and `|&` pass output on; `||` does not
+                    let piped = c == '|' && cs.get(i + 1) != Some(&'|') && (i == 0 || cs[i - 1] != '|');
+                    data.flow |= piped || c == '{';
                     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, piped);
                 }
                 '(' => {
+                    data.flow = true;
                     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, false);
                     // the second `(` of `((` or `$((`: arithmetic, where `<<` is a shift
                     let arithmetic = i > 0 && cs[i - 1] == '(';
                     open.push((if arithmetic { 'A' } else { '(' }, false));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
+                    data.flow = true;
                     i += 1;
                     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, false);
                     open.push(('(', false));
                 }
                 ')' | '`' => {
+                    data.flow = true;
                     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-                    end_cmd(&mut words, &mut cmds, &mut all_kw);
+                    end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, false);
                     let opener = if c == ')' { '(' } else { '`' };
                     match open.last() {
                         Some(&(o, dq)) if o == opener || (opener == '(' && o == 'A') => {
@@ -441,7 +765,7 @@ fn read_commands(
         i += 1;
     }
     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
-    end_cmd(&mut words, &mut cmds, &mut all_kw);
+    end_cmd(&mut words, &mut cmds, &mut all_kw, &mut owners, false);
     cmds
 }
 
@@ -535,13 +859,15 @@ fn here_delimiter(cs: &[char], start: usize) -> Option<(HereDoc, usize)> {
 }
 
 /// The bodies of `docs`, read one after another from `start` (the line after the one that
-/// opened them), and the index of the newline ending the last delimiter line (or the end of the
-/// text). `None` when a delimiter line is missing: then the text is read as commands instead.
-fn here_bodies(cs: &[char], start: usize, docs: &[HereDoc]) -> Option<(Vec<String>, usize)> {
+/// opened them), each with the range of `cs` it was read from, and the index of the newline
+/// ending the last delimiter line (or the end of the text). `None` when a delimiter line is
+/// missing: then the text is read as commands instead.
+fn here_bodies(cs: &[char], start: usize, docs: &[HereDoc]) -> Option<HereBodies> {
     let mut bodies = Vec::with_capacity(docs.len());
     let mut i = start;
     for doc in docs {
         let mut body = String::new();
+        let from = i;
         loop {
             if i >= cs.len() {
                 return None;
@@ -557,6 +883,8 @@ fn here_bodies(cs: &[char], start: usize, docs: &[HereDoc]) -> Option<(Vec<Strin
                 &line
             };
             if line == doc.delimiter {
+                // the body ends where the delimiter line starts
+                bodies.push((std::mem::take(&mut body), (from, i)));
                 i = end;
                 break;
             }
@@ -564,7 +892,6 @@ fn here_bodies(cs: &[char], start: usize, docs: &[HereDoc]) -> Option<(Vec<Strin
             body.push('\n');
             i = end + 1;
         }
-        bodies.push(body);
         // the next body starts on the line after this delimiter
         if i < cs.len() {
             i += 1;
@@ -573,6 +900,10 @@ fn here_bodies(cs: &[char], start: usize, docs: &[HereDoc]) -> Option<(Vec<Strin
     // back to the newline ending the last delimiter line (or the text's last character)
     Some((bodies, i - 1))
 }
+
+/// Here-document bodies with the character ranges they were read from, and where reading
+/// stopped (see [`here_bodies`]).
+type HereBodies = (Vec<(String, (usize, usize))>, usize);
 
 /// An unquoted here-document body as the text of a double-quoted word, so that only its
 /// command substitutions read as commands. In such a body a backslash quotes only `$`, `` ` ``,
@@ -1409,6 +1740,301 @@ mod tests {
             "cat <<A\n$(cat <<B\n$(cat <<C\n$(cat <<D\nsealctl buy\nD\n)\nC\n)\nB\n)\nA",
         ] {
             assert!(bash(c).is_some(), "should deny: {c:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_here_documents_written_to_files_are_data() {
+        // a real session: an agent writing a Node script that reads one variable, then running it
+        // through `sealctl run`, was denied as reading a .env file
+        let script = "const KEY = process.env.ELEVENLABS_API_KEY;\n\
+                      const r = await fetch('https://api.elevenlabs.io/v1/voices', \
+                      { headers: { 'xi-api-key': KEY } });\n\
+                      console.log((await r.json()).voices.map(v => v.name));";
+        let real = format!(
+            "cat > voices.mjs <<'EOF'\n{script}\nEOF\n\
+             sealctl run -e ELEVENLABS_API_KEY=voice/elevenlabs -- node voices.mjs"
+        );
+        assert!(bash(&real).is_none(), "should allow: {real:?}: {:?}", bash(&real));
+        for body in [
+            "const a = process.env.FOO;",
+            "const a = process.env.HOME;",
+            "console.log(process.env)",
+            "see the .env file",
+            "Never run `cat .env` or `printenv`; values come from `sealctl run`.",
+            "env\nprintenv\nexport",
+            "x = os.environ\nputs ENV.to_h\nprint %ENV",
+            "data = open('.env').read()",
+        ] {
+            for head in [
+                "cat > v.mjs",
+                "cd /tmp && cat > v.mjs",
+                "S=/tmp; cat > v.mjs",
+                "cd /tmp; cat > v.mjs",
+                "cat >> notes.md",
+                "cat >notes.md",
+                "cat 2>/dev/null > \"$OUT/v.mjs\"",
+                "cat - &> v.mjs",
+                "tee v.mjs >/dev/null",
+                "tee v.mjs",
+                "tee -a notes.md > /dev/null",
+                "sudo tee /etc/app.conf >/dev/null",
+                "sudo -u app tee -a /srv/app/notes.md",
+                "OUT=/tmp/x cat > v.mjs",
+            ] {
+                for quoted in ["'EOF'", "\"EOF\"", "\\EOF"] {
+                    let c = format!("{head} <<{quoted}\n{body}\nEOF");
+                    assert!(bash(&c).is_none(), "should allow: {c:?}: {:?}", bash(&c));
+                }
+            }
+            // the redirection after the operator; then another command
+            let c = format!("cat <<'EOF' > v.mjs\n{body}\nEOF\ngit add v.mjs.bak && ls");
+            assert!(bash(&c).is_none(), "should allow: {c:?}: {:?}", bash(&c));
+            // `cat` writing to a file inside a substitution or a piped group passes nothing on
+            let c = format!(
+                "x=$(cat > v.mjs <<'EOF'\n{body}\nEOF\n)\n{{ cat > w.mjs <<'EOF'\n{body}\nEOF\n}} | wc -l"
+            );
+            assert!(bash(&c).is_none(), "should allow: {c:?}: {:?}", bash(&c));
+        }
+    }
+
+    #[test]
+    fn here_documents_fed_to_anything_else_keep_the_checks() {
+        // only `cat` and `tee` writing to a file make a quoted body data; any other consumer,
+        // known or not, keeps the checks on its body (found by review)
+        for c in [
+            "awk -f - <<'EOF'\nBEGIN { system(\"cat .env\") }\nEOF",
+            "gawk -f /dev/stdin <<'EOF'\nBEGIN { system(\"head -n 1 config/.env\") }\nEOF",
+            "make -f - <<'EOF'\nall:\n\tcat .env\nEOF",
+            "sqlite3 <<'EOF'\n.shell cat .env\nEOF",
+            "/usr/bin/sqlite3 db <<'EOF'\n.shell cat ~/.npmrc\nEOF",
+            "psql <<'EOF'\n\\! cat .env\nEOF",
+            "mysql <<'EOF'\nsystem cat .env\nEOF",
+            "frobnicate --script - <<'EOF'\ncat .env\nEOF",
+            "./tools/run-steps <<'EOF'\ncat ~/.aws/credentials\nEOF",
+            "gh pr create --title t --body-file - <<'EOF'\nthen cat .env\nEOF",
+            "git commit -F - <<'EOF'\nconsole.log(process.env)\nEOF",
+            "git commit -m \"$(cat <<'EOF'\nconsole.log(process.env)\nEOF\n)\"",
+            // `cat` without a file to write to, and `tee` whose output goes on
+            "cat <<'EOF'\ncat .env\nEOF",
+            "cat > /dev/stdout <<'EOF'\ncat .env\nEOF",
+            "cat >&2 <<'EOF'\ncat .env\nEOF",
+            "cat > v.txt <<'EOF' | frobnicate\ncat .env\nEOF",
+            "tee v.txt <<'EOF' | frobnicate\ncat .env\nEOF",
+            "{ tee v.txt <<'EOF'\ncat .env\nEOF\n} | frobnicate",
+            "frobnicate \"$(tee v.txt <<'EOF'\ncat .env\nEOF\n)\"",
+            "tee /dev/stderr <<'EOF'\ncat .env\nEOF",
+            // the written file is used by the same line
+            "cat > x.sh <<'EOF'\ncat .env\nEOF\nchmod +x x.sh && ./x.sh",
+            "cat > d.mjs <<'EOF'\nconsole.log(process.env)\nEOF\nnode d.mjs",
+            "tee lib/d.py >/dev/null <<'EOF'\nprint(open('.env').read())\nEOF\npython3 -m lib.d < lib/d.py",
+            "cat > s.txt <<'EOF'\ncat .env\nEOF\nfrobnicate --steps=s.txt",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c:?}");
+        }
+    }
+
+    #[test]
+    fn an_interpreter_named_inside_a_shell_command_counts() {
+        // the reviewer's open question: `sh -c` text is one word, read piece by piece
+        for c in [
+            "sh -c \"node -e \\\"require('fs').readFileSync('.env')\\\"\"",
+            "sh -c \"node -e \\\"console.log(require('fs').readFileSync('.env', 'utf8'))\\\"\"",
+            "bash -lc 'python3 -c \"print(open(\\\".env\\\").read())\"'",
+            "eval \"python3 -c \\\"print(open('.env').read())\\\"\"",
+            "bash -c 'cat > d.py <<\"EOF\"\nprint(open(\".env\").read())\nEOF\npython3 d.py'",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c:?}");
+        }
+        assert!(bash("sh -c \"node -e 'console.log(process.env.HOME)'\"").is_none());
+    }
+
+    #[test]
+    fn a_line_that_is_only_env_in_a_message_is_text() {
+        for c in [
+            "git commit -m \"Hooks: read commands, not lines\n\nenv\nset\nexport\nprintenv\n\nMore text.\"",
+            "git commit -m 'Notes\n\nenv\n'",
+            "git commit -F - <<'EOF'\nNotes\n\nenv\nprintenv\nEOF",
+            "gh pr create --title t --body \"$(cat <<'EOF'\nSummary\n\nenv\nexport\nEOF\n)\"",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c:?}: {:?}", bash(c));
+        }
+        // as commands they still dump the environment
+        for c in [
+            "git status\nenv",
+            "ls\nprintenv\n",
+            "bash <<'EOF'\nset -e\nenv | sort\nEOF",
+            "sh <<'EOF'\nprintenv\nEOF",
+            "cat <<'EOF' | sh\nexport\nEOF",
+            "echo \"$(env)\"",
+            "sudo printenv",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c:?}");
+        }
+    }
+
+    #[test]
+    fn many_data_here_documents_are_checked_in_bounded_time() {
+        // every quoted body is left out of the file and environment checks in one pass
+        let started = std::time::Instant::now();
+        let mut line = String::new();
+        for k in 0..20_000 {
+            line.push_str(&format!("cat > f{k} <<'E'\nconsole.log(process.env)\nE\n"));
+        }
+        assert!(bash(&line).is_none(), "should allow");
+        line.push_str("printenv\n");
+        assert!(bash(&line).is_some(), "should deny");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(15), "took {took:?}");
+    }
+
+    #[test]
+    fn here_documents_run_as_code_are_still_checked() {
+        for c in [
+            // an interpreter reading its program from the body
+            "node - <<'EOF'\nconsole.log(process.env)\nEOF",
+            "node <<'EOF'\nconsole.log(process.env)\nEOF",
+            "cd /tmp && node - <<'EOF'\nconsole.log(process.env)\nEOF",
+            "python3 - <<'EOF'\nimport os\nprint(os.environ)\nEOF",
+            "/usr/bin/python3.12 - <<'EOF'\nimport os\nx = os.environ\nprint(x)\nEOF",
+            "python3 - <<'EOF'\nprint(open('.env').read())\nEOF",
+            "python3 - <<'EOF'\nprint(open(\"config/.env.local\").read())\nEOF",
+            "ruby <<'EOF'\nputs ENV.to_h\nEOF",
+            "perl <<'EOF'\nprint %ENV\nEOF",
+            "deno run - <<'EOF'\nconsole.log(Deno.env.toObject())\nEOF",
+            "node - <<'EOF'\nconsole.log(require('fs').readFileSync('.env', 'utf8'))\nEOF",
+            "cat <<'EOF' | python3 -\nprint(open('.env').read())\nEOF",
+            // a script written and run by the same command line
+            "cat > d.mjs <<'EOF'\nconsole.log(process.env)\nEOF\nnode d.mjs",
+            "cat > d.py <<'EOF'\nprint(open('.env').read())\nEOF\npython3 d.py",
+            // a shell reading the body as commands
+            "bash <<'EOF'\ncat .env\nEOF",
+            "sh <<'EOF'\nprintenv\nEOF",
+            "bash <<'EOF'\nset -e\nenv | sort\nEOF",
+            "cat <<'EOF' | sh\nexport\nEOF",
+            "bash <<'EOF'\necho $API_KEY\nEOF",
+            // inline code
+            "node -e 'console.log(process.env)'",
+            "node -e \"console.log(require('fs').readFileSync('.env', 'utf8'))\"",
+            "python3 -c \"print(open('.env').read())\"",
+            "python3 -c 'import os; print(open(os.path.expanduser(\"~/.aws/credentials\")).read())'",
+            // an unquoted body is checked as before: its variables and substitutions expand
+            "cat > v.mjs <<EOF\nconsole.log(process.env)\nEOF",
+            "cat <<EOF\n$(cat .env)\nEOF",
+            // nested here-documents deeper than HERE_DOC_LEVELS
+            "cat <<A\n$(cat <<B\n$(cat <<C\n$(cat <<D\ncat .env\nD\n)\nC\n)\nB\n)\nA",
+            "cat <<A\n$(cat <<B\n$(cat <<C\n$(cat <<D\nprintenv\nD\n)\nC\n)\nB\n)\nA",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c:?}");
+        }
+        // the same programs naming one variable, or files that hold no secret
+        for c in [
+            "node - <<'EOF'\nconst a = process.env.FOO;\nconsole.log(a)\nEOF",
+            "python3 - <<'EOF'\nimport os\nprint(os.environ[\"HOME\"], os.environ.get('PATH'))\nEOF",
+            "python3 - <<'EOF'\nprint(open('.env.example').read())\nEOF",
+            "node -e 'console.log(process.env.HOME)'",
+            "node -e \"console.log(process.env['HOME'])\"",
+            "python3 -c 'import os; print(os.environ.get(\"HOME\"))'",
+            "cat > v.mjs <<EOF\nconst a = process.env.FOO;\nEOF",
+            "cat > v.mjs <<EOF\nsee the .env file\nEOF",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c:?}: {:?}", bash(c));
+        }
+    }
+
+    #[test]
+    fn dotenv_files_are_matched_as_paths_not_substrings() {
+        for c in [
+            "cat .env",
+            "cat config/.env",
+            "cat ./.env.local",
+            "cat \"$HOME/app/.env\"",
+            "grep KEY .env.production",
+            "head -n 3 .envrc",
+            "cp .env /tmp/x",
+            "cat \\\n.env",
+            "printenv",
+            "env",
+            "echo $API_KEY",
+            "cat ~/.aws/credentials",
+            "cat ~/.npmrc",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c:?}");
+        }
+        for c in [
+            "grep -n process.env src/app.js",
+            "rg 'process.env.FOO' src",
+            "cat src/process.env.ts",
+            "head -n 5 lib/os.env.py",
+            "grep -n os.environ app.py",
+            "cat README.md\nls .env",
+            "cat .env.example",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c:?}: {:?}", bash(c));
+        }
+    }
+
+    #[test]
+    fn references_to_a_secret_are_not_secrets() {
+        // `{eq}` keeps these lines from reading as secrets to a hook guarding this file's edits
+        let (pe, eq) = ("process.env", " = ");
+        for line in [
+            format!("const KEY{eq}{pe}.ELEVENLABS_API_KEY"),
+            format!("const KEY{eq}{pe}.ELEVENLABS_API_KEY;"),
+            format!("const API_KEY{eq}{pe}.ELEVENLABS_API_KEY"),
+            format!("const API_KEY{eq}{pe}.ELEVENLABS_API_KEY;"),
+            format!("const apiKey{eq}{pe}[\"ELEVENLABS_API_KEY\"]"),
+            format!("api_key{eq}os.environ[\"ELEVENLABS_API_KEY\"]"),
+            format!("api_key{eq}os.getenv(\"ELEVENLABS_API_KEY\")"),
+            format!("token{eq}ENV[\"GITHUB_TOKEN_FOR_DEPLOYS\"]"),
+            format!("String apiKey{eq}System.getenv(\"ELEVENLABS_API_KEY\");"),
+            format!("let api_key{eq}std::env::var(\"ELEVENLABS_API_KEY\")?;"),
+            "API_KEY=${ELEVENLABS_API_KEY_FROM_ENV}".into(),
+            "API_KEY=$ELEVENLABS_API_KEY_FROM_ENV".into(),
+            format!("secret{eq}this.configService.getElevenLabsApiKey()"),
+            format!("api_key{eq}settings.elevenlabs.api_key_value"),
+            format!("apiKey{eq}import.meta.env.VITE_ELEVENLABS_API_KEY,"),
+            format!("auth_token{eq}config.v2.github.deployToken"),
+        ] {
+            let found = write("voices.mjs", &line);
+            assert!(found.is_none(), "should allow: {line:?}: {found:?}");
+            assert!(prompt(&line).is_none(), "should allow: {line:?}");
+            let c = format!("cat > voices.mjs <<'EOF'\n{line}\nEOF");
+            assert!(bash(&c).is_none(), "should allow: {c:?}: {:?}", bash(&c));
+        }
+        // the Node script from the report, as the Write tool sends it
+        let script = format!(
+            "const KEY{eq}{pe}.ELEVENLABS_API_KEY\n\
+             const api = (p) => fetch('https://api.elevenlabs.io' + p, {{ headers: {{ 'xi-api-key': KEY }} }})\n\
+             console.log(await (await api('/v1/voices')).json())\n"
+        );
+        assert!(
+            write("voices.mjs", &script).is_none(),
+            "{:?}",
+            write("voices.mjs", &script)
+        );
+        // literal values still count, quoted or not, with or without `;`
+        let value = ["xK9fQ2mZ", "7pL4vR8t", "W1nB6cY3"].concat();
+        let jwt = [
+            "eyJhbGciOiJIUzI1NiJ9",
+            ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+            ".dozjgNryP4J3jVmNHl0w5NXgL0n3I9PlFUP0THsR8U",
+        ]
+        .concat();
+        for line in [
+            format!("OPENAI_API_KEY={value}"),
+            format!("OPENAI_API_KEY={value};"),
+            format!("const API_KEY{eq}\"{value}\""),
+            format!("const API_KEY{eq}'{value}';"),
+            format!("api_key: {value}"),
+            format!("token{eq}{jwt}"),
+            format!("const API_KEY{eq}'{pe}.{value}'"),
+            format!("const API_KEY{eq}{value}.toString()"),
+        ] {
+            assert!(write("voices.mjs", &line).is_some(), "should deny: {line:?}");
+            assert!(prompt(&line).is_some(), "should block: {line:?}");
+            let c = format!("cat > voices.mjs <<'EOF'\n{line}\nEOF");
+            assert!(bash(&c).is_some(), "should deny: {c:?}");
         }
     }
 

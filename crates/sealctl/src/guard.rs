@@ -216,15 +216,61 @@ pub fn mask_command(text: &str) -> String {
     out.as_str().to_owned()
 }
 
+/// Whether a word reads like a name someone wrote (`process`, `ELEVENLABS_API_KEY`,
+/// `getApiKey`, `v2`) rather than random characters: few switches between lower and upper case
+/// or between letters and digits for its length, as random tokens have many.
+fn reads_like_a_name(word: &str) -> bool {
+    let mut switches = 0;
+    let mut prev: Option<char> = None;
+    for c in word.chars() {
+        if let Some(p) = prev {
+            if (p.is_ascii_lowercase() && c.is_ascii_uppercase())
+                || (p.is_ascii_alphabetic() && c.is_ascii_digit())
+                || (p.is_ascii_digit() && c.is_ascii_alphabetic())
+            {
+                switches += 1;
+            }
+        }
+        prev = Some(c);
+    }
+    switches <= 2 || switches * 4 <= word.len()
+}
+
+/// Whether the generic `key = value` match at `start..end` of `text` is a reference to a value
+/// kept elsewhere rather than the value itself: an unquoted dotted name
+/// (`process.env.OPENAI_API_KEY`, `settings.stripe.secret_key`) or a name that is called or
+/// indexed (`os.getenv(`, `process.env[`, `ENV[`). Every part must read like a name, so a
+/// dotted token (a JWT, a SendGrid key) still counts as a secret, and so does any quoted value.
+/// `$NAME` and `${NAME}` never match the value pattern in the first place.
+fn is_reference(text: &str, start: usize, end: usize) -> bool {
+    if text[..start].ends_with(['"', '\'', '`']) {
+        return false;
+    }
+    let value = text[start..end].trim_end_matches('.');
+    let called = text[end..].starts_with(['(', '[']);
+    let parts: Vec<&str> = value.split('.').collect();
+    (parts.len() > 1 || called)
+        && parts.iter().all(|p| {
+            p.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && reads_like_a_name(p)
+        })
+}
+
 /// Secret-looking strings in `text`. Known token formats always count; a generic
-/// `key = value` only when the value looks random (so `password = hunter2` or a path doesn't).
+/// `key = value` only when the value looks random (so `password = hunter2` or a path doesn't)
+/// and is not a reference to a value kept elsewhere (`process.env.OPENAI_API_KEY`).
 pub fn find_secrets(text: &str) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
     for (kind, re) in patterns() {
         for cap in re.captures_iter(text) {
             let m = cap.get(1).unwrap_or_else(|| cap.get(0).expect("match"));
             let s = m.as_str();
-            if *kind == "credential" && (entropy(s) < 3.5 || s.contains('/') && !s.contains('+')) {
+            if *kind == "credential"
+                && (entropy(s) < 3.5
+                    || s.contains('/') && !s.contains('+')
+                    || is_reference(text, m.start(), m.end()))
+            {
                 continue;
             }
             let f = Finding {
