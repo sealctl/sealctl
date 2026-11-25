@@ -133,6 +133,12 @@ const SAFE_ENV_FILES: &[&str] = &[
 
 /// A shell command the agent wants to run (`cwd`: where it runs, if known).
 pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
+    bash_check(command, cwd, crate::git::signs_through_sealctl())
+}
+
+/// [`bash_in`]; `signs`: git signs through sealctl here, so turning signing off or pointing it
+/// elsewhere is denied (elsewhere the user may not sign at all).
+fn bash_check(command: &str, cwd: Option<&str>, signs: bool) -> Option<String> {
     // mentions of example files only: fine
     // `--exclude='.env*'` names a file in order NOT to read it
     static EXCLUDE: OnceLock<Regex> = OnceLock::new();
@@ -141,7 +147,7 @@ pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
     for safe in SAFE_ENV_FILES {
         probe = probe.replace(safe, "EXAMPLE_FILE");
     }
-    if let Some(why) = sealctl_check(command) {
+    if let Some(why) = sealctl_check(command, signs) {
         return Some(format!("sealctl: {why}"));
     }
     for (re, why) in deny_patterns() {
@@ -613,18 +619,18 @@ const MAX_COMMAND_BYTES: usize = 1 << 20;
 /// The work is bounded: every parse of every reading, at every nesting level, is paid for from
 /// one budget of characters that grows linearly with the command's length; when it runs out the
 /// command is denied as too complex to check.
-fn sealctl_check(command: &str) -> Option<&'static str> {
+fn sealctl_check(command: &str, signs: bool) -> Option<&'static str> {
     // Longer than any command line a shell accepts (execve limits): denied, so the check stays
     // well inside the hook's timeout for any input.
     if command.len() > MAX_COMMAND_BYTES {
         return Some(TOO_COMPLEX);
     }
     let mut budget = command.len().saturating_mul(32).saturating_add(1 << 20);
-    sealctl_in(command, 0, &mut budget)
+    sealctl_in(command, 0, &mut budget, signs)
 }
 
 /// Why a command line may not run (`budget`: characters left to parse, shared by the recursion).
-fn sealctl_in(text: &str, depth: usize, budget: &mut usize) -> Option<&'static str> {
+fn sealctl_in(text: &str, depth: usize, budget: &mut usize, signs: bool) -> Option<&'static str> {
     if depth > MAX_DEPTH {
         return Some(TOO_COMPLEX);
     }
@@ -647,13 +653,13 @@ fn sealctl_in(text: &str, depth: usize, budget: &mut usize) -> Option<&'static s
     }
     distinct
         .iter()
-        .find_map(|words| sealctl_argv(words, depth, budget))
+        .find_map(|words| sealctl_argv(words, depth, budget, signs))
 }
 
 /// The same for one command's words: the program is found past variable assignments, shell
 /// keywords and wrappers (`env`, `command`, `sudo`, `xargs`, …), at any path; `sh -c` and `eval`
 /// are looked into, and so is the command `sealctl run` starts.
-fn sealctl_argv(words: &[String], depth: usize, budget: &mut usize) -> Option<&'static str> {
+fn sealctl_argv(words: &[String], depth: usize, budget: &mut usize, signs: bool) -> Option<&'static str> {
     if depth > MAX_DEPTH {
         return Some(TOO_COMPLEX);
     }
@@ -678,18 +684,32 @@ fn sealctl_argv(words: &[String], depth: usize, budget: &mut usize) -> Option<&'
     if words[..i].iter().any(|w| names_switch(w)) {
         return Some(SWITCH);
     }
+    if signs && git_env_signing(&assignments(&words[..i])) {
+        return Some(SIGNING_OFF);
+    }
     let prog = words.get(i)?;
     let base = prog.rsplit('/').next().unwrap_or(prog);
     let rest = &words[i + 1..];
     if matches!(
         base,
         "export" | "unset" | "env" | "declare" | "typeset" | "local" | "readonly" | "unsetenv" | "setenv"
-    ) && rest.iter().any(|w| names_switch(w))
-    {
-        return Some(SWITCH);
+    ) {
+        if rest.iter().any(|w| names_switch(w)) {
+            return Some(SWITCH);
+        }
+        let mut set = assignments(rest);
+        if base == "setenv" {
+            // csh: `setenv NAME value`
+            if let [name, value, ..] = rest {
+                set.push((name.as_str(), value.as_str()));
+            }
+        }
+        if signs && git_env_signing(&set) {
+            return Some(SIGNING_OFF);
+        }
     }
     if base == "git" {
-        return git_credential(rest);
+        return git_credential(rest).or_else(|| if signs { git_signing(rest) } else { None });
     }
     // options of a wrapper that take a value
     let wrapper_value_opts: &[&str] = match base {
@@ -705,10 +725,10 @@ fn sealctl_argv(words: &[String], depth: usize, budget: &mut usize) -> Option<&'
             let c = rest
                 .iter()
                 .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))?;
-            return sealctl_in(rest.get(c + 1)?, depth + 1, budget);
+            return sealctl_in(rest.get(c + 1)?, depth + 1, budget, signs);
         }
-        "eval" => return sealctl_in(&rest.join(" "), depth + 1, budget),
-        "sealctl" => return sealctl_args(rest, depth, budget),
+        "eval" => return sealctl_in(&rest.join(" "), depth + 1, budget, signs),
+        "sealctl" => return sealctl_args(rest, depth, budget, signs),
         _ => return None,
     };
     let mut j = 0;
@@ -730,7 +750,7 @@ fn sealctl_argv(words: &[String], depth: usize, budget: &mut usize) -> Option<&'
     if base == "timeout" && j < rest.len() {
         j += 1;
     }
-    sealctl_argv(rest.get(j..)?, depth + 1, budget)
+    sealctl_argv(rest.get(j..)?, depth + 1, budget, signs)
 }
 
 /// `git credential fill` and `git credential-<helper> get` print the stored password or token.
@@ -761,6 +781,203 @@ fn git_credential(args: &[String]) -> Option<&'static str> {
     )
 }
 
+/// Where git signs through sealctl, each signature asks the phone: that request is the user's
+/// approval, so turning signing off or pointing it at another program or key is the user's call.
+const SIGNING_OFF: &str = "turning off or redirecting git signing would skip the phone; only the user changes it. Commit as usual: the phone request is the approval.";
+
+/// Whether setting the git config `key` to `value` (`None`: removed, or a value not known here)
+/// turns commit or tag signing off, or points it away from sealctl's program and key. Keys are
+/// compared without case, as git does for sections and names.
+fn changes_signing(key: &str, value: Option<&str>) -> bool {
+    let key = key.to_ascii_lowercase();
+    let value = value.map(|v| v.trim().to_ascii_lowercase());
+    match key.as_str() {
+        // git reads true, yes, on and a non-zero number as true; anything else is off (or an error)
+        "commit.gpgsign" | "tag.gpgsign" => !value
+            .as_deref()
+            .is_some_and(|v| matches!(v, "true" | "yes" | "on") || v.parse::<i64>().is_ok_and(|n| n != 0)),
+        "gpg.format" => value.as_deref() != Some("ssh"),
+        "gpg.ssh.program" | "user.signingkey" => true,
+        // an alias that commits or tags unsigned (`alias.ci=commit --no-gpg-sign`)
+        k if k.starts_with("alias.") => value.is_none_or(|v| {
+            [
+                "--no-g",
+                "--no-sign",
+                "gpgsign",
+                "gpg.format",
+                "gpg.ssh.program",
+                "signingkey",
+            ]
+            .iter()
+            .any(|s| v.contains(s))
+        }),
+        _ => false,
+    }
+}
+
+/// A `-c` setting, `key=value` (a key alone means true).
+fn setting_changes_signing(setting: &str) -> bool {
+    match setting.split_once('=') {
+        Some((key, value)) => changes_signing(key, Some(value)),
+        None => changes_signing(setting, Some("true")),
+    }
+}
+
+/// The `NAME=value` words among `words`.
+fn assignments(words: &[String]) -> Vec<(&str, &str)> {
+    words.iter().filter_map(|w| w.split_once('=')).collect()
+}
+
+/// Environment assignments that set signing config for git: `GIT_CONFIG_KEY_<n>`, read with its
+/// `GIT_CONFIG_VALUE_<n>` when that is set alongside, and `GIT_CONFIG_PARAMETERS` (what `-c`
+/// passes on).
+fn git_env_signing(set: &[(&str, &str)]) -> bool {
+    set.iter().any(|(name, value)| {
+        if let Some(n) = name.strip_prefix("GIT_CONFIG_KEY_") {
+            let paired = format!("GIT_CONFIG_VALUE_{n}");
+            let v = set.iter().find(|(k, _)| *k == paired).map(|(_, v)| *v);
+            changes_signing(value, v)
+        } else if *name == "GIT_CONFIG_PARAMETERS" {
+            let v = value.to_ascii_lowercase();
+            ["gpgsign", "gpg.format", "gpg.ssh.program", "signingkey"]
+                .iter()
+                .any(|k| v.contains(k))
+        } else {
+            false
+        }
+    })
+}
+
+/// Whether `w` is `long` or an abbreviation of it git accepts, at least `min` characters long.
+fn abbreviates(w: &str, long: &str, min: usize) -> bool {
+    w.len() >= min && long.starts_with(w)
+}
+
+/// `git` turning commit or tag signing off or away from sealctl: `-c` and `--config-env`
+/// settings before the subcommand, `--no-gpg-sign` (`commit`, `merge`, `rebase`, …),
+/// `tag --no-sign`, and `git config` writing or removing the signing settings.
+fn git_signing(args: &[String]) -> Option<&'static str> {
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        match w {
+            "-c" => {
+                if args.get(i + 1).is_some_and(|s| setting_changes_signing(s)) {
+                    return Some(SIGNING_OFF);
+                }
+                i += 2;
+            }
+            // `--config-env=<key>=<variable>`: the value comes from a variable not known here
+            _ if w == "--config-env" || w.starts_with("--config-env=") => {
+                let setting = match w.strip_prefix("--config-env=") {
+                    Some(s) => Some(s),
+                    None => {
+                        i += 1;
+                        args.get(i).map(String::as_str)
+                    }
+                };
+                let key = setting.map(|s| s.split_once('=').map_or(s, |(k, _)| k));
+                if key.is_some_and(|k| changes_signing(k, None)) {
+                    return Some(SIGNING_OFF);
+                }
+                i += 1;
+            }
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" => i += 2,
+            _ if w.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    let sub = args.get(i)?.as_str();
+    let rest = &args[i + 1..];
+    let mut options = rest.iter().map(String::as_str).take_while(|w| *w != "--");
+    let off = match sub {
+        "config" => config_changes_signing(rest),
+        // git takes any unambiguous start of a long option
+        "tag" => options.any(|w| abbreviates(w, "--no-sign", 7) || abbreviates(w, "--no-gpg-sign", 6)),
+        _ => options.any(|w| abbreviates(w, "--no-gpg-sign", 6)),
+    };
+    off.then_some(SIGNING_OFF)
+}
+
+/// `git config <args>` writing, removing or editing a signing setting. Reading (`--get`, `-l`,
+/// `get`, `list`, one key alone) changes nothing.
+fn config_changes_signing(args: &[String]) -> bool {
+    let mut pos: Vec<&str> = Vec::new();
+    let (mut unset, mut section, mut edit, mut read) = (false, false, false, false);
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        i += 1;
+        if w == "--" {
+            pos.extend(args[i..].iter().map(String::as_str));
+            break;
+        }
+        if !w.starts_with('-') || w == "-" {
+            pos.push(w);
+            continue;
+        }
+        // options that take the next word as their value, also abbreviated
+        if matches!(w, "-f" | "-t")
+            || ["--file", "--blob", "--type", "--default", "--comment", "--value"]
+                .iter()
+                .any(|long| abbreviates(w, long, 3))
+        {
+            i += 1;
+        } else if w == "-e" || abbreviates(w, "--edit", 3) {
+            edit = true;
+        } else if abbreviates(w, "--unset", 4) || abbreviates(w, "--unset-all", 4) {
+            unset = true;
+        } else if abbreviates(w, "--remove-section", 4) || abbreviates(w, "--rename-section", 4) {
+            section = true;
+        } else if w == "-l"
+            || abbreviates(w, "--list", 3)
+            || [
+                "--get",
+                "--get-all",
+                "--get-regexp",
+                "--get-urlmatch",
+                "--get-color",
+                "--get-colorbool",
+            ]
+            .iter()
+            .any(|long| abbreviates(w, long, 4))
+        {
+            read = true;
+        }
+    }
+    // sections that hold signing settings (`gpg.ssh` holds `gpg.ssh.program`)
+    let signing_section = |s: &str| {
+        matches!(
+            s.to_ascii_lowercase().as_str(),
+            "commit" | "tag" | "gpg" | "gpg.ssh" | "user"
+        )
+    };
+    // the subcommand form (git 2.46): `git config set|unset|edit|remove-section|… …`
+    match pos.first().copied() {
+        Some("edit") => return true,
+        Some("set") => return pos[1..].windows(2).any(|kv| changes_signing(kv[0], Some(kv[1]))),
+        Some("unset") => return pos[1..].iter().any(|k| changes_signing(k, None)),
+        Some("remove-section" | "rename-section") => return pos[1..].iter().any(|s| signing_section(s)),
+        Some("get" | "list" | "get-color" | "get-colorbool") => return false,
+        _ => {}
+    }
+    if edit {
+        true
+    } else if unset {
+        // any positional, so an option value not known here cannot hide the key
+        pos.iter().any(|k| changes_signing(k, None))
+    } else if section {
+        pos.iter().any(|s| signing_section(s))
+    } else if read {
+        false
+    } else {
+        // `git config <key> <value>` (also `--add`, `--replace-all`); a key alone reads it. Every
+        // pair of neighbours is looked at, so an option value not known here cannot shift the key
+        // out of place.
+        pos.windows(2).any(|kv| changes_signing(kv[0], Some(kv[1])))
+    }
+}
+
 fn is_keyword(w: &str) -> bool {
     matches!(
         w,
@@ -770,7 +987,7 @@ fn is_keyword(w: &str) -> bool {
 
 /// sealctl's arguments: its global options are skipped, the first word left is the subcommand,
 /// and the next one its own subcommand (`secret get`, `git credential`).
-fn sealctl_args(args: &[String], depth: usize, budget: &mut usize) -> Option<&'static str> {
+fn sealctl_args(args: &[String], depth: usize, budget: &mut usize, signs: bool) -> Option<&'static str> {
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() && positional.len() < 2 {
@@ -802,8 +1019,15 @@ fn sealctl_args(args: &[String], depth: usize, budget: &mut usize) -> Option<&'s
                     _ => break,
                 }
             }
-            return sealctl_argv(args.get(j..)?, depth + 1, budget);
+            return sealctl_argv(args.get(j..)?, depth + 1, budget, signs);
         }
+    }
+    // `sealctl git setup --undo` removes the signing settings `setup` made
+    if signs
+        && positional == ["git", "setup"]
+        && args.iter().take_while(|w| *w != "--").any(|w| w == "--undo")
+    {
+        return Some(SIGNING_OFF);
     }
     denied_verb(positional.first()?, positional.get(1).copied())
 }
@@ -992,6 +1216,12 @@ pub const GIT_SIGNING_CONTEXT: &str = "Signed git commits and tags, git push ove
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The checks as where git signs through sealctl (the stricter case, so every allowed
+    /// command below is also checked against the signing rule), without looking at the real HOME.
+    fn bash(command: &str) -> Option<String> {
+        bash_check(command, None, true)
+    }
 
     #[test]
     fn the_git_signing_line_names_the_phone() {
@@ -1354,11 +1584,11 @@ mod tests {
         // when the budget runs out, the command is denied
         let mut budget = 100;
         assert_eq!(
-            sealctl_in(&"echo hello ".repeat(10), 0, &mut budget),
+            sealctl_in(&"echo hello ".repeat(10), 0, &mut budget, true),
             Some(TOO_COMPLEX)
         );
         let mut budget = 1000;
-        assert_eq!(sealctl_in(&"echo hello ".repeat(10), 0, &mut budget), None);
+        assert_eq!(sealctl_in(&"echo hello ".repeat(10), 0, &mut budget, true), None);
     }
 
     #[test]
@@ -1388,6 +1618,178 @@ mod tests {
             "export PATH=$PATH:/x",
         ] {
             assert!(bash(c).is_none(), "should allow: {c}: {:?}", bash(c));
+        }
+    }
+
+    #[test]
+    fn turning_git_signing_off_is_denied_where_git_signs_through_sealctl() {
+        let deny = [
+            // `-c` before the subcommand, any case, any false value
+            "git -c commit.gpgsign=false commit -m x",
+            "git -c commit.gpgSign=no commit -m x",
+            "git -c commit.gpgsign=off commit -m x",
+            "git -c commit.gpgsign=0 commit -m x",
+            "git -c commit.gpgsign= commit -m x",
+            "git -c COMMIT.GPGSIGN=False commit -m x",
+            "git -c tag.gpgsign=false tag -a v1 -m x",
+            "git -c Tag.GpgSign=no tag v1",
+            "git -C repo -c commit.gpgsign=false commit -m x",
+            "git --no-pager -c user.name=x -c commit.gpgsign=false commit -m x",
+            "git --git-dir .git -c commit.gpgsign=false commit -m x",
+            "git -c gpg.ssh.program=ssh-keygen commit -m x",
+            "git -c gpg.format=openpgp commit -m x",
+            "git -c user.signingKey=~/.ssh/id_ed25519.pub commit -m x",
+            "git --config-env=commit.gpgsign=OFF commit -m x",
+            "git --config-env commit.gpgsign=OFF commit -m x",
+            "git -c alias.ci='commit --no-gpg-sign' ci -m x",
+            // `--no-gpg-sign` and its abbreviations, on any subcommand; `tag --no-sign`
+            "git commit --no-gpg-sign -m x",
+            "git commit -m x --no-gpg-sign",
+            "git commit --no-gpg -m x",
+            "git commit -am x --no-g",
+            "git rebase --no-gpg-sign main",
+            "git merge --no-gpg-sign topic",
+            "git cherry-pick --no-gpg-sign abc123",
+            "git tag --no-sign -a v1 -m x",
+            // `git config` writing, removing or editing a signing setting, in any scope or file
+            "git config commit.gpgsign false",
+            "git config --global commit.gpgSign no",
+            "git config --local commit.gpgsign off",
+            "git config --worktree commit.gpgsign 0",
+            "git config --system tag.gpgsign false",
+            "git config --global --type=bool commit.gpgsign false",
+            "git config -t bool commit.gpgsign false",
+            "git config --ty bool commit.gpgsign false",
+            "git config --fil ~/.gitconfig commit.gpgsign false",
+            "git config set -t bool commit.gpgsign false",
+            "git config --comment why --global commit.gpgsign false",
+            "git config --unknown-option x commit.gpgsign false",
+            "git config --unset --unknown-option x commit.gpgsign",
+            "git config --file ~/.gitconfig commit.gpgsign false",
+            "git config -f ~/.gitconfig tag.gpgsign false",
+            "git config --file=.git/config commit.gpgsign false",
+            "git config --global --add commit.gpgsign false",
+            "git config --global --replace-all commit.gpgsign false",
+            "git config --unset commit.gpgsign",
+            "git config --global --unset tag.gpgsign",
+            "git config --unset-all commit.gpgsign",
+            "git config --global --unset-a commit.gpgsign",
+            "git config --global --remove-section commit",
+            "git config --remove-section gpg.ssh",
+            "git config --global --rename-section commit old",
+            "git config --global --edit",
+            "git config -e",
+            "git config set commit.gpgsign false",
+            "git config set --global tag.gpgSign no",
+            "git config unset --global commit.gpgsign",
+            "git config unset --all tag.gpgsign",
+            "git config remove-section --global gpg",
+            "git config edit --global",
+            "git config gpg.format openpgp",
+            "git config --global gpg.format x509",
+            "git config --global gpg.ssh.program /usr/bin/ssh-keygen",
+            "git config --global --unset gpg.ssh.program",
+            "git config user.signingkey ~/.ssh/id_ed25519.pub",
+            "git config --global user.signingKey 'key::ssh-ed25519 AAAA'",
+            "git config --global --unset user.signingkey",
+            "git config --global alias.ci 'commit --no-gpg-sign'",
+            // git's config variables
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false git commit -m x",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgSign GIT_CONFIG_VALUE_0=no git commit -m x",
+            "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=off git tag v1",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=gpg.ssh.program GIT_CONFIG_VALUE_0=ssh-keygen git commit",
+            "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.signingkey GIT_CONFIG_VALUE_0=x",
+            "export GIT_CONFIG_KEY_0=commit.gpgsign",
+            "declare -x GIT_CONFIG_KEY_1=gpg.format",
+            "setenv GIT_CONFIG_KEY_0 commit.gpgsign",
+            "GIT_CONFIG_PARAMETERS=\"'commit.gpgsign'='false'\" git commit -m x",
+            // sealctl's own undo
+            "sealctl git setup --undo",
+            "sealctl git setup --local --undo",
+            // through wrappers, shells, eval and substitutions
+            "env git -c commit.gpgsign=false commit -m x",
+            "/usr/bin/git -c commit.gpgsign=false commit -m x",
+            "command git commit --no-gpg-sign -m x",
+            "sudo git config --system commit.gpgsign false",
+            "sudo GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=0 git commit",
+            "sh -c 'git -c commit.gpgsign=false commit -m x'",
+            "bash -lc \"git commit --no-gpg-sign -m x\"",
+            "sh -c 'git config --global --unset commit.gpgsign'",
+            "eval git -c commit.gpgsign=false commit -m x",
+            "eval 'git config commit.gpgsign false'",
+            "echo \"$(git -c commit.gpgsign=false commit -m x)\"",
+            "x=$(git config --global gpg.format openpgp)",
+            "x=`git commit --no-gpg-sign -m x`",
+            "cd repo && git add . && git -c commit.gpgsign=false commit -m x",
+            "git status; git commit --no-gpg-sign -m x",
+            "sealctl run -- git commit --no-gpg-sign -m x",
+            "bash <<'EOF'\ngit -c commit.gpgsign=false commit -m x\nEOF",
+        ];
+        for c in deny {
+            let why = bash_check(c, None, true);
+            assert_eq!(
+                why.as_deref(),
+                Some(format!("sealctl: {SIGNING_OFF}").as_str()),
+                "should deny: {c:?}"
+            );
+        }
+        // where git does not sign through sealctl, the user may not sign at all
+        for c in deny {
+            assert!(
+                bash_check(c, None, false).is_none(),
+                "should allow without sealctl signing: {c:?}: {:?}",
+                bash_check(c, None, false)
+            );
+        }
+        for c in [
+            "git commit -S -m x",
+            "git commit -m x",
+            "git commit --gpg-sign -m x",
+            "git -c user.name=x commit -m x",
+            "git -c user.name=x -c user.email=dev@mbp.example.com commit -m x",
+            "git -c commit.gpgsign=true commit -m x",
+            "git -c commit.gpgsign commit -m x",
+            "git -c gpg.format=ssh commit -m x",
+            "git tag -s v1 -m x",
+            "git tag -a v1 -m x",
+            "git log --show-signature",
+            "git log --grep=gpgsign",
+            "git verify-commit HEAD",
+            "git config --get commit.gpgsign",
+            "git config --global --get tag.gpgSign",
+            "git config --get-all user.signingkey",
+            "git config --get-regexp gpg",
+            "git config commit.gpgsign",
+            "git config -l",
+            "git config --list --show-origin",
+            "git config get commit.gpgsign",
+            "git config list --global",
+            "git config commit.gpgsign true",
+            "git config --global gpg.format ssh",
+            "git config user.name x",
+            "git config --global --unset user.name",
+            "git config --remove-section remote.old",
+            "git config set user.email dev@mbp.example.com",
+            "git config --global alias.st status",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x git commit -m x",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=true git commit",
+            "sealctl git setup",
+            "sealctl git setup --local --key work",
+            "sealctl run -- git commit -m x",
+            "git commit -m 'never use --no-gpg-sign or commit.gpgsign=false'",
+            "echo git -c commit.gpgsign=false commit",
+            "grep -rn commit.gpgsign docs/",
+            "rg -- --no-gpg-sign src/",
+            "git grep -n -- --no-gpg-sign",
+            "cat > notes.md <<'EOF'\ngit -c commit.gpgsign=false commit\nEOF",
+            "git commit -F - <<'EOF'\nDon't use --no-gpg-sign.\nEOF",
+            "git commit -m \"$(cat <<'EOF'\nKeep commit.gpgsign on; no --no-gpg-sign.\nEOF\n)\"",
+        ] {
+            assert!(
+                bash_check(c, None, true).is_none(),
+                "should allow: {c:?}: {:?}",
+                bash_check(c, None, true)
+            );
         }
     }
 

@@ -38,7 +38,7 @@ computer. They print nothing while they wait: git hides the signer's output.
   answered in time. Say so once, carry on with other work, and try again at the next point
   where you would commit anyway, or when the user says so. Don't retry in a loop, and do
   not switch to unsigned commits (`--no-gpg-sign`, `commit.gpgsign=false`) or another key
-  unless the user asks for that.
+  unless the user asks for that. The hook blocks turning signing off.
 - `sealctl status` shows whether the session is Locked, Open or Waiting for the phone (it never
   asks the phone itself).
 

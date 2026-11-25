@@ -147,8 +147,9 @@ fn sparse_bundle_volume_with_backup_lock_and_unseal() {
     }
 
     // lock: on-lock backup, then the volume closes
-    let (code, out, err) = env.run(&["lock"]);
-    assert_eq!(code, 0, "{err}");
+    let lock = env.run(&["lock"]);
+    assert_eq!(lock.0, 0, "{}", report(&env, "lock", &lock));
+    let (_, out, _) = lock;
     assert!(out.contains("Volume v1 closed."), "{out}");
     if restic_ok {
         assert!(out.contains("Backed up b1."), "{out}");
@@ -488,6 +489,46 @@ fn a_lock_that_cannot_list_the_images_reports_the_volume_busy() {
         "the lock names the volume\n{}",
         report(&env, "lock", &lock)
     );
+}
+
+/// A lock just after a volume was mounted, written or backed up, while a macOS service still
+/// holds it (SPEC 6.5 step 3): `hdiutil detach` is refused as `Resource busy` for longer than
+/// its three quick tries, and no process of the user's has files open. The lock tries again
+/// and closes the volume, instead of exit 11 with it left mounted until the next minute. A
+/// stand-in `hdiutil` on PATH, for the daemon too, refuses the lock's first five plain detaches.
+#[test]
+fn a_lock_closes_a_volume_a_service_holds_for_a_few_seconds() {
+    let mut env = Env::new();
+    env.pair();
+    // the daemon started for the pairing has the plain PATH; the next command starts another
+    env.stop_daemon();
+    let refused = env.h().join("detach-refused");
+    let path = stand_in_hdiutil(
+        &env,
+        &format!(
+            "if [ \"$1\" = detach ] && [ \"$2\" != -force ] && [ -e '{0}' ] && \
+             [ $(wc -l < '{0}') -lt 5 ]; then\n  \
+             echo x >> '{0}'\n  \
+             echo 'hdiutil: detach failed - Resource busy' >&2\n  exit 16\nfi",
+            refused.display()
+        ),
+    );
+    let bundle = env.h().join("r.sparsebundle");
+    let (code, _, err) = create_r(&env, &path);
+    assert_eq!(code, 0, "{err}");
+    let _detach = Detach(&env, bundle.clone(), env.h().join("mnt/r"));
+    // from now on, the first five plain detaches are refused
+    std::fs::write(&refused, b"").unwrap();
+    let lock = run_with_path(&env, &path, &["lock"]);
+    assert_eq!(lock.0, 0, "{}", report(&env, "lock", &lock));
+    assert!(
+        lock.1.contains("Volume r closed."),
+        "the lock closed the volume\n{}",
+        report(&env, "lock", &lock)
+    );
+    assert!(!attached(&bundle), "{}", report(&env, "lock", &lock));
+    let refusals = std::fs::read_to_string(&refused).unwrap_or_default();
+    assert_eq!(refusals.lines().count(), 5, "every refusal was tried again");
 }
 
 /// A lock while an `open` is mounting an auto volume (SPEC 6.5): the lock's unmount waits for

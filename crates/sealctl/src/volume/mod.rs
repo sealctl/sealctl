@@ -511,24 +511,47 @@ pub fn holder(mountpoint: &Path) -> Option<(String, u64)> {
     }
 }
 
-/// Unmounts; a busy volume names the process holding it (exit 11).
+/// How long an unmount refused while no process of the user's has files open on the volume is
+/// tried again before the volume counts as busy (SPEC 6.5 step 3). Just after a mount, a write
+/// or a backup reading it, macOS services (Spotlight, fseventsd, file scanning) can hold a
+/// volume for some seconds, longer than a backend's own quick tries; they let go by themselves,
+/// and `lsof` run as the user cannot name them.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Unmounts; a busy volume names the process holding it (exit 11). A refusal that names a
+/// process, or after which the volume's state cannot be read, is reported at once; one that
+/// names none is tried again for up to `SETTLE`.
+/// Callers in the daemon run this off its async threads.
 pub fn close(vol: &Volume, force: bool) -> Result<()> {
     let be = backend(vol.kind);
     if !vol.check_open()? {
         return Ok(());
     }
-    if let Err(e) = be.lock(vol, force) {
+    let until = std::time::Instant::now() + SETTLE;
+    let mut pause = std::time::Duration::from_millis(500);
+    loop {
+        let Err(e) = be.lock(vol, force) else {
+            return Ok(());
+        };
         if let Some((p, pid)) = holder(&vol.mountpoint) {
             return Err(fail(
                 exit::BUSY,
                 format!("Volume {} is busy: {p} (pid {pid}) has files open.", vol.name),
             ));
         }
-        if be.is_unlocked(vol).unwrap_or(true) {
-            return Err(fail(exit::BUSY, format!("Volume {} is busy: {e:#}", vol.name)));
+        // a state that cannot be read is reported at once, as before (SPEC 6.5 step 3)
+        match be.is_unlocked(vol) {
+            Ok(false) => return Ok(()),
+            Ok(true) if !force && std::time::Instant::now() + pause <= until => {}
+            _ => return Err(fail(exit::BUSY, format!("Volume {} is busy: {e:#}", vol.name))),
         }
+        log::info!(
+            "{}: unmount refused with no process named, trying again: {e:#}",
+            vol.name
+        );
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_secs(2));
     }
-    Ok(())
 }
 
 /// Forgets a definition; with `delete_data` also destroys the data.
