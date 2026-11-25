@@ -531,7 +531,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                             sealed: Some(sealed),
                             created,
                             release_at,
-                            expires: release_at + DELAYED_KEEP_MS,
+                            expires: delayed_expires(true, release_at),
                             cancelled: None,
                         },
                     );
@@ -714,7 +714,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                     sealed: None,
                     created,
                     release_at,
-                    expires: release_at + PHONE_ACTION_KEEP_MS,
+                    expires: delayed_expires(false, release_at),
                     cancelled: None,
                 },
             );
@@ -725,7 +725,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             }
             ok(
                 201,
-                json!({"id": id, "releaseAt": release_at, "expires": release_at + PHONE_ACTION_KEEP_MS}),
+                json!({"id": id, "releaseAt": release_at, "expires": delayed_expires(false, release_at)}),
             )
         }
         (Method::GET, ["delayed"]) => {
@@ -767,9 +767,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             if d.cancelled.is_none() {
                 d.cancelled = Some((by.clone(), now_ms()));
                 d.sealed = None;
-                // kept through the plan window (nb + 30 min) and the signature window twice;
-                // never shortened (an action on the phone is kept longer already)
-                d.expires = d.expires.max(d.release_at + CANCELLED_KEEP_MS);
+                d.expires = cancelled_expires(d.expires, d.release_at);
                 let note = json!({"type": "cancelled", "id": id, "by": by}).to_string();
                 for t in p.phone_sockets.iter().chain(p.machine_sockets.values()) {
                     let _ = t.send(Out::Text(note.clone()));
@@ -805,6 +803,22 @@ const DELAYED_KEEP_MS: u64 = 900_000;
 const PHONE_ACTION_KEEP_MS: u64 = 3_600_000;
 /// A cancelled one: the plan window (30 min from `nb`) plus the 300 s signature window twice.
 const CANCELLED_KEEP_MS: u64 = 2_400_000;
+
+/// A new delayed record's `expires`: a machine's reply, or an action on the phone.
+fn delayed_expires(machine: bool, release_at: u64) -> u64 {
+    release_at
+        + if machine {
+            DELAYED_KEEP_MS
+        } else {
+            PHONE_ACTION_KEEP_MS
+        }
+}
+
+/// `expires` once cancelled: kept through the plan window (nb + 30 min) and the signature
+/// window twice, never shortened (an action on the phone is kept longer already).
+fn cancelled_expires(expires: u64, release_at: u64) -> u64 {
+    expires.max(release_at + CANCELLED_KEEP_MS)
+}
 
 /// A delay in seconds: a whole number from 1 to 7200 (`60.0` too, as JSON numbers go).
 fn valid_delay(v: &Value) -> Option<u64> {
@@ -996,4 +1010,22 @@ async fn machine_socket(app: App, phone: String, machine: String, sock: WebSocke
         }
     }
     pump(sock, rx, |_| None).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// protocol.md, Delayed approvals: a machine's reply keeps 900 s after `releaseAt` and
+    /// 2,400 s once cancelled; an action on the phone keeps 3,600 s, cancelled or not.
+    #[test]
+    fn delayed_expiry_by_kind_and_cancel() {
+        let r = 1_000_000;
+        let machine = delayed_expires(true, r);
+        assert_eq!(machine, r + 900_000);
+        assert_eq!(cancelled_expires(machine, r), r + 2_400_000);
+        let phone = delayed_expires(false, r);
+        assert_eq!(phone, r + 3_600_000);
+        assert_eq!(cancelled_expires(phone, r), r + 3_600_000);
+    }
 }
