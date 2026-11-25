@@ -55,6 +55,14 @@ program gets the key while the agent sees only `****`.
    * text in a quoted here-document (`python3 - <<'EOF'`, `cat > notes.md <<'EOF'`) is
      data, not commands, unless it is fed to a shell; `echo $SSH_AUTH_SOCK` and other
      variables that only name a socket, folder or file are not treated as credentials;
+   * a script written with a quoted here-document (`cat > voices.mjs <<'EOF'`, `tee`) is data:
+     `process.env.ELEVENLABS_API_KEY`, `console.log(process.env)` or the words `.env file` in
+     it are fine. When the same command line names an interpreter (`node`, `python3`,
+     `ruby`, `perl`, `deno`, …) or a shell, the body may run, so dumping the whole environment
+     (`console.log(process.env)`, `print(os.environ)`) or opening a `.env` file
+     (`open('.env')`) in it is denied, as in `node -e '…'` and `python3 -c '…'`. Reading one
+     variable (`process.env.HOME`) is always fine, and `.env` is matched as a file path,
+     never inside `process.env`;
    * setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`) is
      denied: only you switch detection off;
    * where git signs through sealctl, turning signing off or pointing it at another program
@@ -64,6 +72,9 @@ program gets the key while the agent sees only `****`.
      phone is your approval, so only you change it. Reading config, `git commit -S` and
      `git tag -s` are fine; where git does not sign through sealctl, nothing changes;
    * reading `.env` files or private keys, and writing key-like literals into files, is denied;
+     a reference to a secret kept elsewhere is not a literal (`process.env.ELEVENLABS_API_KEY`
+     or `settings.stripe.secret_key` assigned to a key-like name, `os.getenv("API_KEY")`,
+     `${API_KEY}`), in files, commands and prompts alike;
    * reading `*.sealed`, `machine.json` or sealctl's state folder is denied;
    * each session starts with one line: `sealctl: secrets are available by name through
      sealctl run (names: …). Values are never shown.`
@@ -110,6 +121,7 @@ Files sealctl changes are backed up once as `<file>.before-sealctl`.
   tree. It stops an agent calling them directly, not code running as you that sets out to get
   around it (a copy of a shell named `git-remote-https`, git's trace output with redaction
   off). `git push` run by an agent uses the token, as intended, and the phone logs the use.
-* Detection of keys is by pattern (known token formats plus random-looking `key = value`). A
-  false alarm can be overridden by starting the prompt with `#nosecret`.
+* Detection of keys is by pattern (known token formats plus random-looking `key = value`,
+  where a value that names a variable or setting, such as `process.env.NAME`, does not count).
+  A false alarm can be overridden by starting the prompt with `#nosecret`.
 * After `brew upgrade` nothing needs reinstalling: hooks call `/opt/homebrew/bin/sealctl`.

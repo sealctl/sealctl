@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Fixed
+
+- Agent hooks no longer deny writing a script with a quoted here-document
+  (`cat > voices.mjs <<'EOF'` … `EOF`, `tee`) because it reads a variable
+  (`process.env.ELEVENLABS_API_KEY`), prints the environment or mentions a `.env` file: such a
+  body is data. When the command line also names an interpreter (`node`, `python3`, `ruby`,
+  `perl`, `deno`, …) or a shell, the body may run and is still checked; dumping the
+  environment there, and opening a `.env` or credentials file from inline or here-document code
+  (`python3 - <<'EOF'` with `open('.env')`, `node -e` with `readFileSync('.env')`), is now
+  denied. `.env` is matched as a file path, not inside `process.env`, and `printenv`, `env` or
+  `export` on a line of their own count as environment dumps.
+- A reference to a secret kept elsewhere (`process.env.ELEVENLABS_API_KEY` or
+  `settings.stripe.secret_key` assigned to a key-like name, `os.getenv("API_KEY")`) is no
+  longer taken for a key-like literal in written files, commands or prompts. Quoted values and
+  dotted tokens still are.
+
 ## 0.7.1 - 2026-11-25
 
 ### Added
