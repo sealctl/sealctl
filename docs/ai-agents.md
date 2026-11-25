@@ -52,12 +52,17 @@ program gets the key while the agent sees only `****`.
      through `env`, `command`, `sudo`, `sh -c`, `$(…)` and any path to the binary, so
      `sealctl run -e KEY=shop/buy -- …` is allowed and `env /usr/local/bin/sealctl secret get`
      is not;
+   * text in a quoted here-document (`python3 - <<'EOF'`, `cat > notes.md <<'EOF'`) is
+     data, not commands, unless it is fed to a shell; `echo $SSH_AUTH_SOCK` and other
+     variables that only name a socket, folder or file are not treated as credentials;
    * setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`) is
      denied: only you switch detection off;
    * reading `.env` files or private keys, and writing key-like literals into files, is denied;
    * reading `*.sealed`, `machine.json` or sealctl's state folder is denied;
    * each session starts with one line: `sealctl: secrets are available by name through
      sealctl run (names: …). Values are never shown.`
+     Where git signs through sealctl, the line adds that signed commits, `git push` over SSH
+     and `ssh` wait silently for approval on the user's phone.
 3. **Skill and deny rules** — the `sealctl-secrets` skill (open SKILL.md format) explains the
    workflow; deny rules block the dangerous sealctl commands where the agent supports them
    (`secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `project trust`, `aws credentials`,

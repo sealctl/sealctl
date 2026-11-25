@@ -1154,3 +1154,92 @@ async fn an_exit_does_not_wait_for_a_hung_mount() {
     let e = d.t.events();
     assert!(at(&e, "mount end") < at(&e, "close safe"), "{e:?}");
 }
+
+/// Statuses saying Open (sent or failed) since the start of `events`.
+fn open_statuses(d: &Daemon) -> (usize, usize) {
+    let e = d.t.events();
+    (
+        e.iter().filter(|x| *x == "status open").count(),
+        e.iter().filter(|x| *x == "status open failed").count(),
+    )
+}
+
+/// One 15-second sample later, with input `idle` seconds ago.
+async fn sample(d: &Arc<Daemon>, idle: Option<u64>) {
+    d.t.advance(15_000);
+    d.t.set_idle(idle);
+    d.tick().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn work_that_moves_the_lock_deadline_is_told_to_the_phone() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    let (opened, _) = open_statuses(&d);
+    assert!(opened >= 1);
+    // input at every sample: 15 s more each time, and 120 s of allowance per minute worked.
+    // The first minute moves the deadline by 3 minutes; then at most one status in 2 minutes.
+    let mut told = Vec::new();
+    for s in 1..=40 {
+        sample(&d, Some(0)).await;
+        let (sent, _) = open_statuses(&d);
+        if sent > opened + told.len() {
+            told.push(s * 15);
+            // the phone now counts down to the deadline (`left` is in whole seconds)
+            let st = d.st();
+            assert!(st.saved.deadline().abs_diff(st.told_deadline.unwrap()) < 1_000);
+        }
+    }
+    assert_eq!(told, [60, 180, 300, 420, 540], "seconds after the open");
+    // idle: the work of the last minute is told once the 2 minutes are up, then the deadline
+    // stays where the phone has it, so nothing goes out
+    for _ in 0..8 {
+        sample(&d, Some(600)).await;
+    }
+    assert_eq!(open_statuses(&d).0, opened + told.len() + 1);
+    let before = open_statuses(&d);
+    for _ in 0..40 {
+        sample(&d, Some(600)).await;
+    }
+    assert!(d.st().open);
+    assert_eq!(open_statuses(&d), before, "{:?}", d.t.events());
+    // Locked: no deadline to tell
+    d.lock("cli", true, false).await;
+    settle().await;
+    let before = open_statuses(&d);
+    for _ in 0..20 {
+        sample(&d, Some(0)).await;
+    }
+    assert_eq!(open_statuses(&d), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_deadline_status_is_tried_again_after_a_minute_not_at_once() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    // the relay is down from now on; work goes on
+    *d.t.status_failures.lock().unwrap() = 1_000;
+    let mut tries = Vec::new();
+    for s in 1..=80 {
+        let before = open_statuses(&d).1;
+        sample(&d, Some(0)).await;
+        if open_statuses(&d).1 > before {
+            tries.push(s * 15);
+        }
+    }
+    assert!(!tries.is_empty());
+    assert!(
+        tries.windows(2).all(|w| w[1] - w[0] >= 60),
+        "a failed status waits a minute before the next try: {tries:?}"
+    );
+    // the relay is back: the retry carries the deadline, and the rule goes on from there
+    *d.t.status_failures.lock().unwrap() = 0;
+    for _ in 0..5 {
+        sample(&d, Some(0)).await;
+    }
+    let st = d.st();
+    assert!(!st.status_dirty);
+    assert!(st.saved.deadline().abs_diff(st.told_deadline.unwrap()) < session::DEADLINE_LATER_MS);
+}

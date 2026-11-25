@@ -35,6 +35,35 @@ pub fn prompt(text: &str) -> Option<String> {
     ))
 }
 
+const PRINT_CREDENTIAL: &str = "printing a credential variable would put it into the conversation.";
+
+/// Ends of variable names that hold where something is, not a credential (`SSH_AUTH_SOCK`,
+/// `SSH_AGENT_PID`, `PASSWORD_STORE_DIR`, `KEY_FILE`): printing them shows no secret.
+const HARMLESS_SUFFIXES: &[&str] = &["_SOCK", "_SOCKET", "_PID", "_DIR", "_PATH", "_FILE"];
+
+/// Whether a command that matched a [`PRINT_CREDENTIAL`] pattern prints a variable that may hold
+/// a credential, rather than only harmless ones such as `$SSH_AUTH_SOCK`.
+fn prints_credential(text: &str) -> bool {
+    static ECHO: OnceLock<Regex> = OnceLock::new();
+    static VAR: OnceLock<Regex> = OnceLock::new();
+    static PRINTENV: OnceLock<Regex> = OnceLock::new();
+    let echo = ECHO.get_or_init(|| Regex::new(r"\b(?:echo|printf|print)\b([^|;&]*)").expect("valid"));
+    let var = VAR.get_or_init(|| Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").expect("valid"));
+    let printenv =
+        PRINTENV.get_or_init(|| Regex::new(r"(?i)\bprintenv\s+([A-Za-z_][A-Za-z0-9_]*)").expect("valid"));
+    let credential = |name: &str| {
+        ["KEY", "TOKEN", "SECRET", "PASSW", "PASS", "CREDENTIAL", "AUTH"]
+            .iter()
+            .any(|k| name.contains(k))
+            && !HARMLESS_SUFFIXES.iter().any(|s| name.ends_with(s))
+    };
+    echo.captures_iter(text)
+        .any(|c| var.captures_iter(&c[1]).any(|v| credential(&v[1])))
+        || printenv
+            .captures_iter(&text.to_ascii_uppercase())
+            .any(|c| credential(&c[1]))
+}
+
 fn deny_patterns() -> &'static [(Regex, &'static str)] {
     static P: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     P.get_or_init(|| {
@@ -49,11 +78,11 @@ fn deny_patterns() -> &'static [(Regex, &'static str)] {
             ),
             (
                 r#"\b(?:echo|printf|print)\b[^|;&]*\$\{?[A-Za-z_]*(?:KEY|TOKEN|SECRET|PASSW|PASS|CREDENTIAL|AUTH)[A-Za-z_]*"#,
-                "printing a credential variable would put it into the conversation.",
+                PRINT_CREDENTIAL,
             ),
             (
                 r"(?i)\bprintenv\s+[A-Za-z_]*(?:KEY|TOKEN|SECRET|PASSW|PASS|CREDENTIAL|AUTH)",
-                "printing a credential variable would put it into the conversation.",
+                PRINT_CREDENTIAL,
             ),
             (
                 r"(?:^|[|;&(`]|\$\()\s*(?:export|declare\s+-[a-zA-Z]*[px]|typeset\s+-[a-zA-Z]*x|compgen\s+-v)\s*(?:$|[|;&)>`])",
@@ -117,6 +146,9 @@ pub fn bash_in(command: &str, cwd: Option<&str>) -> Option<String> {
     }
     for (re, why) in deny_patterns() {
         if re.is_match(&probe) {
+            if *why == PRINT_CREDENTIAL && !prints_credential(&probe) {
+                continue;
+            }
             return Some(format!("sealctl: {why}"));
         }
     }
@@ -178,7 +210,39 @@ fn denied_verb(verb: &str, sub: Option<&str>) -> Option<&'static str> {
 /// (as bash 4+ and zsh read it); without, a pattern's `)` closes an open `$(` (as bash 3.2, the
 /// macOS `/bin/bash` and `/bin/sh`, reads it inside double quotes). Shells differ here and a `)`
 /// can be misread either way, so callers check every reading.
+///
+/// Here-document bodies are text (only an unquoted body's substitutions are commands), unless
+/// anything in the command line may run its input as commands (see [`RUNS_INPUT`]): a body can
+/// reach such a program through a pipe or group that continues after it, so then every body is
+/// read as commands.
 fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String>> {
+    let cmds = read_commands(text, resume, track_case, true, 0);
+    let runs_input = cmds.iter().any(|words| {
+        words.iter().enumerate().any(|(n, w)| {
+            let base = w.rsplit('/').next().unwrap_or(w);
+            RUNS_INPUT.contains(&base) || (n == 0 && base == ".")
+        })
+    });
+    if runs_input {
+        read_commands(text, resume, track_case, false, 0)
+    } else {
+        cmds
+    }
+}
+
+/// How deeply here-documents inside here-documents (through `$(…)` in an unquoted body) are
+/// read as text; deeper ones are read as commands.
+const HERE_DOC_LEVELS: usize = 3;
+
+/// [`simple_commands`], with here-document bodies read as text (`here_docs`) or as commands;
+/// `level`: how deep in here-document bodies this text is.
+fn read_commands(
+    text: &str,
+    resume: bool,
+    track_case: bool,
+    here_docs: bool,
+    level: usize,
+) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
@@ -218,8 +282,69 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
         }
         *all_kw = true;
     };
+    // here-documents opened on the current line, read at its end
+    let mut pending: Vec<HereDoc> = Vec::new();
+    // after a `#` that starts a word, the rest of the line is a comment: a `<<` there opens no
+    // here-document (its text is still read as commands, which only errs towards denying)
+    let mut in_comment = false;
+    // open `$[ … ]` (old arithmetic): a `<<` there is a shift
+    let mut old_arith = 0usize;
     while i < cs.len() {
         let c = cs[i];
+        if quote.is_none() {
+            match c {
+                '#' if !in_word => in_comment = true,
+                '\n' => in_comment = false,
+                '$' if cs.get(i + 1) == Some(&'[') => old_arith += 1,
+                ']' if old_arith > 0 => old_arith -= 1,
+                _ => {}
+            }
+        }
+        // a newline ending a line that opened here-documents: their bodies follow
+        if quote.is_none() && c == '\n' && !pending.is_empty() {
+            end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+            end_cmd(&mut words, &mut cmds, &mut all_kw);
+            let docs = std::mem::take(&mut pending);
+            // no delimiter line: the text is read as commands, line by line
+            if let Some((bodies, end)) = here_bodies(&cs, i + 1, &docs) {
+                for (doc, body) in docs.iter().zip(bodies) {
+                    // an unquoted delimiter: `$(…)` and backquotes in the body still run
+                    if !doc.quoted {
+                        // one level deeper; past HERE_DOC_LEVELS, bodies in it are commands,
+                        // which keeps the work linear in the text
+                        cmds.extend(read_commands(
+                            &as_double_quoted(&body),
+                            resume,
+                            track_case,
+                            level + 1 < HERE_DOC_LEVELS,
+                            level + 1,
+                        ));
+                    }
+                }
+                // `end`: the newline after the last delimiter line, or the end of the text
+                i = end;
+            }
+            i += 1;
+            continue;
+        }
+        // `<<` and `<<-` (not `<<<`, nor a shift inside `$(( ))` or `(( ))`): a here-document
+        if here_docs
+            && quote.is_none()
+            && c == '<'
+            && cs.get(i + 1) == Some(&'<')
+            && cs.get(i + 2) != Some(&'<')
+            && (i == 0 || cs[i - 1] != '<')
+            && !open.iter().any(|&(o, _)| o == 'A')
+            && !in_comment
+            && old_arith == 0
+        {
+            if let Some((doc, next)) = here_delimiter(&cs, i + 2) {
+                end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
+                pending.push(doc);
+                i = next;
+                continue;
+            }
+        }
         match quote {
             Some('\'') => {
                 if c == '\'' {
@@ -274,7 +399,9 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
                 '(' => {
                     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
                     end_cmd(&mut words, &mut cmds, &mut all_kw);
-                    open.push(('(', false));
+                    // the second `(` of `((` or `$((`: arithmetic, where `<<` is a shift
+                    let arithmetic = i > 0 && cs[i - 1] == '(';
+                    open.push((if arithmetic { 'A' } else { '(' }, false));
                 }
                 '$' if cs.get(i + 1) == Some(&'(') => {
                     i += 1;
@@ -287,7 +414,7 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
                     end_cmd(&mut words, &mut cmds, &mut all_kw);
                     let opener = if c == ')' { '(' } else { '`' };
                     match open.last() {
-                        Some(&(o, dq)) if o == opener => {
+                        Some(&(o, dq)) if o == opener || (opener == '(' && o == 'A') => {
                             open.pop();
                             if dq && resume {
                                 quote = Some('"');
@@ -310,6 +437,160 @@ fn simple_commands(text: &str, resume: bool, track_case: bool) -> Vec<Vec<String
     end_word(&mut word, &mut in_word, &mut words, &mut open, &mut all_kw);
     end_cmd(&mut words, &mut cmds, &mut all_kw);
     cmds
+}
+
+/// A here-document opened by `<<word` or `<<-word`.
+struct HereDoc {
+    delimiter: String,
+    /// `<<-`: leading tabs are removed from body lines and the delimiter line.
+    strip_tabs: bool,
+    /// The delimiter was quoted (`'EOF'`, `"EOF"`, `\EOF`): the body is plain text, nothing in
+    /// it runs. Unquoted, `$(…)` and backquotes in it run.
+    quoted: bool,
+}
+
+/// Programs that may run their standard input as commands. When any word of a command line
+/// names one (`.` only as a command), its here-documents are read as commands, as before
+/// here-documents were known: a body can reach such a program through a pipe, group or loop
+/// that continues after the body (`cat <<'EOF' |` … `EOF` / `sh`, `{ cat <<'EOF' … } | sh`).
+const RUNS_INPUT: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "mksh",
+    "fish",
+    "csh",
+    "tcsh",
+    "ash",
+    "busybox",
+    "source",
+    "eval",
+    "exec",
+    "ssh",
+    "su",
+    "sudo",
+    "doas",
+    "xargs",
+    "parallel",
+    "osascript",
+    "script",
+    "expect",
+];
+
+/// The here-document whose operator ends just before `start`: its delimiter word and where the
+/// text after it starts. `None` when no delimiter follows.
+fn here_delimiter(cs: &[char], start: usize) -> Option<(HereDoc, usize)> {
+    let mut i = start;
+    let strip_tabs = cs.get(i) == Some(&'-');
+    if strip_tabs {
+        i += 1;
+    }
+    while matches!(cs.get(i), Some(' ' | '\t')) {
+        i += 1;
+    }
+    let mut delimiter = String::new();
+    let mut quoted = false;
+    let mut quote: Option<char> = None;
+    while let Some(&c) = cs.get(i) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => delimiter.push(c),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    quoted = true;
+                }
+                '\\' => {
+                    quoted = true;
+                    i += 1;
+                    if let Some(&n) = cs.get(i) {
+                        delimiter.push(n);
+                    }
+                }
+                ' ' | '\t' | '\n' | '|' | ';' | '&' | '<' | '>' | '(' | ')' => break,
+                c => delimiter.push(c),
+            },
+        }
+        i += 1;
+    }
+    if quote.is_some() || delimiter.is_empty() || delimiter.contains(['$', '`']) {
+        return None;
+    }
+    Some((
+        HereDoc {
+            delimiter,
+            strip_tabs,
+            quoted,
+        },
+        i,
+    ))
+}
+
+/// The bodies of `docs`, read one after another from `start` (the line after the one that
+/// opened them), and the index of the newline ending the last delimiter line (or the end of the
+/// text). `None` when a delimiter line is missing: then the text is read as commands instead.
+fn here_bodies(cs: &[char], start: usize, docs: &[HereDoc]) -> Option<(Vec<String>, usize)> {
+    let mut bodies = Vec::with_capacity(docs.len());
+    let mut i = start;
+    for doc in docs {
+        let mut body = String::new();
+        loop {
+            if i >= cs.len() {
+                return None;
+            }
+            let end = cs[i..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(cs.len(), |p| i + p);
+            let line: String = cs[i..end].iter().collect();
+            let line = if doc.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                &line
+            };
+            if line == doc.delimiter {
+                i = end;
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+            i = end + 1;
+        }
+        bodies.push(body);
+        // the next body starts on the line after this delimiter
+        if i < cs.len() {
+            i += 1;
+        }
+    }
+    // back to the newline ending the last delimiter line (or the text's last character)
+    Some((bodies, i - 1))
+}
+
+/// An unquoted here-document body as the text of a double-quoted word, so that only its
+/// command substitutions read as commands. In such a body a backslash quotes only `$`, `` ` ``,
+/// `\` and a newline, and `"` is an ordinary character.
+fn as_double_quoted(body: &str) -> String {
+    let cs: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 2);
+    out.push('"');
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '\\' if matches!(cs.get(i + 1), Some('$' | '`' | '\\' | '\n')) => {
+                out.push('\\');
+                out.push(cs[i + 1]);
+                i += 1;
+            }
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out.push('"');
+    out
 }
 
 /// The reason given when a command line is too deeply nested or too costly to check: the hook
@@ -675,25 +956,60 @@ pub fn session_context() -> String {
         .and_then(|s| s.list())
         .map(|l| l.into_iter().map(|x| x.name).collect())
         .unwrap_or_default();
+    session_line(&names, crate::git::signs_through_sealctl())
+}
+
+/// The session line for these secret names; `signs`: git signs through sealctl here.
+fn session_line(names: &[String], signs: bool) -> String {
     let shown: Vec<&str> = names.iter().take(40).map(String::as_str).collect();
     let more = if names.len() > shown.len() {
         format!(" (+{} more)", names.len() - shown.len())
     } else {
         String::new()
     };
-    format!(
+    let line = format!(
         "sealctl: secrets are available by name through sealctl run (names: {}{more}). Values are never shown.",
         if shown.is_empty() {
             "none yet".to_string()
         } else {
             shown.join(", ")
         }
-    )
+    );
+    if signs {
+        format!("{line} {GIT_SIGNING_CONTEXT}")
+    } else {
+        line
+    }
 }
+
+/// Added to the session line where git signs through sealctl: the signer prints nothing while
+/// the phone is asked, so an agent would otherwise look for a prompt on the computer.
+pub const GIT_SIGNING_CONTEXT: &str = "Signed git commits and tags, git push over SSH and ssh \
+    wait silently for approval in the sealctl app on the user's phone (not on this computer); \
+    \"agent refused operation\" means it was declined or not answered in time.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_git_signing_line_names_the_phone() {
+        assert!(GIT_SIGNING_CONTEXT.contains("phone"));
+        assert!(GIT_SIGNING_CONTEXT.contains("agent refused operation"));
+        assert!(!GIT_SIGNING_CONTEXT.contains("  "), "{GIT_SIGNING_CONTEXT}");
+    }
+
+    #[test]
+    fn the_session_line_mentions_git_signing_only_where_git_signs_through_sealctl() {
+        let names = vec!["shop/stripe".to_string()];
+        let signs = session_line(&names, true);
+        assert!(signs.ends_with(GIT_SIGNING_CONTEXT), "{signs}");
+        assert!(signs.contains("names: shop/stripe"), "{signs}");
+        let plain = session_line(&names, false);
+        assert!(!plain.contains("agent refused operation"), "{plain}");
+        assert!(plain.ends_with("Values are never shown."), "{plain}");
+        assert!(session_line(&[], false).contains("names: none yet"));
+    }
 
     #[test]
     fn prompts_with_keys_are_blocked() {
@@ -762,6 +1078,104 @@ mod tests {
             "cat README.md",
         ] {
             assert!(bash(c).is_none(), "should allow: {c}: {:?}", bash(c));
+        }
+    }
+
+    #[test]
+    fn variables_that_only_name_a_place_may_be_printed() {
+        for c in [
+            "echo $SSH_AUTH_SOCK",
+            "echo \"${SSH_AUTH_SOCK}\"",
+            "printenv SSH_AUTH_SOCK",
+            "echo $SSH_AGENT_PID $GPG_AGENT_SOCKET",
+            "echo $PASSWORD_STORE_DIR",
+            "echo $KEY_FILE $SSH_KEY_PATH",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c}: {:?}", bash(c));
+        }
+        for c in [
+            "echo $SSH_AUTH_SOCK $OPENAI_API_KEY",
+            "echo $AUTH_TOKEN",
+            "printenv github_token",
+            "echo ${SOCK}${API_KEY}",
+            "printf '%s %s' \"$SSH_AUTH_SOCK\" \"$DB_PASSWORD\"",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c}");
+        }
+    }
+
+    #[test]
+    fn here_documents_for_other_programs_are_text() {
+        for c in [
+            // what was blocked in a real session: a quoted python here-document whose text
+            // mentions a denied command in backquotes
+            "python3 - <<'EOF'\nnote = 'never run `sealctl buy` or $(sealctl seal x)'\nEOF",
+            "cat > notes.md <<'EOF'\nRun `sealctl seal volume safe <uuid>` yourself.\nEOF\ngit status",
+            "cat <<\"EOF\" > a\nsealctl buy\nEOF",
+            "cat <<\\EOF\nsealctl recover\nEOF",
+            // unquoted: plain text in it runs nothing
+            "cat <<EOF > a\nsealctl buy\nEOF",
+            "cat <<-EOF\n\tsealctl unseal --all\n\tEOF\necho done",
+            "gh pr create --body-file - <<'EOF'\nDon't run sealctl secret get.\nEOF",
+            "cat <<A <<'B'\nsealctl buy\nA\n`sealctl recover`\nB",
+            // without `-`, a tab-indented delimiter does not end the body (bash runs nothing)
+            "cat <<EOF\n\tEOF\nsealctl buy\nEOF\n",
+            // a comment after the operator does not stop the here-document
+            "cat <<'EOF' # notes\nsealctl buy\nEOF",
+            // `#` inside a word is no comment
+            "cat a#b <<'EOF'\nsealctl buy\nEOF",
+            // `.` as an argument is no `source`
+            "git add . && git commit -m \"$(cat <<'EOF'\nNever run `sealctl buy`.\nEOF\n)\"",
+        ] {
+            assert!(bash(c).is_none(), "should allow: {c:?}: {:?}", bash(c));
+        }
+    }
+
+    #[test]
+    fn here_documents_that_run_are_still_checked() {
+        for c in [
+            // a shell reads its here-document as commands
+            "bash <<'EOF'\nsealctl buy\nEOF",
+            "sh -s <<EOF\nsealctl secret get k\nEOF",
+            "cat <<'EOF' | sh\nsealctl recover\nEOF",
+            "sudo -s <<EOF\nsealctl unpair\nEOF",
+            "ssh host <<'EOF'\nsealctl buy\nEOF",
+            // an unquoted body still runs its substitutions
+            "cat <<EOF\n$(sealctl secret get k)\nEOF",
+            "cat <<EOF\nvalue: `sealctl secret get k`\nEOF",
+            "cat <<EOF\n\"$(sealctl buy)\"\nEOF",
+            // commands after the delimiter run
+            "cat <<'EOF'\ntext\nEOF\nsealctl buy",
+            "cat <<'EOF' && sealctl buy\ntext\nEOF",
+            // no delimiter line: everything is read as commands
+            "cat <<'EOF'\nsealctl buy",
+            // shifts are no here-documents
+            "x=$((1<<2))\nsealctl buy\n2",
+            "x=$(( 1 << 2 ))\nsealctl buy\n2",
+            "(( y = 1 << 2 ))\nsealctl buy\n2",
+            // a here-string is no here-document
+            "cat <<< x\nsealctl buy\nx",
+            // the delimiter line must match exactly
+            "cat <<'EOF'\nEOF \nsealctl buy\n EOF",
+            // a `<<` in a comment opens nothing (found by review)
+            "# note <<EOF\nsealctl buy\nEOF",
+            "echo x # see <<'EOF'\nsealctl buy\nEOF",
+            "ls;#<<EOF\nsealctl buy\nEOF",
+            // old arithmetic `$[ ]`: a shift
+            "x=$[1<<2]\nsealctl buy\n2]",
+            "x=$[ 1 << 2 ]\nsealctl buy\n2",
+            // the body reaches a shell through a pipe, group or loop continuing after it
+            "cat <<'EOF' |\nsealctl buy\nEOF\nsh",
+            "cat <<'EOF' | # notes\nsealctl buy\nEOF\nbash",
+            "{ cat <<'EOF'\nsealctl buy\nEOF\n} | sh",
+            "( cat <<'EOF'\nsealctl buy\nEOF\n) | /bin/zsh",
+            "for x in 1; do cat <<'EOF'\nsealctl buy\nEOF\ndone | sh",
+            "cat <<'EOF' \\\n| sh\nsealctl buy\nEOF",
+            ". /dev/stdin <<'EOF'\nsealctl buy\nEOF",
+            // here-documents nested deeper than HERE_DOC_LEVELS are read as commands
+            "cat <<A\n$(cat <<B\n$(cat <<C\n$(cat <<D\nsealctl buy\nD\n)\nC\n)\nB\n)\nA",
+        ] {
+            assert!(bash(c).is_some(), "should deny: {c:?}");
         }
     }
 
@@ -843,6 +1257,25 @@ mod tests {
         ] {
             assert!(bash(c).is_some(), "should deny: {c}");
         }
+    }
+
+    #[test]
+    fn nested_here_documents_are_checked_in_bounded_time() {
+        // each level of a here-document inside a here-document's `$(…)` is read again; past
+        // HERE_DOC_LEVELS they are commands, so the work stays linear
+        let started = std::time::Instant::now();
+        let n = 20_000;
+        let mut line = String::new();
+        for k in 0..n {
+            line.push_str(&format!("cat <<E{k}\n$("));
+        }
+        line.push_str("sealctl buy\n");
+        for k in (0..n).rev() {
+            line.push_str(&format!(")\nE{k}\n"));
+        }
+        assert!(bash(&line).is_some(), "should deny");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(15), "took {took:?}");
     }
 
     #[test]

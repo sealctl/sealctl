@@ -21,6 +21,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   github.com`, `Open volume safe`, `Back up safe`, `Use 2 secrets for npm test`), names only. The
   answer replaces it: `Signed` or `Approved`, `Declined`, `Expired: nothing was signed`.
 - Level 3 notices are titled sealctl and no longer start with `sealctl:`.
+- The AI agent skill and session line say that signed git commits, `git push` over SSH and `ssh`
+  wait silently for approval on the phone, and what `agent refused operation` means, so agents
+  no longer look for a prompt on the computer or fall back to unsigned commits.
+- Agent hooks no longer deny harmless commands: text in a here-document fed to a program that
+  is not a shell (a quoted `python3 - <<'EOF'`, notes written with `cat > file <<'EOF'`) is no
+  longer read as commands, and `echo $SSH_AUTH_SOCK` and other variables ending in `_SOCK`,
+  `_PID`, `_DIR`, `_PATH` or `_FILE` may be printed. Here-documents fed to a shell, and
+  substitutions in unquoted ones, are still checked.
 - Output names the 4-character fingerprint of your 24 words as the seed: `seed 6qdC` instead of
   `words 6qdC` (`volume ls`, `status`, `seal`, `migrate`, `recover` and error messages). JSON
   keys, flags and stored files are unchanged.
@@ -30,6 +38,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 
+- The phone's countdown for an Open session follows your work: the daemon sends a status when
+  activity moves the lock 2 minutes later (or anything moves it 1 minute earlier), at most once
+  every 2 minutes, instead of up to 15 minutes later.
 - Requests that nobody sees waiting (the SSH agent and git signing, the git and AWS credential
   helpers, the backup schedule) always show a desktop notification, also when an AI agent made
   them. Before, a daemon started from an agent's shell showed none, so a signed `git commit` run
