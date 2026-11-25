@@ -368,7 +368,7 @@ On any lock the daemon, in this order:
 
 1. wipes the store key, decrypted SSH keys, own-approval keys and the per-agent session allowances;
 2. runs on-lock backups with the backup keys it still holds (skipped with `--no-backup`, after a lock message `words`, and on unpairing), at most 15 minutes in total: restic still running at the limit, or when the daemon exits, is stopped, since it holds the backup key and the storage credentials (SIGINT, so it removes its repository lock, then SIGKILL after 10 seconds);
-3. unmounts volumes; a busy volume is reported with the process holding it (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux), and so is a volume whose state cannot be read (`Volume <name> could not be checked: …`, e.g. `hdiutil info` failing), never passed over as closed; both are retried every 60 seconds until it closes or a session opens, with a status each time the busy list changes; `sealctl lock --force` force-unmounts;
+3. unmounts volumes; a volume one of the user's processes holds is reported busy at once, with that process (`lsof -F pcn <mountpoint>` on macOS, `fuser -vm` on Linux); an unmount refused while no such process can be named is tried again for up to 10 seconds (macOS services such as Spotlight or fseventsd can hold a volume for some seconds after a mount, a write or a backup reading it, and let go by themselves), so a lock right after a backup still closes the volume, and a volume refused for longer is reported busy; so is a volume whose state cannot be read (`Volume <name> could not be checked: …`, e.g. `hdiutil info` failing), never passed over as closed; both are retried every 60 seconds until it closes or a session opens, with a status each time the busy list changes; `sealctl lock --force` force-unmounts;
 4. wipes the backup and volume keys;
 5. sends a status (`locked`, with any busy volumes) and closes the machine socket. When that status (or one after a busy volume closed) fails, the daemon sends it again every minute until the phone has heard the session is Locked with the volumes still busy. Every status while Locked carries the busy volumes.
 
@@ -682,6 +682,7 @@ The `ai` module installs a skill, hooks and deny rules per agent (docs/ai-agents
 - Every volume also gets `<mount>/.sealctl/volume.id`.
 - Volumes without `--manual` mount when the session opens and unmount when it locks.
 - A busy volume names the process: `Volume safe is busy: node (pid 4211) has files open.`
+- `sealctl volume close`, `lock` and the other commands that close a volume treat a refused unmount the same way (section 6.5, step 3): reported at once when a process of the user's holds the volume, tried again for up to 10 seconds when none can be named.
 
 ## 14. Backups
 

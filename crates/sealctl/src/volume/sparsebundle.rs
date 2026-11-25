@@ -141,8 +141,9 @@ pub fn create_image(path: &std::path::Path, size: &str, volname: &str, pass: &[u
 
 /// Detaches every attachment of the image at `path`, wherever it is mounted. Just after a
 /// mount or a write, macOS services (Spotlight, fseventsd) can hold the volume for a moment,
-/// so a detach without `force` is tried three times, a second apart, before the volume is
-/// reported busy. Callers in the daemon run this off its async threads.
+/// so a detach without `force` is tried three times, a second apart, before it fails; a lock or
+/// `volume close` then tries again for longer when no process of the user's holds the volume
+/// ([`super::close`]). Callers in the daemon run this off its async threads.
 fn detach_all(path: &std::path::Path, force: bool) -> Result<()> {
     const TRIES: u32 = 3;
     for a in attachments(path)? {
