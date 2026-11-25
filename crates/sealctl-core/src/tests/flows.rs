@@ -466,6 +466,6 @@ fn every_message_kind_round_trips() {
 
 #[test]
 fn versions() {
-    assert_eq!(crate::core_version(), "0.7.0");
+    assert_eq!(crate::core_version(), "0.7.1");
     assert_eq!(crate::protocol_version(), "1");
 }

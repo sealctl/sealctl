@@ -3,7 +3,7 @@ name = "sealctl-core"
 description = "sealctl protocol and crypto core shared by the sealctl CLI and the phone apps"
 # The core follows the 0.7 release it ships in (`core_version()`), ahead of the
 # workspace version that the 0.5/0.6 CLI still carries.
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
