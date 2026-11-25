@@ -6,7 +6,7 @@ members = ["crates/sealctl", "crates/sealctl-core", "crates/sealctl-fakerelay", 
 default-members = ["crates/sealctl", "crates/sealctl-core", "crates/sealctl-fakerelay"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"

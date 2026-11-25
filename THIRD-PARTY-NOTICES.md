@@ -5960,8 +5960,8 @@ SOFTWARE.
 
 Used by:
 
-- sealctl 0.7.0 (https://github.com/sealctl/sealctl)
-- sealctl-core 0.7.0 (https://github.com/sealctl/sealctl)
+- sealctl 0.7.1 (https://github.com/sealctl/sealctl)
+- sealctl-core 0.7.1 (https://github.com/sealctl/sealctl)
 - libm 0.2.16 (https://github.com/rust-lang/compiler-builtins)
 - raunch 1.0.1 (https://github.com/bbqsrc/raunch)
 

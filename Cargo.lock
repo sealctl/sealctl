@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "sealctl"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "sealctl-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.23.1",
  "bip39",
@@ -2738,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "sealctl-fakerelay"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
