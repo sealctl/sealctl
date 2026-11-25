@@ -55,14 +55,15 @@ program gets the key while the agent sees only `****`.
    * text in a quoted here-document (`python3 - <<'EOF'`, `cat > notes.md <<'EOF'`) is
      data, not commands, unless it is fed to a shell; `echo $SSH_AUTH_SOCK` and other
      variables that only name a socket, folder or file are not treated as credentials;
-   * a script written with a quoted here-document (`cat > voices.mjs <<'EOF'`, `tee`) is data:
-     `process.env.ELEVENLABS_API_KEY`, `console.log(process.env)` or the words `.env file` in
-     it are fine. When the same command line names an interpreter (`node`, `python3`,
-     `ruby`, `perl`, `deno`, …) or a shell, the body may run, so dumping the whole environment
-     (`console.log(process.env)`, `print(os.environ)`) or opening a `.env` file
-     (`open('.env')`) in it is denied, as in `node -e '…'` and `python3 -c '…'`. Reading one
-     variable (`process.env.HOME`) is always fine, and `.env` is matched as a file path,
-     never inside `process.env`;
+   * a script written with a quoted here-document (`cat > voices.mjs <<'EOF'`, `tee notes.md`)
+     is data when `cat` or `tee` only writes it to a file that nothing else on the command line
+     uses: `process.env.ELEVENLABS_API_KEY`, `console.log(process.env)` or the words `.env file`
+     in it are fine. A body fed to anything else (a shell, `node -`, `python3 -`, `awk`, `make`,
+     `psql`, a program sealctl does not know), piped on, or run or read by the same line
+     (`cat > d.mjs <<'EOF'` … `node d.mjs`) is checked, so dumping the environment or opening a
+     `.env` file in it (`open('.env')`) is denied, as in `node -e '…'` and `python3 -c '…'`.
+     Reading one variable (`process.env.HOME`) is always fine, and `.env` is matched as a file
+     path, never inside `process.env`;
    * setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`) is
      denied: only you switch detection off;
    * where git signs through sealctl, turning signing off or pointing it at another program
