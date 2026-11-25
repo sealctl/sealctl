@@ -27,11 +27,17 @@ On a machine where sealctl serves SSH keys (`sealctl git setup`, `sealctl ssh`),
 `git commit` or `git tag`, `git push` over SSH and `ssh` ask the user's **phone**, not this
 computer. They print nothing while they wait: git hides the signer's output.
 
-- If such a command seems stuck, tell the user to approve the request in the sealctl app on
-  their phone. There is no prompt on the computer. Let the command keep waiting.
+- **sealctl does not change when you commit, tag, push or ssh.** Do it whenever you
+  normally would. The request on the phone *is* the user's approval: do not ask the user
+  for permission or a "ready" word first, and do not hold work back waiting for one. When
+  the session is Open, signing usually goes through without asking at all.
+- When you run such a command, say in one short line that the phone may ask (for example
+  "Committing; approve on your phone if it asks"). Let it wait; there is no prompt on
+  this computer.
 - `agent refused operation` (or `signing failed`) means the phone declined it or nobody
-  answered in time. Tell the user, and run the command again once they are ready to approve.
-  Do not switch to unsigned commits (`--no-gpg-sign`, `commit.gpgsign=false`) or another key
+  answered in time. Say so once, carry on with other work, and try again at the next point
+  where you would commit anyway, or when the user says so. Don't retry in a loop, and do
+  not switch to unsigned commits (`--no-gpg-sign`, `commit.gpgsign=false`) or another key
   unless the user asks for that.
 - `sealctl status` shows whether the session is Locked, Open or Waiting for the phone (it never
   asks the phone itself).
