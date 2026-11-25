@@ -916,10 +916,12 @@ fn config_changes_signing(args: &[String]) -> bool {
             pos.push(w);
             continue;
         }
-        if matches!(
-            w,
-            "-f" | "--file" | "--blob" | "--type" | "--default" | "--comment" | "--value"
-        ) {
+        // options that take the next word as their value, also abbreviated
+        if matches!(w, "-f" | "-t")
+            || ["--file", "--blob", "--type", "--default", "--comment", "--value"]
+                .iter()
+                .any(|long| abbreviates(w, long, 3))
+        {
             i += 1;
         } else if w == "-e" || abbreviates(w, "--edit", 3) {
             edit = true;
@@ -953,12 +955,8 @@ fn config_changes_signing(args: &[String]) -> bool {
     // the subcommand form (git 2.46): `git config set|unset|edit|remove-section|… …`
     match pos.first().copied() {
         Some("edit") => return true,
-        Some("set") => {
-            return pos
-                .get(1)
-                .is_some_and(|k| changes_signing(k, pos.get(2).copied()))
-        }
-        Some("unset") => return pos.get(1).is_some_and(|k| changes_signing(k, None)),
+        Some("set") => return pos[1..].windows(2).any(|kv| changes_signing(kv[0], Some(kv[1]))),
+        Some("unset") => return pos[1..].iter().any(|k| changes_signing(k, None)),
         Some("remove-section" | "rename-section") => return pos[1..].iter().any(|s| signing_section(s)),
         Some("get" | "list" | "get-color" | "get-colorbool") => return false,
         _ => {}
@@ -966,17 +964,17 @@ fn config_changes_signing(args: &[String]) -> bool {
     if edit {
         true
     } else if unset {
-        pos.first().is_some_and(|k| changes_signing(k, None))
+        // any positional, so an option value not known here cannot hide the key
+        pos.iter().any(|k| changes_signing(k, None))
     } else if section {
         pos.iter().any(|s| signing_section(s))
     } else if read {
         false
     } else {
-        // `git config <key> <value>` (also `--add`, `--replace-all`); a key alone reads it
-        match pos.as_slice() {
-            [key, value, ..] => changes_signing(key, Some(value)),
-            _ => false,
-        }
+        // `git config <key> <value>` (also `--add`, `--replace-all`); a key alone reads it. Every
+        // pair of neighbours is looked at, so an option value not known here cannot shift the key
+        // out of place.
+        pos.windows(2).any(|kv| changes_signing(kv[0], Some(kv[1])))
     }
 }
 
@@ -1660,6 +1658,13 @@ mod tests {
             "git config --worktree commit.gpgsign 0",
             "git config --system tag.gpgsign false",
             "git config --global --type=bool commit.gpgsign false",
+            "git config -t bool commit.gpgsign false",
+            "git config --ty bool commit.gpgsign false",
+            "git config --fil ~/.gitconfig commit.gpgsign false",
+            "git config set -t bool commit.gpgsign false",
+            "git config --comment why --global commit.gpgsign false",
+            "git config --unknown-option x commit.gpgsign false",
+            "git config --unset --unknown-option x commit.gpgsign",
             "git config --file ~/.gitconfig commit.gpgsign false",
             "git config -f ~/.gitconfig tag.gpgsign false",
             "git config --file=.git/config commit.gpgsign false",
