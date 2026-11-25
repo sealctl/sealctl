@@ -751,8 +751,8 @@ fn a_finished_delayed_action_leaves_the_pending_list() {
         "a finished action is no longer pending"
     );
 
-    // one whose relay record expired (15 minutes after `releaseAt`) while its `done` never
-    // came is not pending either
+    // one 15 minutes past its `releaseAt` whose `done` never came is not pending either (a
+    // machine's relay record is gone by then; `sealctl cancel` stops only what still waits)
     let stale = MessageKind::Notice {
         notice: Notice {
             what: "leave".into(),

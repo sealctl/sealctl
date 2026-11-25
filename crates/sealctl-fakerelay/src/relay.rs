@@ -714,7 +714,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                     sealed: None,
                     created,
                     release_at,
-                    expires: release_at + DELAYED_KEEP_MS,
+                    expires: release_at + PHONE_ACTION_KEEP_MS,
                     cancelled: None,
                 },
             );
@@ -725,7 +725,7 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             }
             ok(
                 201,
-                json!({"id": id, "releaseAt": release_at, "expires": release_at + DELAYED_KEEP_MS}),
+                json!({"id": id, "releaseAt": release_at, "expires": release_at + PHONE_ACTION_KEEP_MS}),
             )
         }
         (Method::GET, ["delayed"]) => {
@@ -767,7 +767,8 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             if d.cancelled.is_none() {
                 d.cancelled = Some((by.clone(), now_ms()));
                 d.sealed = None;
-                // kept through the plan window (nb + 30 min) and the signature window twice
+                // kept through the plan window (nb + 30 min) and the signature window twice;
+                // never shortened (an action on the phone is kept longer already)
                 d.expires = d.expires.max(d.release_at + CANCELLED_KEEP_MS);
                 let note = json!({"type": "cancelled", "id": id, "by": by}).to_string();
                 for t in p.phone_sockets.iter().chain(p.machine_sockets.values()) {
@@ -798,8 +799,10 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
     }
 }
 
-/// How long a delayed record stays after `releaseAt` (protocol.md, Delayed approvals).
+/// How long a machine's delayed record stays after `releaseAt` (protocol.md, Delayed approvals).
 const DELAYED_KEEP_MS: u64 = 900_000;
+/// A record with no machine (an action on the phone): an hour to come back and finish it.
+const PHONE_ACTION_KEEP_MS: u64 = 3_600_000;
 /// A cancelled one: the plan window (30 min from `nb`) plus the 300 s signature window twice.
 const CANCELLED_KEEP_MS: u64 = 2_400_000;
 

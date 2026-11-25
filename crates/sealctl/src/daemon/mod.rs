@@ -61,8 +61,9 @@ pub(crate) fn take_message(
     new || matches!(msg.kind, sealctl_core::wire::MessageKind::Lock { .. })
 }
 
-/// How long after its `releaseAt` a delayed action can still be pending: the relay deletes
-/// the record 15 minutes after it (protocol.md, Delayed approvals).
+/// How long after its `releaseAt` a delayed action can still be pending: the relay deletes a
+/// machine's record 15 minutes after it (protocol.md, Delayed approvals). One for an action on
+/// the phone stays an hour, but `sealctl cancel` stops only what still waits.
 const DELAYED_EXPIRES_MS: u64 = 15 * 60_000;
 
 /// The longest delay of a delayed action (protocol.md, Delayed approvals): one announced
