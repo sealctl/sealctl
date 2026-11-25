@@ -23,7 +23,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Level 3 notices are titled sealctl and no longer start with `sealctl:`.
 - The AI agent skill and session line say that signed git commits, `git push` over SSH and `ssh`
   wait silently for approval on the phone, and what `agent refused operation` means, so agents
-  no longer look for a prompt on the computer or fall back to unsigned commits.
+  no longer look for a prompt on the computer or fall back to unsigned commits. They also commit
+  whenever they normally would: the request on the phone is the approval, so they do not ask
+  you for a go-ahead first.
 - Agent hooks no longer deny harmless commands: text in a here-document fed to a program that
   is not a shell (a quoted `python3 - <<'EOF'`, notes written with `cat > file <<'EOF'`) is no
   longer read as commands, and `echo $SSH_AUTH_SOCK` and other variables ending in `_SOCK`,

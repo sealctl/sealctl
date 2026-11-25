@@ -986,6 +986,7 @@ fn session_line(names: &[String], signs: bool) -> String {
 /// the phone is asked, so an agent would otherwise look for a prompt on the computer.
 pub const GIT_SIGNING_CONTEXT: &str = "Signed git commits and tags, git push over SSH and ssh \
     wait silently for approval in the sealctl app on the user's phone (not on this computer); \
+    that request is the approval, so commit whenever you normally would without asking first. \
     \"agent refused operation\" means it was declined or not answered in time.";
 
 #[cfg(test)]
