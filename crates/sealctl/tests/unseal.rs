@@ -169,6 +169,11 @@ fn cancel_from_another_machine() {
     let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, Some(60));
     pty.line("unseal");
     pty.expect("Starts in", Duration::from_secs(60));
+    // a machine's delayed reply is kept 900 s after `releaseAt` (protocol.md, Delayed approvals)
+    let record = || env.block(env.phone.delayed()).unwrap()[0].clone();
+    let d = record();
+    let release_at = d["releaseAt"].as_u64().unwrap();
+    assert_eq!(d["expires"].as_u64(), Some(release_at + 900_000), "{d}");
     // the other machine sees it pending, and cancels it
     let (code, out, err) = second.run(&["status", "--json"]);
     assert_eq!(code, 0, "{err}");
@@ -181,6 +186,10 @@ fn cancel_from_another_machine() {
         out.contains("Google Find My Device") && out.contains("Apple Find My"),
         "{out}"
     );
+    // its tombstone is kept 2,400 s after `releaseAt`
+    let d = record();
+    assert_eq!(d["state"], "cancelled", "{d}");
+    assert_eq!(d["expires"].as_u64(), Some(release_at + 2_400_000), "{d}");
     let (code, _, screen) = pty.wait(Duration::from_secs(120));
     assert_eq!(code, 4, "{screen}");
     assert!(
