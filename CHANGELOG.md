@@ -17,6 +17,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - The AI agent skill and session line say that signed git commits, `git push` over SSH and `ssh`
   wait silently for approval on the phone, and what `agent refused operation` means, so agents
   no longer look for a prompt on the computer or fall back to unsigned commits.
+- Agent hooks no longer deny harmless commands: text in a here-document fed to a program that
+  is not a shell (a quoted `python3 - <<'EOF'`, notes written with `cat > file <<'EOF'`) is no
+  longer read as commands, and `echo $SSH_AUTH_SOCK` and other variables ending in `_SOCK`,
+  `_PID`, `_DIR`, `_PATH` or `_FILE` may be printed. Here-documents fed to a shell, and
+  substitutions in unquoted ones, are still checked.
 
 - Output names the 4-character fingerprint of your 24 words as the seed: `seed 6qdC` instead of
   `words 6qdC` (`volume ls`, `status`, `seal`, `migrate`, `recover` and error messages). JSON
