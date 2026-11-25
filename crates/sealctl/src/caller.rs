@@ -736,16 +736,17 @@ mod tests {
     #[test]
     fn another_process_has_a_folder_and_an_environment() {
         let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        // a clean environment: nothing of this process's goes into the child
-        let mut child = std::process::Command::new("/bin/sleep")
+        // a clean environment, only PATH to find `sleep` (the Nix build has no /bin/sleep)
+        let mut child = std::process::Command::new("sleep")
             .arg("5")
             .current_dir(&dir)
             .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("SEALCTL_CALLER_TEST", "yes")
             .spawn()
             .unwrap();
         let pid = child.id() as i32;
-        let wanted = |env: &[String]| env == ["SEALCTL_CALLER_TEST=yes"];
+        let wanted = |env: &[String]| env.iter().any(|e| e == "SEALCTL_CALLER_TEST=yes");
         // Linux: until the child runs `sleep`, its environment is still this process's; macOS
         // shows another process's environment to root only
         let mut env = env_of(pid);
