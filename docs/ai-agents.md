@@ -57,6 +57,12 @@ program gets the key while the agent sees only `****`.
      variables that only name a socket, folder or file are not treated as credentials;
    * setting or removing the agent variables (`SEALCTL_AGENT=0 …`, `unset CLAUDECODE`) is
      denied: only you switch detection off;
+   * where git signs through sealctl, turning signing off or pointing it at another program
+     or key is denied (`git -c commit.gpgsign=false`, `--no-gpg-sign`, `git config
+     commit.gpgsign false` or `--unset`, `gpg.format`, `gpg.ssh.program`, `user.signingkey`,
+     the same through `GIT_CONFIG_KEY_<n>`, `sealctl git setup --undo`): the request on your
+     phone is your approval, so only you change it. Reading config, `git commit -S` and
+     `git tag -s` are fine; where git does not sign through sealctl, nothing changes;
    * reading `.env` files or private keys, and writing key-like literals into files, is denied;
    * reading `*.sealed`, `machine.json` or sealctl's state folder is denied;
    * each session starts with one line: `sealctl: secrets are available by name through
@@ -73,8 +79,9 @@ program gets the key while the agent sees only `****`.
 
 What needs which layer: the refusals in layer 1 hold with no setup, in every agent. Everything
 in layers 2 and 3 — `.env` reads, environment dumps, `echo $KEY`, clipboard reads,
-`git credential fill`, changing the agent variables — holds only where `sealctl ai install` set
-up hooks or deny rules, and only as far as the agent runs them (see Limits).
+`git credential fill`, changing the agent variables, turning git signing off — holds only
+where `sealctl ai install` set up hooks or deny rules, and only as far as the agent runs them
+(see Limits).
 
 ## Support
 
