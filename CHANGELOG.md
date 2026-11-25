@@ -59,6 +59,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   helpers, the backup schedule) always show a desktop notification, also when an AI agent made
   them. Before, a daemon started from an agent's shell showed none, so a signed `git commit` run
   by an agent waited silently.
+- `sealctl lock` (and `volume close`) right after a backup or a write could leave a volume
+  mounted and exit 11 with `Volume <name> is busy: hdiutil detach ... Resource busy`, when a
+  macOS service still held the volume for a few seconds. An unmount refused while none of your
+  processes has files open on the volume is now tried again for up to 10 seconds; a volume one
+  of your processes holds is still reported busy at once, with the process.
 
 ## 0.7.0 - 2026-11-24
 
