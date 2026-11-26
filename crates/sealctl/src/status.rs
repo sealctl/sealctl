@@ -75,15 +75,15 @@ fn describe(paired: &Paired, d: &approve::Delayed) -> (String, Option<String>) {
     }
 }
 
-/// The first line of `sealctl status` while Open, from the daemon's `status`: "active" while
-/// the machine works, else how long it has been idle and when it locks (SPEC 10.1). A daemon
-/// still running from an older version sends only `left`.
-fn open_line(d: &Value) -> String {
+/// The first line of `sealctl status` while Open, from the daemon's `status` at `now` (Unix
+/// ms): "active" while the machine works, else how long until it locks, counted down in whole
+/// minutes (SPEC 10.1). A daemon still running from an older version sends only `left`.
+fn open_line(d: &Value, now: u64) -> String {
     let stop = d["hardStop"]
         .as_u64()
         .map(|h| format!(" · hard stop {}", session::hhmm(h)))
         .unwrap_or_default();
-    match (d["active"].as_bool(), d["idleSecs"].as_u64()) {
+    match (d["active"].as_bool(), d["locksAt"].as_u64()) {
         (Some(true), _) => {
             let after = d["allowanceSecs"]
                 .as_u64()
@@ -91,17 +91,22 @@ fn open_line(d: &Value) -> String {
                 .unwrap_or_default();
             format!("Open · active{after}{stop}")
         }
-        (Some(false), Some(idle)) => {
-            let at = d["locksAt"]
-                .as_u64()
-                .map(|t| format!(" · locks at {}", session::hhmm(t)))
-                .unwrap_or_default();
-            format!("Open · idle {}{at}{stop}", session::duration(idle))
-        }
+        (Some(false), Some(at)) => format!("Open · locks in {}{stop}", locks_in(at, now)),
         _ => {
             let left = d["left"].as_u64().unwrap_or(0);
             format!("Open · {} left{stop}", session::duration(left))
         }
+    }
+}
+
+/// The time until `at` from `now` (Unix ms) in whole minutes, rounded down: "3 h 47 min",
+/// "47 min", "under a minute".
+fn locks_in(at: u64, now: u64) -> String {
+    let secs = at.saturating_sub(now) / 1000;
+    if secs < 60 {
+        "under a minute".into()
+    } else {
+        session::duration(secs)
     }
 }
 
@@ -184,7 +189,7 @@ pub fn status(json_out: bool) -> Result<i32> {
         return Ok(exit::NOT_PAIRED);
     };
     let first = match state.as_str() {
-        "open" => open_line(daemon.as_ref().unwrap_or(&Value::Null)),
+        "open" => open_line(daemon.as_ref().unwrap_or(&Value::Null), machine::now_ms()),
         "waiting" => {
             let since = daemon
                 .as_ref()
@@ -475,7 +480,7 @@ mod tests {
         let d = json!({"left": 14_390, "active": true, "idleSecs": 10, "allowanceSecs": 14_400,
             "locksAt": STOP - 3_600_000, "hardStop": STOP});
         assert_eq!(
-            open_line(&d),
+            open_line(&d, STOP - 5 * 3_600_000),
             format!(
                 "Open · active · locks after 4 h idle · hard stop {}",
                 session::hhmm(STOP)
@@ -484,17 +489,50 @@ mod tests {
     }
 
     #[test]
-    fn open_says_how_long_idle_and_when_it_locks() {
+    fn open_counts_down_to_the_lock_once_idle() {
         let locks = STOP - 5 * 3_600_000;
         let d = json!({"left": 13_680, "active": false, "idleSecs": 720, "allowanceSecs": 14_400,
             "locksAt": locks, "hardStop": STOP});
+        let line = |now: u64| open_line(&d, now);
+        let stop = format!(" · hard stop {}", session::hhmm(STOP));
+        let min = 60_000;
+        // whole minutes, rounded down
         assert_eq!(
-            open_line(&d),
-            format!(
-                "Open · idle 12 min · locks at {} · hard stop {}",
-                session::hhmm(locks),
-                session::hhmm(STOP)
-            )
+            line(locks - 227 * min - 30_000),
+            format!("Open · locks in 3 h 47 min{stop}")
+        );
+        assert_eq!(
+            line(locks - 227 * min),
+            format!("Open · locks in 3 h 47 min{stop}")
+        );
+        assert_eq!(
+            line(locks - 227 * min + 1),
+            format!("Open · locks in 3 h 46 min{stop}")
+        );
+        assert_eq!(line(locks - 180 * min), format!("Open · locks in 3 h{stop}"));
+        assert_eq!(
+            line(locks - 47 * min - 59_000),
+            format!("Open · locks in 47 min{stop}")
+        );
+        assert_eq!(line(locks - min), format!("Open · locks in 1 min{stop}"));
+        assert_eq!(
+            line(locks - 59_999),
+            format!("Open · locks in under a minute{stop}")
+        );
+        assert_eq!(
+            line(locks + 5_000),
+            format!("Open · locks in under a minute{stop}")
+        );
+    }
+
+    #[test]
+    fn the_countdown_is_to_the_hard_stop_when_that_comes_first() {
+        // the daemon's locksAt is already the hard stop then
+        let d = json!({"left": 13_680, "active": false, "idleSecs": 720, "allowanceSecs": 14_400,
+            "locksAt": STOP, "hardStop": STOP});
+        assert_eq!(
+            open_line(&d, STOP - 25 * 60_000),
+            format!("Open · locks in 25 min · hard stop {}", session::hhmm(STOP))
         );
     }
 
@@ -502,9 +540,9 @@ mod tests {
     fn an_older_daemon_still_shows_the_time_left() {
         let d = json!({"left": 11_520, "hardStop": STOP});
         assert_eq!(
-            open_line(&d),
+            open_line(&d, STOP - 5 * 3_600_000),
             format!("Open · 3 h 12 min left · hard stop {}", session::hhmm(STOP))
         );
-        assert_eq!(open_line(&json!({"left": 1_800})), "Open · 30 min left");
+        assert_eq!(open_line(&json!({"left": 1_800}), 0), "Open · 30 min left");
     }
 }
