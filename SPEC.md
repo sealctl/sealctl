@@ -173,7 +173,7 @@ Paths use the XDG variables when set, else these defaults, on macOS and Linux al
 | `~/.local/state/sealctl/usage.jsonl` | Uses not yet acknowledged by the phone: time, agent, repo, masked command, names | Names only |
 | `~/.local/state/sealctl/month.json` | Monthly counters: keys used, requests declined | No |
 | `~/.local/state/sealctl/inventory.json` | Objects this machine knows (section 15) | No |
-| `~/.local/state/sealctl/licence.json` | Last licence answer and its time; time of the last ask | No |
+| `~/.local/state/sealctl/licence.json` | Last licence answer and its time; time of the last ask and which one-time notes were shown | No |
 | `~/.local/state/sealctl/migrate.json` | Re-encryption job state | No |
 | `~/.local/state/sealctl/projects.json` | Project files trusted on this machine (10.3): canonical path, SHA-256 of the content, time trusted. No names, no values | No |
 | `~/.local/state/sealctl/backup/<name>.toml` | Last backup times and last error | No |
@@ -402,7 +402,7 @@ At start the daemon sets `RLIMIT_CORE` to 0, on Linux `prctl(PR_SET_DUMPABLE, 0)
 - Loops never call the relay again at once (staging incident 2026-11-22): the machine socket reconnects after 2 s doubling to 300 s (±20% jitter, at least a `429`'s `retryAfter`), starting over only after a socket stayed open a minute; a failed status is tried again after a minute; the test phone in `sealctl-fakerelay` pauses after every poll, failed ones doubling up to 30 s.
 - Wait sockets send `ping` every 30 seconds (planned on the relay; harmless before) and keep their own 300-second timer, since the relay has no expiry timer.
 - A `403 forbidden` or a wait closed with `unpaired` or `moved` makes the daemon look itself up (`GET /v1/machines/{machine}`): a move proof moves it to the new phone key (protocol.md); `404 not_paired` locks and marks the machine unpaired (exit 3 for the caller).
-- Licence answers are cached for 1 hour in `licence.json`. `sealctl status` refreshes a stale cache with a 2-second timeout and shows the cached value when the relay is slow.
+- Licence answers are cached for 1 hour in `licence.json`; a cached feedback licence whose `until` has passed makes the cache stale at once and counts as unpaid (19.3). `sealctl status` refreshes a stale cache with a 2-second timeout and shows the cached value when the relay is slow.
 - The client logs method, path, status and duration at `debug`; never headers, bodies or sealed strings.
 
 ## 8. Pairing
@@ -495,7 +495,7 @@ Unpaid · sealctl buy
 - First line: `Locked`, `Locked from your phone`, `Locked: your phone left the place`, `Open · <time> left · hard stop <HH:MM>`, or `Waiting for your phone (asked 0:42 ago)`. Not paired: `Not paired · sealctl pair`.
 - A running migration adds `Migrate   re-encrypting volume safe · 41% · about 2 min left` (or `paused: battery below 20%`).
 - A pending level 3 action adds `Pending   leaving sealctl, approved on your phone · takes effect 11:00 · sealctl cancel`; `--json` has `"pending": [{"id", "what", "machine", "at"}]`.
-- The licence line is `Unpaid · sealctl buy`, or `Paid`. When the relay was never reached it is left out.
+- The licence line is `Unpaid · sealctl buy`, `Licensed until 2027-11-26 (feedback)` (the local date a feedback licence ends, 19.3), or `Paid`. When the relay was never reached it is left out.
 - "nothing written to disk" means no value was written to a file by sealctl this month; `secret get` to a pipe or `recover --out` replaces it with `values given out: <n>`.
 
 `sealctl status --json`:
@@ -515,11 +515,12 @@ Unpaid · sealctl buy
   "migrate": null,
   "month": {"keysUsed": 214, "declined": 0, "valuesGivenOut": 0},
   "licence": "unpaid",
+  "until": null,
   "daemon": "running"
 }
 ```
 
-`licence` is `"paid"`, `"unpaid"` or `"unknown"`, as a plain fact.
+`licence` is `"paid"`, `"feedback"`, `"unpaid"` or `"unknown"`, as a plain fact. `until` is when a feedback licence ends (RFC 3339, local offset), `null` otherwise.
 
 ### 10.2 Secrets
 
@@ -1076,11 +1077,16 @@ Text, with `daysUsed` from the relay:
 You've used sealctl on 41 days. It's $5.99 once: sealctl buy
 ```
 
+Two other lines take the ask's place under the same rules (same commands, a person, a fresh cache, 7 days since the last of any of them), each shown once:
+
+- a feedback licence (19.3) in its last 30 days, once per licence: `Your free year of sealctl ends on 26 Nov 2027. It's $5.99 once: sealctl buy`;
+- for a phone that said it would buy (`intent: true`, unpaid), once card payments are open (`payments: true`): `Card payments are open, as you asked to hear. It's $5.99 once: sealctl buy`.
+
 Never in `sealctl run` output, pipes, CI, hooks or anything an agent reads; never a countdown; never on the phone. `sealctl status` always shows `Unpaid · sealctl buy` while unpaid (that line is a fact, not the ask), and `--json` carries `"licence": "unpaid"`. The monthly summary line shows paid or not.
 
 ### 19.2 `sealctl buy`
 
-Needs a pairing (the licence is attached to the phone key). Refused inside an AI agent (exit 8). Without `--seats` or `--code` it needs a terminal.
+Needs a pairing (the licence is attached to the phone key). Refused inside an AI agent (exit 8). Without `--seats` or `--code` it needs a person at a terminal: stdin and stderr are terminals and `CI` is unset, else exit 8. It reads the licence first (`GET .../licence`); when the relay says `payments: false`, it shows the menu of 19.3 instead.
 
 ```text
 $ sealctl buy
@@ -1088,20 +1094,61 @@ Who pays?
   1  Me             card, opens checkout
   2  My company     invoice with VAT ID, opens checkout
   3  Someone else   copies a payment link to send
-Choose 1, 2 or 3:
+  4  Give feedback instead
+Choose 1, 2, 3 or 4:
 ```
+
+Line 4 is there only while the relay says `feedback: false` (this phone key never gave feedback); without it the prompt is `Choose 1, 2 or 3:`. An answer that is not one of the numbers is asked again (`Type a number from 1 to 4.`); the end of input leaves without doing anything (exit 0).
 
 | Choice | Does |
 | --- | --- |
 | 1 | `POST /v1/phones/{phone}/checkout` with `{"seats": 1}`, opens the link (`open` or `xdg-open`), prints it, then checks the licence every 5 seconds for up to 15 minutes: `Waiting for the payment. Ctrl-C stops waiting; sealctl status shows it later.` Then `Paid. Thank you.` |
 | 2 | Same checkout (Paddle asks for the company and VAT ID), and copies a message for the team chat: `Could we get sealctl for me? It keeps API keys away from AI agents. $5.99 once: <link>` |
 | 3 | Copies the link and prints it: `Link copied. Anyone can pay it; sealctl status shows Paid afterwards.` No wait |
+| 4 | The questionnaire of 19.3 |
 
 - `--seats N` (2 to 1,000): checkout for N seats; after payment prints `Seat code ACME-7KQ2 (10 seats, 1 used by you). Each developer runs: sealctl buy --code ACME-7KQ2`.
 - `--code CODE`: `POST /v1/phones/{phone}/claim`: `Paid with a seat from ACME-7KQ2. 8 seats left.` Errors map: `unknown_code` → exit 9 `No such code.`; `no_seats_left` → exit 1 `That code has no seats left.`; `already_paid` → exit 0 `This phone is already paid.`
 - `already_paid` on checkout for one seat: exit 0 `Already paid. Thank you.`
-- `payments_not_configured` or `payments_unavailable`: exit 6 with the status link.
+- `payments_not_configured` or `payments_unavailable`: with `--seats`, exit 6 with the status link. From the menu (a relay that does not send `payments` yet), the menu of 19.3 follows.
 - A licence never blocks keys, `recover`, the words or any command. The machine gate (off at launch) is applied by the relay at pairing only.
+
+### 19.3 Before card payments open: intent and feedback
+
+While the relay says `payments: false`, `sealctl buy` measures who would buy, and trades a few answers for a year's licence. A paid phone gets `Already paid. Thank you.` (exit 0). Otherwise:
+
+```text
+$ sealctl buy
+sealctl is $5.99 once. Card payments open soon.
+  1  I'd buy it      sealctl tells you here when you can (nothing is charged)
+  2  Give feedback   2 minutes; you get a year free
+  3  Not now
+Choose 1, 2 or 3:
+```
+
+| Choice | Does |
+| --- | --- |
+| 1 | `POST /v1/phones/{phone}/intent` with `{}`, then `Noted. Thank you: sealctl will tell you here when you can buy.` When payments open, the ask's place carries a one-time line saying so (19.1) |
+| 2 | The questionnaire below |
+| 3 | Nothing |
+
+The questionnaire (also choice 4 of 19.2). Each answer is checked and asked again when it does not fit; the end of input stops it with `Nothing sent.` (exit 1).
+
+| Question | Answers | Sent as |
+| --- | --- | --- |
+| `What do you use sealctl for? Pick any, like 1,3 or 1 3.` | 1 AI agents and API keys, 2 SSH and git signing, 3 Encrypted volumes, 4 Backups, 5 Something else; numbers separated by commas or spaces | `use` |
+| `Would $5.99 once be fair?` | 1 Yes, 2 I'd pay more, 3 Too much, 4 I wouldn't pay | `price` |
+| `What's missing? Pick any, like 1,3 or 1 3.` | 1 Windows, 2 The iPhone app on the App Store, 3 Teams, 4 Password managers, 5 Nothing (only on its own), 6 Something else | `missing` |
+| `Anything else? One line, or Enter to skip:` | Up to 280 characters, no control characters (protocol.md) | `text`, when not empty |
+
+Then one line, `Sent with this phone's id; no name or email.`, the `POST /v1/phones/{phone}/feedback`, a refreshed licence cache, and the result, with the date in local time:
+
+- granted: `Sent. Licensed until 26 Nov 2027. Thank you.`
+- already paid: `Sent. This phone is already paid. Thank you.`
+- a feedback licence still valid: `Sent. Thank you. This phone has its free year already: licensed until 26 Nov 2027.`
+- one that has ended: `Sent. Thank you. The free year comes once per phone, and this one has had it.`
+
+**The feedback licence.** One year from the first feedback, once per phone key (protocol.md, Buy intent and feedback). While it lasts, `status` shows `Licensed until 2027-11-26 (feedback)` and `--json` `"licence": "feedback"` with `"until"`, and the relay sends no ask. When `until` passes, the CLI counts the phone as unpaid at once, from the cache, and refreshes it at its next licence read without waiting out the hour; the usual ask (19.1) resumes. Deleting the relay data deletes the answers and the intent but keeps the licence record (granted, and `until`), as for a paid licence: a phone restored from the words keeps the rest of its year and never gets a second one.
 
 ## 20. Security requirements
 
@@ -1179,7 +1226,7 @@ Each milestone ends with its acceptance tests green in CI.
 | M4 | Volumes and backups | APFS, sparse bundle and LUKS create/open/close on real tools in CI; busy-volume naming; backups to a folder and MinIO with stored credentials, schedule, on-lock backup |
 | M5 | Changing words | Rewrap of every object kind by itself after a scripted words change; `migrate` table and estimates; re-encryption job resumes after a kill and pauses on a faked battery; S3 old-version deletion; `--scan`; `old_words` |
 | M6 | Recovery, seal and unseal | `recover` for every target on a clean machine with no config; `seal` and `unseal` of every object kind and `unseal --all` per 18.8, real OS tests included; the round trip: a hand-back list sealed again with `seal --from`, every object opening afterwards |
-| M7 | Licence | `buy` (all three choices, `--seats`, `--code`) against the fake relay's checkout and claim; the ask appears only under its rules (tests for agent, pipe, CI, 7-day spacing) |
+| M7 | Licence | `buy` (all three choices, `--seats`, `--code`) against the fake relay's checkout and claim; the ask appears only under its rules (tests for agent, pipe, CI, 7-day spacing); intent, the questionnaire on a terminal with wrong answers asked again, the feedback licence in `status` and its end, `buy` menus refused to agents, CI and pipes; the fake relay's intent, feedback checks, grant once, expiry, and delete keeping the licence record but not the answers |
 | M8 | Release | Staging relay and real phones per section 22's manual list, including "Leave sealctl" on the phone; packages and Homebrew install; attestations; `cli.md`; docs (`README.md`, `docs/ai-agents.md`, `docs/threat-model.md`, `docs/design.md`, `docs/unseal.md`); `CHANGELOG.md` and `SECURITY-CHANGELOG.md` |
 
 ## 25. Things other repositories rely on

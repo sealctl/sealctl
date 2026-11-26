@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Added
+
+- `sealctl buy` while card payments are not open on the relay: `1  I'd buy it` records that you
+  would buy (nothing is charged) so sealctl can tell you when you can, and `2  Give feedback`
+  asks four short questions and gives a year's licence, once per phone. The answers are sent
+  with the phone's id; no name or email. With payments open, the usual menu adds
+  `4  Give feedback instead` until this phone has given feedback. Wrong answers in the menus
+  are asked again instead of ending the command, and the menus are refused in CI as well as in
+  pipes and AI agents.
+- `sealctl status` shows `Licensed until 2027-11-26 (feedback)` while a feedback licence lasts,
+  and `--json` has `"licence": "feedback"` with `"until"`. When it ends, sealctl counts the
+  phone as unpaid at once instead of waiting for the hour-long licence cache. In its last 30
+  days, one line after a command you typed says when it ends.
+- Protocol: `POST /v1/phones/{phone}/intent` and `POST /v1/phones/{phone}/feedback`, and the
+  licence answer's `kind`, `until`, `feedback`, `intent` and `payments` (docs/protocol.md,
+  planned on the relay). Deleting a phone's relay data deletes its feedback answers and
+  intent; the feedback licence record (granted, and its end) stays, as a paid one does.
+
 ### Changed
 
 - The session's hard stop is now 02:00 local time or 24 hours after the first `open` granted

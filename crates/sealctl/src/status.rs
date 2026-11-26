@@ -137,6 +137,7 @@ pub fn status(json_out: bool) -> Result<i32> {
             "migrate": Value::Null,
             "month": m,
             "licence": lic.as_ref().map(|c| c.licence()).unwrap_or("unknown"),
+            "until": lic.as_ref().and_then(licence::Cache::feedback_until).map(session::rfc3339),
             "daemon": if daemon.is_some() { "running" } else { "stopped" },
         });
         println!("{out}");
@@ -245,6 +246,13 @@ pub fn status(json_out: bool) -> Result<i32> {
     );
     match lic.as_ref().map(|c| c.licence()) {
         Some("paid") => println!("Paid"),
+        Some("feedback") => {
+            let until = lic.as_ref().and_then(licence::Cache::feedback_until);
+            println!(
+                "Licensed until {} (feedback)",
+                until.map(licence::short_date).unwrap_or_default()
+            );
+        }
         Some("unpaid") => println!("Unpaid · sealctl buy"),
         _ => {}
     }

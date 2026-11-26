@@ -18,10 +18,11 @@ program gets the key while the agent sees only `****`.
 1. **sealctl itself** — works with every agent, no setup:
    * `sealctl run` replaces secret values with `****` in everything the program prints, whenever
      it runs inside an agent or its output isn't a terminal.
-   * `secret get`, `recover`, `seal`, `unseal`, `buy`, `unpair`, `project trust`, `scan` and `migrate` refuse
-     inside an agent (exit 8; detected by the environment variables agents set: `CLAUDECODE`,
-     `CODEX_THREAD_ID`, `GEMINI_CLI`, `QWEN_CODE`, `COPILOT_AGENT_SESSION_ID`, `OPENCODE`,
-     `AI_AGENT`, …; force with `SEALCTL_AGENT=1`). `SEALCTL_AGENT=0` turns detection off,
+   * `secret get`, `recover`, `seal`, `unseal`, `buy` (its intent and feedback questions too),
+     `unpair`, `project trust`, `scan` and `migrate` refuse inside an agent (exit 8; detected
+     by the environment variables agents set: `CLAUDECODE`, `CODEX_THREAD_ID`, `GEMINI_CLI`,
+     `QWEN_CODE`, `COPILOT_AGENT_SESSION_ID`, `OPENCODE`, `AI_AGENT`, …; force with
+     `SEALCTL_AGENT=1`). `SEALCTL_AGENT=0` turns detection off,
      also when those variables are set; it is for you, not the agent (the hooks deny an agent
      setting it), and sealctl then says on stderr, once per command, that detection is off
      although an agent is running.
