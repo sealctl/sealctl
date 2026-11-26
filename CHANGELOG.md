@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Changed
+
+- The session's hard stop is now 02:00 local time or 24 hours after the first `open` granted
+  today, whichever comes first (it was 14 hours). A session first opened in the morning stays
+  Open until 02:00 that night while you keep working; one opened at 03:00 runs until 02:00 the
+  next night. The idle allowance, the nights when the clocks change and a clock set back work
+  as before.
+
 ### Fixed
 
 - Agent hooks no longer deny writing a script with a quoted here-document

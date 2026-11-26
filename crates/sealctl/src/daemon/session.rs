@@ -63,17 +63,21 @@ pub fn idle_allowance(cap: u64, base: u64, rate: u64, worked: u64) -> u64 {
     cap.min(base.saturating_add(rate.saturating_mul(worked)))
 }
 
-/// The hard stop for a session first opened at `first_open` (Unix ms): 02:00 local time or 14
-/// hours after the first open, whichever comes first.
+/// The longest a session lasts after the first `open` granted today (SPEC 6.4): the hard stop
+/// is 02:00 local time or this long after the first open, whichever comes first.
+pub const HARD_STOP_AFTER_MS: u64 = 24 * 3_600_000;
+
+/// The hard stop for a session first opened at `first_open` (Unix ms): 02:00 local time or 24
+/// hours after the first open ([`HARD_STOP_AFTER_MS`]), whichever comes first.
 pub fn hard_stop(first_open: u64) -> u64 {
     hard_stop_in(first_open, &TimeZone::system())
 }
 
 /// [`hard_stop`] in the time zone `tz`.
 pub fn hard_stop_in(first_open: u64, tz: &TimeZone) -> u64 {
-    let fourteen = first_open + 14 * 3600 * 1000;
+    let latest = first_open.saturating_add(HARD_STOP_AFTER_MS);
     let Some(start) = crate::clock::from_ms(first_open) else {
-        return fourteen;
+        return latest;
     };
     let first_day = start.to_zoned(tz.clone()).date();
     let mut day = first_day;
@@ -90,7 +94,7 @@ pub fn hard_stop_in(first_open: u64, tz: &TimeZone) -> u64 {
         for t in times.into_iter().flatten() {
             let ms = t.timestamp().as_millisecond();
             if ms > first_open as i64 {
-                return (ms as u64).min(fourteen);
+                return (ms as u64).min(latest);
             }
         }
         match day.tomorrow() {
@@ -98,7 +102,7 @@ pub fn hard_stop_in(first_open: u64, tz: &TimeZone) -> u64 {
             Err(_) => break,
         }
     }
-    fourteen
+    latest
 }
 
 /// `HH:MM` of a Unix ms time, local.
@@ -262,14 +266,14 @@ mod tests {
     }
 
     #[test]
-    fn hard_stop_is_at_most_fourteen_hours() {
+    fn hard_stop_is_at_most_a_day() {
         let t0 = 1_800_000_000_000u64;
         let h = hard_stop(t0);
         assert!(h > t0);
-        assert!(h <= t0 + 14 * 3600 * 1000);
-        let fourteen = h == t0 + 14 * 3600 * 1000;
-        assert!(fourteen || hhmm(h) == "02:00");
-        // in other zones too: 02:00 local, or fourteen hours
+        assert!(h <= t0 + HARD_STOP_AFTER_MS);
+        let a_day = h == t0 + HARD_STOP_AFTER_MS;
+        assert!(a_day || hhmm(h) == "02:00");
+        // in other zones too: the next 02:00 local, or 24 hours
         for tz in [
             "Europe/Warsaw",
             "America/Los_Angeles",
@@ -290,21 +294,68 @@ mod tests {
                     .tomorrow()
                     .unwrap()
                     .at(2, 0, 0, 0)
-                    .to_zoned(zone)
+                    .to_zoned(zone.clone())
                     .unwrap()
             };
-            let want = (two.timestamp().as_millisecond() as u64).min(t0 + 14 * 3600 * 1000);
-            assert!(want > t0 && want <= t0 + 14 * 3600 * 1000, "{tz}");
+            let want = (two.timestamp().as_millisecond() as u64).min(t0 + HARD_STOP_AFTER_MS);
+            assert!(want > t0 && want <= t0 + HARD_STOP_AFTER_MS, "{tz}");
+            assert_eq!(hard_stop_in(t0, &zone), want, "{tz}");
         }
+    }
+
+    /// Europe/Warsaw as a POSIX rule, so the tests run without a time zone database.
+    fn warsaw() -> TimeZone {
+        TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap()
+    }
+
+    fn ms(s: &str) -> u64 {
+        s.parse::<jiff::Timestamp>().unwrap().as_millisecond() as u64
+    }
+
+    #[test]
+    fn a_session_first_opened_at_07_15_is_open_at_23_59_and_stops_at_02_00() {
+        let warsaw = warsaw();
+        // 07:15 CET
+        let first_open = ms("2027-01-15T06:15:00Z");
+        let stop = hard_stop_in(first_open, &warsaw);
+        // 23:59 the same day: still before the stop
+        assert!(ms("2027-01-15T22:59:00Z") < stop);
+        // 02:00 the next night, 18 h 45 min after the first open (before 24 hours)
+        assert_eq!(stop, ms("2027-01-16T01:00:00Z"));
+        assert_eq!(stop - first_open, (18 * 60 + 45) * 60_000);
+        // the same through `Saved`, in this machine's zone
+        let local = |day: i8, h: i8, m: i8| {
+            jiff::civil::date(2027, 1, day)
+                .at(h, m, 0, 0)
+                .to_zoned(TimeZone::system())
+                .unwrap()
+                .timestamp()
+                .as_millisecond() as u64
+        };
+        let s = Saved {
+            first_open: Some(local(15, 7, 15)),
+            ..Saved::default()
+        };
+        assert!(!s.past_hard_stop(local(15, 23, 59)));
+        assert!(!s.past_hard_stop(local(16, 1, 59)));
+        assert!(s.past_hard_stop(local(16, 2, 0)));
+    }
+
+    #[test]
+    fn a_session_first_opened_at_03_00_runs_until_02_00_the_next_night() {
+        // about 23 hours, the longest a session runs to 02:00
+        assert_eq!(
+            hard_stop_in(ms("2027-01-15T02:00:00Z"), &warsaw()),
+            ms("2027-01-16T01:00:00Z")
+        );
     }
 
     #[test]
     fn hard_stop_across_daylight_saving_changes() {
         // POSIX rules, so the test runs without a time zone database: Europe/Warsaw and
         // America/Los_Angeles as of 2026
-        let warsaw = jiff::tz::TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+        let warsaw = warsaw();
         let la = jiff::tz::TimeZone::posix("PST8PDT,M3.2.0,M11.1.0").unwrap();
-        let ms = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_millisecond() as u64;
         // autumn: 02:00 to 02:59 come twice (03:00 CEST back to 02:00 CET). Opened at 02:30
         // CEST, the next 02:00 is the second one, half an hour later.
         assert_eq!(
@@ -316,25 +367,36 @@ mod tests {
             hard_stop_in(ms("2026-10-24T18:00:00Z"), &warsaw),
             ms("2026-10-25T00:00:00Z")
         );
+        // opened at the second 02:00 (CET): the next 02:00 is 24 hours away, the same moment
+        assert_eq!(
+            hard_stop_in(ms("2026-10-25T01:00:00Z"), &warsaw),
+            ms("2026-10-26T01:00:00Z")
+        );
         // spring: 02:00 does not exist; the stop is when the clock jumps to 03:00 CEST
         assert_eq!(
             hard_stop_in(ms("2026-03-28T20:00:00Z"), &warsaw),
             ms("2026-03-29T01:00:00Z")
         );
-        // opened right after the jump: the next night, or 14 hours
+        // opened right after the jump: 02:00 the next night, 23 hours later
         assert_eq!(
             hard_stop_in(ms("2026-03-29T01:00:00Z"), &warsaw),
-            ms("2026-03-29T15:00:00Z")
+            ms("2026-03-30T00:00:00Z")
         );
         // 01:00 to 01:59 come twice there; 02:00 PST once
         assert_eq!(
             hard_stop_in(ms("2026-11-01T08:30:00Z"), &la),
             ms("2026-11-01T10:00:00Z")
         );
-        // opened exactly at 02:00: the next 02:00 is a day away, so 14 hours
+        // there the day before has 25 hours from 02:00 PDT to 02:00 PST: opened at 02:30 PDT,
+        // 24 hours comes first, at 01:30 PST
+        assert_eq!(
+            hard_stop_in(ms("2026-10-31T09:30:00Z"), &la),
+            ms("2026-11-01T09:30:00Z")
+        );
+        // opened exactly at 02:00: the next 02:00 is 24 hours away, the same moment
         assert_eq!(
             hard_stop_in(ms("2027-01-15T01:00:00Z"), &warsaw),
-            ms("2027-01-15T15:00:00Z")
+            ms("2027-01-16T01:00:00Z")
         );
         // a minute before 02:00: one minute
         assert_eq!(

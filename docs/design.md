@@ -69,7 +69,7 @@ cancelled from the phone or any paired machine (`sealctl cancel`).
 The daemon opens the session with one `open` request covering the store key, the keys of
 volumes that mount with the session, and backup keys. The idle allowance is
 `min(cap, base + rate × minutes worked)` with `cap/base/rate` from the phone's reply (they
-depend on where the phone is); the hard stop is 02:00 or 14 hours after the first open. Credit
+depend on where the phone is); the hard stop is 02:00 or 24 hours after the first open. Credit
 survives locks and restarts (`session.json`, no keys). Locking wipes the keys, runs on-lock
 backups, closes volumes and tells the phone. While Open, the daemon keeps the machine socket
 to the relay: it sends sealed status (state, time left, usage log) and applies sealed

@@ -288,6 +288,43 @@ async fn past_the_hard_stop_a_session_hands_out_no_key_before_the_tick() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_session_first_opened_at_07_15_is_open_at_23_59_and_stops_at_02_00() {
+    let (d, _) = testing::daemon(DEAD);
+    let local = |day: i8, h: i8, m: i8| {
+        jiff::civil::date(2027, 1, day)
+            .at(h, m, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::system())
+            .unwrap()
+            .timestamp()
+            .as_millisecond() as u64
+    };
+    let first = local(15, 7, 15);
+    d.t.set_now(first);
+    open(&d, &store_items()).await;
+    assert_eq!(d.st().saved.first_open, Some(first));
+    assert_eq!(session::hard_stop(first), local(16, 2, 0));
+    // a use every minute up to 23:59: past 14 hours (21:15) and still Open
+    let mut t = first;
+    for until in [local(15, 23, 59), local(16, 1, 59)] {
+        while t < until {
+            t += 60_000;
+            d.t.set_now(t);
+            d.st().saved.work(t);
+        }
+        d.tick().await;
+        assert!(d.st().open, "still Open at {}", session::hhmm(t));
+    }
+    // 02:00: the hard stop locks and resets the credit
+    d.t.set_now(local(16, 2, 0));
+    d.tick().await;
+    settle().await;
+    let st = d.st();
+    assert!(!st.open);
+    assert_eq!(st.saved.worked, 0);
+    assert!(st.saved.first_open.is_none());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_clock_set_back_locks_the_session() {
     let (d, _) = testing::daemon(DEAD);
     open(&d, &store_items()).await;

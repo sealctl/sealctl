@@ -142,13 +142,14 @@ impl Drop for Stopped {
     }
 }
 
-/// Test time: about 2027-01-15, moved to an hour whose hard stop (in this machine's zone) is the
-/// full 14 hours away, so idle tests do not run into it.
+/// Test time: about 2027-01-15, moved to the hour whose hard stop (in this machine's zone) is
+/// furthest away (02:00 local where the zone is on a whole hour: 24 hours), so idle tests do not
+/// run into it.
 pub fn t0() -> u64 {
     let base = 1_800_000_000_000u64;
-    (0..48)
+    (0..24)
         .map(|h| base + h * 3_600_000)
-        .find(|&t| super::session::hard_stop(t) == t + 14 * 3_600_000)
+        .max_by_key(|&t| super::session::hard_stop(t) - t)
         .unwrap_or(base)
 }
 
