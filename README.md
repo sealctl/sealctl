@@ -18,7 +18,7 @@ you approve, and **the 24 words alone open every object**, with no phone, relay 
   sealed strings, ids and timing.
 - **One tap a day.** The first use opens a session on the machine; while it is Open, the
   daemon holds the keys and nothing asks again until the idle allowance runs out (it grows the
-  more you work, 4 hours at most at a trusted place) or the hard stop (02:00 or 14 hours). The
+  more you work, 4 hours at most at a trusted place) or the hard stop (02:00 or 24 hours). The
   phone can lock the machine at any time.
 - **Agents use secrets, never see them.** `sealctl run` gives a program its keys in its
   environment and masks them in its output; an agent's first use of a secret in a repository

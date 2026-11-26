@@ -400,7 +400,7 @@ The machine says nothing about where it is. For the Automatic level the phone us
 | `ack` | number | `report` only: the `seq` the phone stored |
 | `msgs` | array | `report` only: [machine message](#machine-status-and-messages) bodies waiting for this machine |
 
-A `plan` grant carries no `cap`, `base` and `rate` (no allowance at levels 2 and 3). For `once` and `session` the core fills `cap`, `base` and `rate` from the place: `trusted` 14,400 / 1,800 / 120, `other` 600 / 600 / 0, `none` 3,600 / 1,800 / 120. The machine computes its idle allowance as `min(cap, base + rate × minutes worked today)` and does not hard-code these numbers. The machine computes the hard stop itself: 02:00 local time, or 14 hours after the first `open` granted today, whichever comes first.
+A `plan` grant carries no `cap`, `base` and `rate` (no allowance at levels 2 and 3). For `once` and `session` the core fills `cap`, `base` and `rate` from the place: `trusted` 14,400 / 1,800 / 120, `other` 600 / 600 / 0, `none` 3,600 / 1,800 / 120. The machine computes its idle allowance as `min(cap, base + rate × minutes worked today)` and does not hard-code these numbers. The machine computes the hard stop itself: 02:00 local time, or 24 hours after the first `open` granted today, whichever comes first.
 
 ### Confirmation levels
 
