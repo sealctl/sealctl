@@ -677,15 +677,16 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                 close_machine(&mut old, m, "unpaired");
                 g.index.remove(m);
             }
-            // a paid licence record stays (licence, seat codes); a feedback licence, the
-            // feedback, the intent and everything else go
-            if old.paid {
+            // the licence record stays: paid (licence, seat codes) or a feedback licence
+            // (granted, and its end); the feedback answers, the intent and the rest go
+            if old.paid || old.feedback_until.is_some() {
                 g.phones.insert(
                     phone.clone(),
                     PhoneRec {
-                        paid: true,
+                        paid: old.paid,
                         source: old.source.clone(),
                         codes: old.codes.clone(),
+                        feedback_until: old.feedback_until,
                         ..PhoneRec::default()
                     },
                 );

@@ -206,21 +206,39 @@ fn payments_flag_follows_the_relay_settings() {
 }
 
 #[test]
-fn deleting_the_phone_drops_feedback_intent_and_the_feedback_licence() {
+fn deleting_the_phone_keeps_the_licence_record_but_not_the_answers() {
     let relay = FakeRelay::start(Options::default());
     let phone = Phone::new(&relay.origin);
-    assert_eq!(call(&phone, "POST", "/feedback", Some(feedback())).0, 200);
+    let (_, granted) = call(&phone, "POST", "/feedback", Some(feedback()));
+    let until = granted["until"].as_u64().unwrap();
     assert_eq!(call(&phone, "POST", "/intent", None).0, 200);
     let (s, v) = call(&phone, "DELETE", "", None);
     assert_eq!((s, v["deleted"].as_bool()), (200, Some(true)));
-    assert!(relay.feedback_of(&phone.id()).is_none());
-    assert!(relay.intent_of(&phone.id()).is_none());
+    assert!(relay.feedback_of(&phone.id()).is_none(), "the answers go");
+    assert!(relay.intent_of(&phone.id()).is_none(), "the intent goes");
+    // restored from the words: the rest of the year, the mark, no second year
     let l = licence(&phone);
-    assert!(l.get("kind").is_none(), "{l}");
+    assert_eq!(
+        (l["kind"].as_str(), l["until"].as_u64()),
+        (Some("feedback"), Some(until)),
+        "{l}"
+    );
     assert_eq!(
         (l["feedback"].as_bool(), l["intent"].as_bool()),
-        (Some(false), Some(false))
+        (Some(true), Some(false))
     );
+    let (s, v) = call(&phone, "POST", "/feedback", Some(feedback()));
+    assert_eq!(s, 200);
+    assert_eq!(v["granted"], false);
+    assert_eq!(v["until"].as_u64(), Some(until), "the end does not move");
+    // an ended one stays ended after a delete: never granted again
+    relay.set_feedback_until(&phone.id(), now_ms() - 1);
+    assert_eq!(call(&phone, "DELETE", "", None).0, 200);
+    let l = licence(&phone);
+    assert!(l.get("kind").is_none(), "{l}");
+    assert_eq!(l["feedback"], true);
+    let (_, v) = call(&phone, "POST", "/feedback", Some(feedback()));
+    assert_eq!(v, json!({"licence": "unpaid", "granted": false}));
 
     // a paid licence record stays
     let paid = Phone::new(&relay.origin);

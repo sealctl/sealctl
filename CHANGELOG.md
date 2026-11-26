@@ -21,8 +21,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   days, one line after a command you typed says when it ends.
 - Protocol: `POST /v1/phones/{phone}/intent` and `POST /v1/phones/{phone}/feedback`, and the
   licence answer's `kind`, `until`, `feedback`, `intent` and `payments` (docs/protocol.md,
-  planned on the relay). Deleting a phone's relay data deletes its feedback, intent and
-  feedback licence.
+  planned on the relay). Deleting a phone's relay data deletes its feedback answers and
+  intent; the feedback licence record (granted, and its end) stays, as a paid one does.
 
 ### Changed
 
