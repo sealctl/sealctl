@@ -232,10 +232,18 @@ impl State {
         }
     }
 
-    /// The phone heard `state`, and the lock deadline `deadline` (`None` when Locked).
-    fn told(&mut self, state: String, busy: Vec<sealctl_core::wire::BusyVolume>, deadline: Option<u64>) {
+    /// The phone heard `state`, the lock deadline `deadline` and the work `work` (`None` when
+    /// Locked).
+    fn told(
+        &mut self,
+        state: String,
+        busy: Vec<sealctl_core::wire::BusyVolume>,
+        deadline: Option<u64>,
+        work: Option<session::ToldWork>,
+    ) {
         self.status_dirty = false;
         self.told_deadline = deadline;
+        self.told_work = work;
         if self.saved.told.as_deref() != Some(state.as_str()) {
             self.saved.told = Some(state.clone());
             save_saved(&self.saved);
@@ -306,6 +314,10 @@ struct State {
     told_deadline: Option<u64>,
     /// When a status for a moved deadline was last tried (SPEC 6.6), Unix ms.
     deadline_status_at: u64,
+    /// What the last status told the phone of the work (`None` when it said Locked).
+    told_work: Option<session::ToldWork>,
+    /// When a status for each reason of the activity rule was last tried (SPEC 6.4).
+    activity_tried: session::ActivityTried,
     keys_used_month: u64,
 }
 
@@ -1728,11 +1740,16 @@ impl Daemon {
         } else {
             "locked"
         };
+        let open = st.open;
         json!({
             "state": state,
-            "open": st.open,
-            "left": if st.open { Some(st.saved.left(n)) } else { None },
-            "hardStop": st.saved.first_open.filter(|_| st.open).map(session::hard_stop),
+            "open": open,
+            "left": open.then(|| st.saved.left(n)),
+            "active": open.then(|| session::is_active(n, st.saved.last_work)),
+            "idleSecs": open.then(|| st.saved.idle(n)),
+            "allowanceSecs": open.then(|| st.saved.allowance()),
+            "locksAt": open.then(|| st.saved.deadline()),
+            "hardStop": st.saved.first_open.filter(|_| open).map(session::hard_stop),
             "lockReason": st.saved.lock_reason,
             "waitingSince": st.waiting_since,
             "place": st.saved.place,
@@ -1753,6 +1770,8 @@ impl Daemon {
             let s = sealctl_core::wire::SessionState {
                 session: st.state_word().into(),
                 left: st.open.then(|| st.saved.left(n)),
+                idle: st.open.then(|| st.saved.idle(n)),
+                allow: st.open.then(|| st.saved.allowance()),
                 stop: st.saved.first_open.filter(|_| st.open).map(session::hard_stop),
                 place: st.saved.place.clone(),
                 busy: if st.open { Vec::new() } else { st.busy.clone() },
@@ -1799,6 +1818,8 @@ impl Daemon {
             .left
             .map(|l| time.saturating_add(l.saturating_mul(1000)))
             .map(|d| state.stop.map_or(d, |stop| d.min(stop)));
+        // and whether it shows the machine as active
+        let work = state.idle.map(|i| session::ToldWork::of(time, i));
         let status = sealctl_core::wire::MachineStatus {
             version: 1,
             time,
@@ -1827,7 +1848,7 @@ impl Daemon {
             drop(paired);
             let mut st = self.st();
             st.last_status = self.now();
-            st.told(s, busy, deadline);
+            st.told(s, busy, deadline, work);
             return Ok(());
         }
         let sealed = sealctl_core::channel::seal_status(&paired.keys, &paired.phone, &status)
@@ -1847,6 +1868,7 @@ impl Daemon {
             status.state.map(|s| s.session).unwrap_or_default(),
             busy,
             deadline,
+            work,
         );
         Ok(())
     }
@@ -2061,11 +2083,27 @@ impl Daemon {
             if moved {
                 st.deadline_status_at = n;
             }
+            // The phone shows "active" instead of a countdown while the machine works (SPEC
+            // 6.4): it hears when the machine goes idle, when it is active again, and that it is
+            // still active before its "active" runs out. Like the deadline rule, this waits for
+            // a failed status's retry, which carries the idle time.
+            let activity = if word == "open" && !st.status_dirty {
+                session::activity_status(n, Some(st.saved.last_work), st.told_work, st.activity_tried)
+            } else {
+                None
+            };
+            match activity {
+                Some(session::Activity::Idle) => st.activity_tried.idle = n,
+                Some(session::Activity::StillActive) => st.activity_tried.still_active = n,
+                Some(session::Activity::Resumed) => st.activity_tried.resumed = n,
+                None => {}
+            }
             let due = st.open
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
                     || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000)
                     || (changed && n.saturating_sub(st.last_status) >= 10 * 1000)
-                    || moved);
+                    || moved
+                    || activity.is_some());
             // A Locked session whose last status still said Open, or told other busy volumes
             // (a lock's or a retry's status failed), tells the phone again every minute, once
             // no lock is running.

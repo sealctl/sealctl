@@ -464,6 +464,38 @@ fn every_message_kind_round_trips() {
     );
 }
 
+/// `idle` and `allow` are optional: a status from an older machine reads without them, and a
+/// newer one names them in `state` next to `left`.
+#[test]
+fn a_status_carries_idle_and_allowance_when_the_machine_sends_them() {
+    let old: MachineStatus =
+        serde_json::from_str(r#"{"v":1,"t":1,"seq":1,"state":{"s":"open","left":600}}"#).unwrap();
+    let st = old.state.unwrap();
+    assert_eq!((st.left, st.idle, st.allow), (Some(600), None, None));
+    let new = MachineStatus {
+        version: 1,
+        time: T,
+        seq: 3,
+        state: Some(SessionState {
+            session: "open".into(),
+            left: Some(13_080),
+            idle: Some(720),
+            allow: Some(13_800),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&new).unwrap();
+    assert!(
+        json.contains(r#""state":{"s":"open","left":13080,"idle":720,"allow":13800}"#),
+        "{json}"
+    );
+    let keys = keys_b();
+    let m = machine();
+    let sealed = crate::channel::seal_status(&m, &phone_public(&keys), &new).unwrap();
+    assert_eq!(crate::open_machine_status(&keys, m.id(), sealed).unwrap(), new);
+}
+
 #[test]
 fn versions() {
     assert_eq!(crate::core_version(), "0.7.1");

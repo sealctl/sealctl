@@ -89,6 +89,8 @@ proptest! {
     fn status_and_message_round_trip(
         seq in any::<u64>(),
         left in proptest::option::of(any::<u64>()),
+        idle in proptest::option::of(any::<u64>()),
+        allow in proptest::option::of(any::<u64>()),
         command in text(),
         names in proptest::collection::vec(text(), 0..4),
         reason in text(),
@@ -99,7 +101,7 @@ proptest! {
             version: 1,
             time: T,
             seq,
-            state: Some(SessionState { session: "open".into(), left, ..Default::default() }),
+            state: Some(SessionState { session: "open".into(), left, idle, allow, ..Default::default() }),
             log: vec![LogEntry { time: T, agent: None, repository: None, command, names, own: true }],
             ..Default::default()
         };

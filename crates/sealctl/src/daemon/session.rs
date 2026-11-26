@@ -58,6 +58,90 @@ pub fn deadline_moved(now: u64, deadline: Option<u64>, told: Option<u64>, last: 
     moved && now.saturating_sub(last) >= DEADLINE_STATUS_EVERY_MS
 }
 
+/// The machine is active while its last work moment is less than this old (SPEC 6.4): `sealctl
+/// status` and the phone then say "active" instead of counting down an allowance that every
+/// sample with input fills up again. Eight 15-second samples, and the same as
+/// [`DEADLINE_STATUS_EVERY_MS`], so continuous work needs no more statuses than it sends now.
+pub const ACTIVE_MS: u64 = 2 * 60_000;
+
+/// At most one status in this time for each reason of the activity rule ([`activity_status`]),
+/// sent or failed.
+pub const ACTIVITY_STATUS_EVERY_MS: u64 = 2 * 60_000;
+
+/// Whether a machine whose last work moment is `last_work` is active at `now`.
+pub fn is_active(now: u64, last_work: u64) -> bool {
+    now.saturating_sub(last_work) < ACTIVE_MS
+}
+
+/// What the last status told the phone of the work: the last work moment it implied (its time
+/// minus its `idle`), and whether it said the machine was active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToldWork {
+    pub at: u64,
+    pub active: bool,
+}
+
+impl ToldWork {
+    /// What a status made at `time` with `idle` seconds since the last work tells the phone.
+    pub fn of(time: u64, idle: u64) -> ToldWork {
+        let ms = idle.saturating_mul(1000);
+        ToldWork {
+            at: time.saturating_sub(ms),
+            active: ms < ACTIVE_MS,
+        }
+    }
+}
+
+/// Why a status about the machine's activity is due (SPEC 6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// The last status said active, and the machine has gone idle since.
+    Idle,
+    /// The last status said active, its 2 minutes are over and the machine is still active:
+    /// the phone hears it again before its "active" runs out.
+    StillActive,
+    /// The last status said idle, and the machine is active again.
+    Resumed,
+}
+
+/// When a status for each [`Activity`] was last tried, Unix ms.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ActivityTried {
+    pub idle: u64,
+    pub still_active: u64,
+    pub resumed: u64,
+}
+
+/// Whether a status is due at `now` because the machine went from active to idle or back, or
+/// stays active past what the phone last heard. `last_work` is the session's last work moment
+/// (`None` unless Open), `told` what the last status said ([`ToldWork`]; `None` when it said
+/// Locked or came from before this daemon), and `tried` when a status for each reason was last
+/// tried; each goes out at most once every 2 minutes ([`ACTIVITY_STATUS_EVERY_MS`]).
+///
+/// Work makes the first two follow each other at that pace anyway: `Idle` needs 2 minutes
+/// without work after a status that said active, and `Resumed` work after a status that said
+/// idle. So each goes out at the first sample that sees it. The phone shows "active" for up to
+/// a minute past the 2 minutes of the last active status, so a `StillActive` comes in time.
+pub fn activity_status(
+    now: u64,
+    last_work: Option<u64>,
+    told: Option<ToldWork>,
+    tried: ActivityTried,
+) -> Option<Activity> {
+    let (Some(work), Some(told)) = (last_work, told) else {
+        return None;
+    };
+    let (why, last) = match (told.active, is_active(now, work)) {
+        (true, false) => (Activity::Idle, tried.idle),
+        (true, true) if now.saturating_sub(told.at) >= ACTIVE_MS => {
+            (Activity::StillActive, tried.still_active)
+        }
+        (false, true) => (Activity::Resumed, tried.resumed),
+        _ => return None,
+    };
+    (now.saturating_sub(last) >= ACTIVITY_STATUS_EVERY_MS).then_some(why)
+}
+
 /// `min(cap, base + rate × minutes worked)`, in seconds.
 pub fn idle_allowance(cap: u64, base: u64, rate: u64, worked: u64) -> u64 {
     cap.min(base.saturating_add(rate.saturating_mul(worked)))
@@ -148,16 +232,25 @@ impl Saved {
 
     /// Seconds of idle allowance left at `now`.
     pub fn left(&self, now: u64) -> u64 {
-        let allowance = idle_allowance(self.cap, self.base, self.rate, self.worked);
-        let idle = now.saturating_sub(self.last_work) / 1000;
-        allowance.saturating_sub(idle)
+        self.allowance().saturating_sub(self.idle(now))
+    }
+
+    /// The idle allowance now, seconds.
+    pub fn allowance(&self) -> u64 {
+        idle_allowance(self.cap, self.base, self.rate, self.worked)
+    }
+
+    /// Seconds since the last work moment at `now`.
+    pub fn idle(&self, now: u64) -> u64 {
+        now.saturating_sub(self.last_work) / 1000
     }
 
     /// When the session locks unless more work comes, Unix ms: the last work moment plus the
     /// idle allowance, or the hard stop when that comes first.
     pub fn deadline(&self) -> u64 {
-        let allowance = idle_allowance(self.cap, self.base, self.rate, self.worked);
-        let idle = self.last_work.saturating_add(allowance.saturating_mul(1000));
+        let idle = self
+            .last_work
+            .saturating_add(self.allowance().saturating_mul(1000));
         self.first_open.map_or(idle, |f| idle.min(hard_stop(f)))
     }
 
@@ -240,6 +333,91 @@ mod tests {
         assert!(!deadline_moved(now, Some(told + 600_000), None, last));
         // the first status for a moved deadline after the daemon started
         assert!(deadline_moved(now, Some(told + 600_000), Some(told), 0));
+    }
+
+    #[test]
+    fn active_means_work_in_the_last_two_minutes() {
+        let w = 1_800_000_000_000u64;
+        assert!(is_active(w, w));
+        assert!(is_active(w + 119_999, w));
+        assert!(!is_active(w + 120_000, w));
+        // a clock set back is not "idle"
+        assert!(is_active(w - 60_000, w));
+        // what a status tells the phone
+        assert_eq!(ToldWork::of(w, 0), ToldWork { at: w, active: true });
+        assert_eq!(
+            ToldWork::of(w, 119),
+            ToldWork {
+                at: w - 119_000,
+                active: true
+            }
+        );
+        assert_eq!(
+            ToldWork::of(w, 120),
+            ToldWork {
+                at: w - 120_000,
+                active: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_status_goes_out_when_the_machine_goes_idle_and_when_it_is_back() {
+        let w = 1_800_000_000_000u64;
+        let never = ActivityTried::default();
+        let due = |now: u64, work: u64, told: ToldWork, tried: ActivityTried| {
+            activity_status(now, Some(work), Some(told), tried)
+        };
+        let active = ToldWork { at: w, active: true };
+        // told active at `w`, still working: nothing for 2 minutes, then again
+        assert_eq!(due(w + 105_000, w + 105_000, active, never), None);
+        assert_eq!(due(w + 119_000, w + 105_000, active, never), None);
+        assert_eq!(
+            due(w + 120_000, w + 105_000, active, never),
+            Some(Activity::StillActive)
+        );
+        // no work for 2 minutes: idle, at the first sample that sees it
+        assert_eq!(due(w + 119_000, w, active, never), None);
+        assert_eq!(due(w + 120_000, w, active, never), Some(Activity::Idle));
+        // also 15 s after a status that said active again (work 105 s before it)
+        let again = ToldWork {
+            at: w + 15_000,
+            active: true,
+        };
+        let still = ActivityTried {
+            still_active: w + 120_000,
+            ..never
+        };
+        assert_eq!(due(w + 135_000, w + 15_000, again, still), Some(Activity::Idle));
+        // each at most once every 2 minutes
+        let tried = ActivityTried {
+            idle: w + 1_000,
+            still_active: w + 1_000,
+            resumed: 0,
+        };
+        assert_eq!(due(w + 120_000, w, active, tried), None);
+        assert_eq!(due(w + 121_000, w, active, tried), Some(Activity::Idle));
+        assert_eq!(due(w + 120_000, w + 120_000, active, tried), None);
+        assert_eq!(
+            due(w + 121_000, w + 120_000, active, tried),
+            Some(Activity::StillActive)
+        );
+        // told idle: nothing while it stays idle
+        let idle = ToldWork { at: w, active: false };
+        assert_eq!(due(w + 600_000, w, idle, never), None);
+        // work again: at the first sample that sees it
+        assert_eq!(
+            due(w + 615_000, w + 615_000, idle, never),
+            Some(Activity::Resumed)
+        );
+        let resumed = ActivityTried {
+            resumed: w + 500_000,
+            ..never
+        };
+        assert_eq!(due(w + 615_000, w + 615_000, idle, resumed), None);
+        // Locked, or nothing told yet: nothing
+        assert_eq!(activity_status(w, None, Some(active), never), None);
+        assert_eq!(activity_status(w + 600_000, Some(w), None, never), None);
     }
 
     #[test]

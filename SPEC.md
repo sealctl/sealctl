@@ -360,6 +360,7 @@ One daemon per user holds the session: the keys, the timers, the relay connectio
 - **Own-approval keys** are wiped when the command that asked exits (the daemon watches the client connection).
 - The daemon samples every 15 seconds. At each sample it checks the idle allowance and the hard stop against the last work moment before it counts the sample's input as work, so the key press that wakes a machine from sleep does not turn the time asleep into work. Every request for a key (values, keys, store, `open`, the SSH agent) makes the same check first, so a request right after a wake does not get a key from a session whose time ran out while asleep.
 - **Clock changes:** when the wall clock is more than a minute behind the last work moment (set back), the session locks and the credit resets, since neither the idle time nor the hard stop can be trusted. A saved first open in the future (the clock was ahead) does not carry its credit into the next `open`. A clock set forward only brings the lock sooner.
+- **Active and idle:** the session is active while the last work moment is less than 2 minutes old (`ACTIVE_MS`, eight samples), idle after that. `sealctl status` and the phone say "active" instead of counting down an allowance that each sample with input fills up again, and once idle they say for how long and when the session locks. Each status carries `idle` (seconds since the last work moment) and `allow` (the idle allowance) beside `left`. At each sample while Open (not Waiting) the daemon sends a status when the last one said active and the session has gone idle since (2 minutes after the last work), when the last one said idle and the session is active again (at the first sample with input, or the sample after a key use), and when the last one said active and its last work moment is 2 minutes old while the session is still active, so the phone, which shows "active" for up to a minute longer, hears it again in time. Each of the three goes out at most once every 2 minutes (`ACTIVITY_STATUS_EVERY_MS`), sent or failed; going idle needs 2 minutes without work after a status that said active, so the first two are never held back. Continuous work costs no more statuses than the deadline rule below already sends (the third reason coincides with it except when the hard stop is the deadline).
 - **Lock deadline:** `last work moment + idle allowance`, or the hard stop when that comes first. The phone counts down to the deadline the last status implied (its time plus `left`, capped by `stop`), and work moves the deadline later at every sample with input and every key use, so at each 15-second sample while Open (not Waiting) the daemon compares the two and sends a status when the deadline moved at least 2 minutes later (`DEADLINE_LATER_MS`) or at least 1 minute earlier (`DEADLINE_EARLIER_MS`), at most once every 2 minutes for this reason (`DEADLINE_STATUS_EVERY_MS`), sent or failed. The allowance never shrinks while Open; the deadline moves earlier only when the wall clock is set back (less than a minute at a time, or the session locks), or the machine moves to a time zone where 02:00 comes sooner.
 
 ### 6.5 Locking
@@ -381,7 +382,7 @@ While Open, the daemon keeps the phone informed and listens for locks (protocol.
 - When the relay offers the machine channel (planned in protocol.md; specified in the relay spec), it opens the machine socket and sends status with `PUT .../status`. A `404 not_found` on the socket upgrade means this relay does not offer it yet; the daemon then uses the fallback below and tries the socket again after 6 hours.
 - Until then it keeps one `report` request waiting (ttl 300, renewed at most once per 60 seconds) and applies `ack` and `msgs` from the reply.
 - The phone takes the session as Open by the machine's last status, so the status goes out when the session opens, before the command that asked (or one that joined its `open`) goes on to its next request, and before volumes are mounted. When a status went out while the phone was asked (`waiting`), a status saying Open follows as soon as the answer arrives, before the next request; if that fails, the next 15-second sample sends it. A request waiting for the phone (up to 5 minutes) holds up neither statuses nor messages: a `lock` from the phone applies at once.
-- While Open, a status goes out when the session state changes, when there are unsent log entries (at most every 60 seconds), when the lock deadline moved (6.4: 2 minutes later or 1 minute earlier, at most every 2 minutes), and at least every 15 minutes. A failed status is tried again after a minute (section 7); while one is due again that way (or log entries wait), the deadline rule sends nothing of its own, since that status carries the new deadline, so a relay that is down never gets more than one status a minute.
+- While Open, a status goes out when the session state changes, when there are unsent log entries (at most every 60 seconds), when the lock deadline moved (6.4: 2 minutes later or 1 minute earlier, at most every 2 minutes), when the session went idle or is active again, or stays active past the last status (6.4, each at most every 2 minutes), and at least every 15 minutes. A failed status is tried again after a minute (section 7); while one is due again that way (or log entries wait), the deadline and activity rules send nothing of their own, since that status carries the new deadline and the idle time, so a relay that is down never gets more than one status a minute.
 - Usage log entries wait in `usage.jsonl` until a status that carries them is acknowledged. The log holds names, agents, repositories and masked commands, never values.
 - A `lock` message locks at once (reason shown by `sealctl status`: "Locked from your phone" or "Locked: your phone left the place"), unless it was made more than 60 seconds before the session's `open` was sent (a lock held from an earlier session; the minute allows for the phone's clock being behind). Its `seq` does not matter: each install of the app numbers its messages by its own clock, so a lock from one install can come with a lower `seq` than another install's last message; it still applies, and the highest `seq` seen stays. Every other message applies only when its `seq` is above the highest seen. An `answers` message replaces `answers.json` (used by `sealctl rules`).
 - A `notice` message (protocol.md, Message body) or a relay `delayed` note on the machine socket announces a level 3 action. The daemon keeps it in memory until a `cancelled` or `done` notice or note for it, or 15 minutes after its `at` (when the relay deletes a machine's record; one for an action on the phone stays an hour, but `sealctl cancel` stops only what still waits; for one without `at`, the longest delay, 2 hours, counts from its arrival, and the notification says `It takes effect within 2 hours`), shows it in `sealctl status`, and shows a desktop notification (5.2, title `sealctl`) whether or not an agent is running:
@@ -482,7 +483,7 @@ Global flags: `-v` (more logging to stderr, never values), `--relay <origin>`, `
 `sealctl status` on a terminal:
 
 ```text
-Open · 3 h 12 min left · hard stop 02:00
+Open · active · locks after 4 h idle · hard stop 02:00
 dev@mbp.example.com #k7m2 · seed qHWf
 Store     7 secrets · ~/.local/share/sealctl/store/0f8c6d2e…
 Volumes   safe (APFS) mounted at /Volumes/safe · backup 12 min ago
@@ -492,7 +493,7 @@ This month: 214 keys used, 0 requests declined, nothing written to disk.
 Unpaid · sealctl buy
 ```
 
-- First line: `Locked`, `Locked from your phone`, `Locked: your phone left the place`, `Open · <time> left · hard stop <HH:MM>`, or `Waiting for your phone (asked 0:42 ago)`. Not paired: `Not paired · sealctl pair`.
+- First line: `Locked`, `Locked from your phone`, `Locked: your phone left the place`, `Open · active · locks after <allowance> idle · hard stop <HH:MM>` while the session is active (6.4: work in the last 2 minutes), `Open · idle <time> · locks at <HH:MM> · hard stop <HH:MM>` once it is idle (the lock time is the lock deadline, the hard stop when that comes first), or `Waiting for your phone (asked 0:42 ago)`. Not paired: `Not paired · sealctl pair`. A daemon still running from an older version reports only the time left: `Open · <time> left · hard stop <HH:MM>`.
 - A running migration adds `Migrate   re-encrypting volume safe · 41% · about 2 min left` (or `paused: battery below 20%`).
 - A pending level 3 action adds `Pending   leaving sealctl, approved on your phone · takes effect 11:00 · sealctl cancel`; `--json` has `"pending": [{"id", "what", "machine", "at"}]`.
 - The licence line is `Unpaid · sealctl buy`, `Licensed until 2027-11-26 (feedback)` (the local date a feedback licence ends, 19.3), or `Paid`. When the relay was never reached it is left out.
@@ -504,7 +505,11 @@ Unpaid · sealctl buy
 {
   "version": "0.7.0",
   "state": "open",
-  "left": 11520,
+  "left": 14400,
+  "active": true,
+  "idleSecs": 0,
+  "allowanceSecs": 14400,
+  "locksAt": "2026-11-21T16:12:00+01:00",
   "hardStop": "2026-11-22T02:00:00+01:00",
   "lockReason": null,
   "machine": {"name": "dev@mbp.example.com", "tag": "k7m2", "paired": true, "relay": "https://relay.sealctl.com"},
@@ -519,6 +524,8 @@ Unpaid · sealctl buy
   "daemon": "running"
 }
 ```
+
+While Open, `active` is whether the session is active, `idleSecs` the seconds since the last work moment, `allowanceSecs` the idle allowance and `locksAt` the lock deadline (RFC 3339, local offset); `left` (the allowance minus the idle time) stays for scripts that read it. All four are `null` unless Open.
 
 `licence` is `"paid"`, `"feedback"`, `"unpaid"` or `"unknown"`, as a plain fact. `until` is when a feedback licence ends (RFC 3339, local offset), `null` otherwise.
 
