@@ -26,7 +26,9 @@ SPEC disagree, say so and fix one of them in the pull request; don't silently pi
   wrong.
 - When summarising sealctl, name encrypted volumes and backups alongside API and SSH keys.
 - Level 3 (unseal everything, show the words, delete relay data) waits two hours away from a
-  trusted place; a place added by hand lifts that wait only after 24 hours.
+  trusted place; a trusted place, learned or added by hand, lifts the two-hour wait two hours
+  after it is trusted, and trusting it is announced to every paired computer and can be
+  cancelled.
 - Output uses these words and no others for the same things: Locked, Open, Waiting, One tap,
   Places, words, seed, phone, machine (SPEC 1). The 4-character fingerprint is shown as
   `seed qHWf`; "words" is the 24 words the user writes down and types.
