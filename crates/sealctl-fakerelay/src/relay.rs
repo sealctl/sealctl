@@ -1,6 +1,7 @@
 //! An in-process implementation of the Relay API (docs/protocol.md) for tests: real signature
 //! checks, roles, pairing, approvals over WebSockets, delayed approvals, the machine channel,
-//! licence, checkout and seat codes. State lives in memory.
+//! licence, checkout and seat codes, buy intent and feedback, deleting a phone. State lives in
+//! memory.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -13,6 +14,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use sealctl_core::feedback::{check_feedback, check_intent, FEEDBACK_LICENCE_MS};
 use sealctl_core::relay_auth::{verify_relay_headers, RelayHeaders};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -56,12 +58,33 @@ struct PhoneRec {
     days_used: u64,
     last_day: u64,
     codes: Vec<(String, u64, u64)>,
+    /// The latest feedback as stored, and when it came.
+    feedback: Option<(Value, u64)>,
+    /// The end of the feedback licence, once one was granted (once per phone key).
+    feedback_until: Option<u64>,
+    /// The latest buy intent as stored, and when it came.
+    intent: Option<(Value, u64)>,
+}
+
+impl PhoneRec {
+    /// `licence`, and `kind` and `until` when the phone holds a licence (protocol.md, Licence).
+    fn licence_fields(&self, n: u64) -> Value {
+        let mut v = json!({"licence": if self.paid { "paid" } else { "unpaid" }});
+        if self.paid {
+            v["kind"] = json!("paid");
+        } else if let Some(u) = self.feedback_until.filter(|u| *u > n) {
+            v["kind"] = json!("feedback");
+            v["until"] = json!(u);
+        }
+        v
+    }
 }
 
 /// Switches for tests.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Checkout works (else `503 payments_not_configured`, as staging answers).
+    /// Checkout works (else `503 payments_not_configured`, as staging answers, and the licence
+    /// answer says `"payments": false`).
     pub payments: bool,
     /// The machine channel is offered (else the socket upgrade answers `404`).
     pub machine_channel: bool,
@@ -235,6 +258,36 @@ impl FakeRelay {
             .entry(phone.to_string())
             .or_default()
             .days_used = days;
+    }
+
+    /// The feedback a phone sent, as the relay keeps it, with `at` (Unix ms).
+    pub fn feedback_of(&self, phone: &str) -> Option<Value> {
+        let g = self.app.inner.lock().unwrap();
+        let (v, at) = g.phones.get(phone)?.feedback.clone()?;
+        let mut v = v;
+        v["at"] = json!(at);
+        Some(v)
+    }
+
+    /// The buy intent a phone recorded, as the relay keeps it, with `at` (Unix ms).
+    pub fn intent_of(&self, phone: &str) -> Option<Value> {
+        let g = self.app.inner.lock().unwrap();
+        let (v, at) = g.phones.get(phone)?.intent.clone()?;
+        let mut v = v;
+        v["at"] = json!(at);
+        Some(v)
+    }
+
+    /// Moves the end of a phone's feedback licence (to test its expiry).
+    pub fn set_feedback_until(&self, phone: &str, until: u64) {
+        self.app
+            .inner
+            .lock()
+            .unwrap()
+            .phones
+            .entry(phone.to_string())
+            .or_default()
+            .feedback_until = Some(until);
     }
 
     /// Pending request ids for a phone (for assertions).
@@ -553,10 +606,16 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             }
         }
         (Method::GET, ["licence"]) => {
-            let ask_after = app.opts.lock().unwrap().ask_after_days;
+            let (ask_after, payments) = {
+                let o = app.opts.lock().unwrap();
+                (o.ask_after_days, o.payments)
+            };
             let g = app.inner.lock().unwrap();
             let p = g.phones.get(&phone);
-            let paid = p.is_some_and(|p| p.paid);
+            let n = now_ms();
+            let empty = PhoneRec::default();
+            let fields = p.unwrap_or(&empty).licence_fields(n);
+            let licensed = fields.get("kind").is_some();
             let days = p.map_or(0, |p| p.days_used);
             let codes: Vec<Value> = p
                 .map(|p| {
@@ -566,20 +625,72 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                         .collect()
                 })
                 .unwrap_or_default();
-            ok(
-                200,
-                json!({
-                    "licence": if paid { "paid" } else { "unpaid" },
-                    "source": p.and_then(|p| p.source.clone()),
-                    "since": Value::Null,
-                    "movedTo": Value::Null,
-                    "daysUsed": days,
-                    "ask": !paid && days >= ask_after,
-                    "machines": p.map_or(0, |p| p.machines.len()),
-                    "machineGate": Value::Null,
-                    "codes": codes,
-                }),
-            )
+            let mut v = json!({
+                "source": p.and_then(|p| p.source.clone()),
+                "since": Value::Null,
+                "movedTo": Value::Null,
+                "daysUsed": days,
+                "ask": !licensed && days >= ask_after,
+                "machines": p.map_or(0, |p| p.machines.len()),
+                "machineGate": Value::Null,
+                "codes": codes,
+                "feedback": p.is_some_and(|p| p.feedback.is_some() || p.feedback_until.is_some()),
+                "intent": p.is_some_and(|p| p.intent.is_some()),
+                "payments": payments,
+            });
+            for (k, val) in fields.as_object().expect("object") {
+                v[k] = val.clone();
+            }
+            ok(200, v)
+        }
+        (Method::POST, ["intent"]) => {
+            let Some(rec) = check_intent(&body) else {
+                return err(400, "bad_intent");
+            };
+            let mut g = app.inner.lock().unwrap();
+            g.phones.entry(phone.clone()).or_default().intent = Some((rec, now_ms()));
+            ok(200, json!({"recorded": true}))
+        }
+        (Method::POST, ["feedback"]) => {
+            let Some(rec) = check_feedback(&body) else {
+                return err(400, "bad_feedback");
+            };
+            let mut g = app.inner.lock().unwrap();
+            let p = g.phones.entry(phone.clone()).or_default();
+            let n = now_ms();
+            p.feedback = Some((rec, n));
+            let granted = !p.paid && p.feedback_until.is_none();
+            if granted {
+                p.feedback_until = Some(n + FEEDBACK_LICENCE_MS);
+            }
+            let mut v = p.licence_fields(n);
+            v["granted"] = json!(granted);
+            ok(200, v)
+        }
+        (Method::DELETE, []) if is_phone => {
+            let mut g = app.inner.lock().unwrap();
+            let Some(mut old) = g.phones.remove(&phone) else {
+                return ok(200, json!({"deleted": true, "machines": 0}));
+            };
+            let machines: Vec<String> = old.machines.keys().cloned().collect();
+            for m in &machines {
+                close_machine(&mut old, m, "unpaired");
+                g.index.remove(m);
+            }
+            // a paid licence record stays (licence, seat codes); a feedback licence, the
+            // feedback, the intent and everything else go
+            if old.paid {
+                g.phones.insert(
+                    phone.clone(),
+                    PhoneRec {
+                        paid: true,
+                        source: old.source.clone(),
+                        codes: old.codes.clone(),
+                        ..PhoneRec::default()
+                    },
+                );
+            }
+            ok(200, json!({"deleted": true, "machines": machines.len()}))
         }
         (Method::POST, ["checkout"]) => {
             let seats = body["seats"].as_u64().unwrap_or(1);

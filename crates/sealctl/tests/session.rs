@@ -196,6 +196,244 @@ fn buy_seats_and_claim_a_code() {
     assert_eq!(c, 2, "--seats is 2 to 1,000: {err}");
 }
 
+/// `26 Nov 2027` from the date part of `2027-11-26T...`.
+fn long_date(rfc3339: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let p: Vec<usize> = rfc3339[..10].split('-').map(|x| x.parse().unwrap()).collect();
+    format!("{} {} {}", p[2], MONTHS[p[1] - 1], p[0])
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// The questionnaire, typed with some wrong answers first (each is asked again).
+fn answer_the_questionnaire(pty: &Pty) {
+    let t = Duration::from_secs(30);
+    pty.expect("What do you use sealctl for?", t);
+    pty.expect("Choose: ", t);
+    pty.line("1,9");
+    pty.expect("Type numbers from 1 to 5, like 1,3 or 1 3.", t);
+    pty.line("1, 3");
+    pty.expect("Would $5.99 once be fair?", t);
+    pty.line("5");
+    pty.expect("Type a number from 1 to 4.", t);
+    pty.line("2");
+    pty.expect("What's missing?", t);
+    pty.line("5 1");
+    pty.expect("Nothing goes on its own.", t);
+    pty.line("1 3");
+    pty.expect("Anything else?", t);
+    pty.line(&"x".repeat(281));
+    pty.expect("One line of at most 280 characters, please.", t);
+    pty.line("  works well  ");
+}
+
+#[test]
+fn buy_while_payments_are_closed_records_the_intent() {
+    let mut env = Env::fake(Options {
+        payments: false,
+        ..Options::default()
+    });
+    env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    let mut c = env.cmd();
+    c.args(["buy"]);
+    let pty = Pty::spawn(c);
+    let t = Duration::from_secs(30);
+    let screen = pty.expect("Choose 1, 2 or 3: ", t);
+    assert!(
+        screen.contains("sealctl is $5.99 once. Card payments open soon."),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("  1  I'd buy it      sealctl tells you here when you can (nothing is charged)"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("  2  Give feedback   2 minutes; you get a year free"),
+        "{screen}"
+    );
+    assert!(screen.contains("  3  Not now"), "{screen}");
+    pty.line("yes");
+    pty.expect("Type a number from 1 to 3.", t);
+    pty.line("1");
+    let (code, _, screen) = pty.wait(t);
+    assert_eq!(code, 0, "{screen}");
+    assert!(
+        screen.contains("Noted. Thank you: sealctl will tell you here when you can buy."),
+        "{screen}"
+    );
+    let intent = fake.intent_of(&env.phone.id()).expect("intent recorded");
+    assert_eq!(intent.as_object().unwrap().len(), 1, "only the time: {intent}");
+    // nothing else changes: still unpaid, and "Not now" sends nothing
+    assert_eq!(status(&env)["licence"], "unpaid");
+    let mut c = env.cmd();
+    c.args(["buy"]);
+    let pty = Pty::spawn(c);
+    pty.expect("Choose 1, 2 or 3: ", t);
+    pty.line("3");
+    let (code, _, screen) = pty.wait(t);
+    assert_eq!(code, 0, "{screen}");
+    assert!(fake.feedback_of(&env.phone.id()).is_none());
+}
+
+#[test]
+fn feedback_gives_a_year_once_and_status_shows_it() {
+    let mut env = Env::fake(Options {
+        payments: false,
+        ..Options::default()
+    });
+    env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    fake.set_days_used(&env.phone.id(), 41);
+    let t = Duration::from_secs(30);
+    let mut c = env.cmd();
+    c.args(["buy"]);
+    let pty = Pty::spawn(c);
+    pty.expect("Choose 1, 2 or 3: ", t);
+    pty.line("2");
+    answer_the_questionnaire(&pty);
+    let (code, _, screen) = pty.wait(t);
+    assert_eq!(code, 0, "{screen}");
+    assert!(
+        screen.contains("Sent with this phone's id; no name or email."),
+        "{screen}"
+    );
+    let got = fake.feedback_of(&env.phone.id()).expect("feedback stored");
+    assert_eq!(got["use"], serde_json::json!(["agents", "volumes"]));
+    assert_eq!(got["price"], "more");
+    assert_eq!(got["missing"], serde_json::json!(["windows", "teams"]));
+    assert_eq!(got["text"], "works well");
+    let keys: Vec<&String> = got.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys.len(),
+        6,
+        "v, use, price, missing, text, at; no name or email: {got}"
+    );
+
+    // status: the line and the JSON, from the cache `buy` refreshed
+    let v = status(&env);
+    assert_eq!(v["licence"], "feedback");
+    let until = v["until"].as_str().expect("until").to_string();
+    assert!(
+        screen.contains(&format!("Sent. Licensed until {}. Thank you.", long_date(&until))),
+        "{screen}"
+    );
+    let (_, out, _) = env.run(&["status"]);
+    assert!(
+        out.contains(&format!("Licensed until {} (feedback)", &until[..10])),
+        "{out}"
+    );
+    assert!(!out.contains("Unpaid"), "{out}");
+    // no ask while it lasts
+    let mut c = env.cmd();
+    c.args(["status"]);
+    let (_, _, screen) = Pty::spawn(c).wait(t);
+    assert!(!screen.contains("$5.99"), "{screen}");
+
+    // a second feedback is kept but gives nothing new
+    let mut c = env.cmd();
+    c.args(["buy"]);
+    let pty = Pty::spawn(c);
+    pty.expect("Choose 1, 2 or 3: ", t);
+    pty.line("2");
+    answer_the_questionnaire(&pty);
+    let (code, _, screen) = pty.wait(t);
+    assert_eq!(code, 0, "{screen}");
+    assert!(
+        screen.contains(&format!(
+            "Sent. Thank you. This phone has its free year already: licensed until {}.",
+            long_date(&until)
+        )),
+        "{screen}"
+    );
+    assert_eq!(status(&env)["until"], until.as_str(), "the end does not move");
+
+    // the year ends: unpaid at once, without waiting for the hour-long cache
+    fake.set_feedback_until(&env.phone.id(), now_ms() - 1);
+    let file = env.h().join("s/sealctl/licence.json");
+    let mut cache: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(cache["answer"]["kind"], "feedback");
+    cache["answer"]["until"] = serde_json::json!(now_ms() - 1);
+    std::fs::write(&file, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let v = status(&env);
+    assert_eq!(v["licence"], "unpaid");
+    assert!(v["until"].is_null(), "{v}");
+    let (_, out, _) = env.run(&["status"]);
+    assert!(out.contains("Unpaid · sealctl buy"), "{out}");
+    // and the usual ask resumes
+    let mut c = env.cmd();
+    c.args(["status"]);
+    let (_, _, screen) = Pty::spawn(c).wait(t);
+    assert!(
+        screen.contains("You've used sealctl on 41 days. It's $5.99 once: sealctl buy"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn with_payments_open_feedback_is_offered_until_given() {
+    let mut env = Env::fake(Options::default());
+    env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    let t = Duration::from_secs(30);
+    let mut c = env.cmd();
+    c.args(["buy"]);
+    let pty = Pty::spawn(c);
+    let screen = pty.expect("Choose 1, 2, 3 or 4: ", t);
+    assert!(screen.contains("Who pays?"), "{screen}");
+    assert!(screen.contains("  4  Give feedback instead"), "{screen}");
+    pty.line("4");
+    answer_the_questionnaire(&pty);
+    let (code, _, screen) = pty.wait(t);
+    assert_eq!(code, 0, "{screen}");
+    assert!(screen.contains("Sent. Licensed until "), "{screen}");
+    assert!(fake.feedback_of(&env.phone.id()).is_some());
+    // given once: the menu no longer offers it; the end of input leaves without a checkout
+    let mut c = env.cmd();
+    c.args(["buy"]);
+    let pty = Pty::spawn(c);
+    let screen = pty.expect("Choose 1, 2 or 3: ", t);
+    assert!(!screen.contains("Give feedback"), "{screen}");
+    pty.line("\u{4}");
+    let (code, out, screen) = pty.wait(t);
+    assert_eq!(code, 0, "{screen}");
+    assert!(!out.contains("https://"), "{out}");
+}
+
+#[test]
+fn buy_menus_are_for_a_person_only() {
+    let mut env = Env::fake(Options {
+        payments: false,
+        ..Options::default()
+    });
+    env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    // inside an AI agent, even on a terminal: exit 8
+    let mut c = env.cmd();
+    c.env("SEALCTL_AGENT", "1").args(["buy"]);
+    let (code, _, screen) = Pty::spawn(c).wait(Duration::from_secs(30));
+    assert_eq!(code, 8, "{screen}");
+    assert!(!screen.contains("Card payments"), "{screen}");
+    // CI, even on a terminal: exit 8
+    let mut c = env.cmd();
+    c.env("CI", "true").args(["buy"]);
+    let (code, _, screen) = Pty::spawn(c).wait(Duration::from_secs(30));
+    assert_eq!(code, 8, "{screen}");
+    assert!(screen.contains("This needs a terminal: sealctl buy."), "{screen}");
+    // a pipe with scripted answers: exit 8, nothing sent
+    let (code, _, err) = env.run_in(&["buy"], b"2\n1\n1\n5\n\n");
+    assert_eq!(code, 8, "{err}");
+    assert!(fake.feedback_of(&env.phone.id()).is_none());
+    assert!(fake.intent_of(&env.phone.id()).is_none());
+}
+
 #[test]
 fn the_ask_shows_only_to_a_person_and_weekly() {
     let mut env = Env::fake(Options::default());

@@ -641,6 +641,8 @@ Errors always have the shape `{"error": "<code>", ...}`.
 | `GET /v1/phones/{phone}/licence` | Phone or machine | | `200`, see Licence |
 | `POST /v1/phones/{phone}/checkout` | Phone or machine | `{"seats"?}` | `200 {"url", "seats"}` |
 | `POST /v1/phones/{phone}/claim` | Phone or machine | `{"code"}` | `200 {"licence": "paid", "left"}` |
+| `POST /v1/phones/{phone}/intent` **(planned)** | Phone or machine | `{}` or `{"note"}` | `200 {"recorded": true}`, see Buy intent and feedback |
+| `POST /v1/phones/{phone}/feedback` **(planned)** | Phone or machine | `{"v", "use", "price", "missing", "text"?}` | `200 {"granted", "licence", "kind"?, "until"?}`, see Buy intent and feedback |
 | `POST /v1/phones/{phone}/licence/move` | Phone | `{"to"}` | `200 {"movedTo"}` |
 | `POST /v1/paddle/webhook` | Paddle, `Paddle-Signature` | Paddle's event | `200`, see Paddle |
 | `PUT /v1/phones/{phone}/push/{device}` **(planned)** | Phone | `{"platform": "apns", "token", "sandbox"?}` or `{"platform": "fcm", "token"}` | `200 {"devices": <count>}` |
@@ -738,13 +740,20 @@ Compare-and-swap means a replayed or stale upload cannot roll the state back.
 | `since` | When it was paid, or `null` |
 | `movedTo` | The phone key this licence was moved to, or `null` |
 | `daysUsed` | UTC days with at least one delivered reply |
-| `ask` | `true` when unpaid and `daysUsed` is at least `ASK_AFTER_DAYS` (30) |
+| `ask` | `true` when unpaid and `daysUsed` is at least `ASK_AFTER_DAYS` (30); **(planned)** and no feedback licence is valid |
 | `machines` | Paired machines |
 | `machineGate` | N when the machine gate is on, else `null` |
 | `codes` | Seat codes this phone bought: `[{"code", "seats", "claimed"}]` |
 | `revoked` **(planned)** | `"refund"`, `"chargeback"`, or `null`: why a paid licence was taken back |
+| `kind` **(planned)** | `"paid"` when `licence` is `"paid"`; `"feedback"` while a feedback licence is valid (`licence` stays `"unpaid"`); absent otherwise |
+| `until` **(planned)** | Only with `kind` `"feedback"`: when the feedback licence ends, Unix ms |
+| `feedback` **(planned)** | `true` once this phone key has sent feedback or holds a feedback licence, even an ended one; else `false` |
+| `intent` **(planned)** | `true` when a buy intent is recorded for this phone; else `false` |
+| `payments` **(planned)** | `true` when checkout is configured; `false` when it would answer `503 payments_not_configured` |
 
 The relay only says whether to ask. When and where to print the request to pay (stderr, after a command a person typed, at most once a week) is the CLI's job.
+
+**(planned)** The new fields are additions: `licence` keeps its two values, so a 0.7 client shows a phone with a feedback licence as unpaid, without the ask. Clients treat `kind` or `until` set to `null` as absent. A client that gets no `payments` field (an older relay) tries checkout and treats `payments_not_configured` and `payments_unavailable` as `payments: false`.
 
 **Checkout.** `POST /v1/phones/{phone}/checkout` with `{"seats"}` (an integer from 1 to 1,000; 1 when absent) asks Paddle for a transaction and returns Paddle's checkout link. The relay sends Paddle:
 
@@ -771,6 +780,39 @@ What a purchase grants:
 - `POST /v1/phones/{phone}/claim` with `{"code"}` takes a seat. The code is matched case-insensitively, ignoring spaces and dashes, with I and L read as 1 and O as 0.
 - A claimed seat stays with that phone. Claiming again from a paid phone answers `409 already_paid` and takes no second seat.
 - Errors: `400 bad_code`, `409 already_paid`, `404 unknown_code`, `409 no_seats_left`.
+
+**Buy intent and feedback (planned).** While card payments are not open, the CLI lets a person say they would buy, or answer four questions for a year's licence. Neither body carries a name, an email or anything else about the person: the relay keeps them with the phone id (the `{phone}` key) and the time, and keeps feedback and intent for its operator. How the operator reads them is not part of this protocol.
+
+- Both endpoints accept the phone or any paired machine, signed as every call (`403 forbidden` for anyone else). They count toward the abuse limit and the short-term limits like any other call (`429 rate_limited`). Checks run in this order: signature, role, limits, JSON (`400 bad_json`), then the body below. A refused body changes nothing.
+- **Free text.** `note` and `text` are refused when they contain a control character (Unicode category Cc, U+0000 to U+001F and U+007F to U+009F) anywhere, a line break included. They are then trimmed of whitespace at both ends: Unicode White_Space and U+FEFF, which is what JavaScript's `String.prototype.trim()` removes once control characters are excluded. What is left may be at most 280 characters, counted in Unicode code points (in JavaScript `[...s].length`, not `s.length`). An empty result is treated as no text and not stored.
+- **Intent.** `POST /v1/phones/{phone}/intent` with an empty body, `{}` or `{"note": <string>}` records that the person would buy, with the time. Any other field, a `note` that is not a string or fails the free-text rule, or a body that is not an object answers `400 bad_intent`. One intent is kept per phone: a later one replaces the earlier (its time and note). Answer: `200 {"recorded": true}`.
+- **Feedback.** `POST /v1/phones/{phone}/feedback` with:
+
+  ```json
+  {"v": 1, "use": ["agents", "ssh"], "price": "fair", "missing": ["windows"], "text": "optional"}
+  ```
+
+  | Field | Rule |
+  | --- | --- |
+  | `v` | The integer 1 |
+  | `use` | Array of 1 to 5 distinct values from `"agents"`, `"ssh"`, `"volumes"`, `"backups"`, `"other"` |
+  | `price` | One of `"fair"` (yes), `"more"` (I'd pay more), `"too_much"`, `"would_not_pay"` |
+  | `missing` | Array of 1 to 6 distinct values from `"windows"`, `"ios_store"`, `"teams"`, `"password_managers"`, `"nothing"`, `"other"`; `"nothing"` only on its own |
+  | `text` | Optional string, the free-text rule above |
+
+  A missing required field, any other field, `null` for any field, a value of the wrong type, an unknown or repeated value, `"nothing"` with another value, or a `text` that fails the free-text rule answers `400 bad_feedback`. The relay stores the checked body (`text` trimmed, dropped when empty) with the time; a later feedback replaces the earlier.
+- **The feedback licence.** The first feedback stored for a phone key that is not paid grants a feedback licence: `until` = the time of that feedback + 365 days (31,536,000,000 ms). It is granted once per phone key: never again after it ends, whatever later feedback says. Feedback from a paid phone is stored and grants nothing.
+- The answer is `200 {"granted": <bool>, "licence", "kind"?, "until"?}`, where `licence`, `kind` and `until` are as in `GET .../licence` after the call:
+
+  | Case | Answer |
+  | --- | --- |
+  | First feedback, unpaid | `{"granted": true, "licence": "unpaid", "kind": "feedback", "until": <ms>}` |
+  | Again, licence still valid | `{"granted": false, "licence": "unpaid", "kind": "feedback", "until": <the same ms>}` |
+  | Again, licence ended | `{"granted": false, "licence": "unpaid"}` |
+  | Paid phone | `{"granted": false, "licence": "paid", "kind": "paid"}` |
+
+- While a feedback licence is valid (the relay's time is before `until`), `ask` is `false` and the machine gate treats the phone as paid. `licence` stays `"unpaid"`: checkout and claim work as on any unpaid phone, and a purchase or a claimed seat makes the phone paid (`kind` `"paid"`). From `until` on, the phone is unpaid as before: `kind` and `until` are absent and the usual `ask` rule applies.
+- Moving the licence (below) carries a valid feedback licence with its `until`, and the mark that feedback was given, to the new key, unless that key is paid or has its own; the answers and the intent stay with the old key and go when it is deleted.
 
 **Moving the licence.** When the words change, the old phone key moves its licence to the new one with `POST /v1/phones/{old}/licence/move` and `{"to": "<new phone key>"}`, signed by the old key. The new phone becomes paid with source `moved`, unless it already was. The old one becomes unpaid with `movedTo` set. Errors: `400 bad_target`, `409 not_paid`.
 
@@ -816,7 +858,7 @@ A level 3 approval away from a trusted place waits two hours (see [Delayed appro
 
 ### Deleting a phone (planned)
 
-- `DELETE /v1/phones/{phone}`, signed by the phone, deletes its machines, state, push devices, machine status and held messages, delayed approvals, and pending requests, and answers `{"deleted": true, "machines": <count>}`. A licence record that is paid, moved or refunded stays (licence, Paddle transaction ids, seat codes), so a later restore from the words is still paid and a refund still finds the licence. Nothing else stays.
+- `DELETE /v1/phones/{phone}`, signed by the phone, deletes its machines, state, push devices, machine status and held messages, delayed approvals, pending requests, feedback, buy intent and feedback licence, and answers `{"deleted": true, "machines": <count>}`. A licence record that is paid, moved or refunded stays (licence, Paddle transaction ids, seat codes), so a later restore from the words is still paid and a refund still finds the licence. A feedback licence is not such a record: it goes with the rest. Nothing else stays.
 - A phone with no signed call for 730 days has its data deleted the same way.
 
 ### Changing words on the relay (planned)
@@ -842,6 +884,8 @@ The phone runs these steps in order, while it still holds the old root:
 | Machines per phone | 100 |
 | State blob | 1 MiB |
 | Seats per checkout | 1,000 |
+| Feedback `text`, intent `note` **(planned)** | 280 code points after trimming; no control characters |
+| Feedback licence **(planned)** | 365 days from the first feedback; once per phone key |
 | Paddle webhook clock tolerance | 5 seconds |
 | Request body, other than `PUT state` **(planned)** | 16,384 bytes |
 | WebSocket message **(planned)** | 8,192 bytes |

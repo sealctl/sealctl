@@ -3,7 +3,8 @@
 //! Everything both sides must agree on byte for byte lives here: the words and the root,
 //! derivation, fingerprints and key checks, relay signing, pairing and its proofs, sealed
 //! requests and replies with the number match and plan signature, machine status and
-//! messages, the phone's state blob and storage formats, `.sealed` and `.id` files.
+//! messages, the phone's state blob and storage formats, `.sealed` and `.id` files, and the
+//! checks on buy intent and feedback bodies.
 //!
 //! No primitive is implemented here: hashes, HKDF, HMAC, Ed25519, X25519, HPKE, the AEAD and
 //! BIP39 come from established crates. The only I/O is the clock and the OS random source.
@@ -22,6 +23,7 @@ uniffi::setup_scaffolding!();
 pub mod channel;
 mod crypto;
 pub mod error;
+pub mod feedback;
 pub mod ids;
 pub mod keys;
 pub mod machine;
