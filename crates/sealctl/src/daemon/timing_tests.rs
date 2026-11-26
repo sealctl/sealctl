@@ -1229,12 +1229,14 @@ async fn work_that_moves_the_lock_deadline_is_told_to_the_phone() {
         }
     }
     assert_eq!(told, [60, 180, 300, 420, 540], "seconds after the open");
-    // idle: the work of the last minute is told once the 2 minutes are up, then the deadline
-    // stays where the phone has it, so nothing goes out
+    // idle: the work of the last minute is told once the 2 minutes are up, and 2 minutes after
+    // the last work that the machine is idle (SPEC 6.4); then the deadline stays where the
+    // phone has it, so nothing goes out
     for _ in 0..8 {
         sample(&d, Some(600)).await;
     }
-    assert_eq!(open_statuses(&d).0, opened + told.len() + 1);
+    assert_eq!(open_statuses(&d).0, opened + told.len() + 2);
+    assert!(!d.st().told_work.unwrap().active);
     let before = open_statuses(&d);
     for _ in 0..40 {
         sample(&d, Some(600)).await;
@@ -1279,4 +1281,130 @@ async fn a_failed_deadline_status_is_tried_again_after_a_minute_not_at_once() {
     let st = d.st();
     assert!(!st.status_dirty);
     assert!(st.saved.deadline().abs_diff(st.told_deadline.unwrap()) < session::DEADLINE_LATER_MS);
+}
+
+/// How long past the 2 minutes of an active status the phone still shows "active" (the app's
+/// SPEC 11.8): the status that ends them must come within it.
+const PHONE_GRACE_MS: u64 = 60_000;
+
+/// Samples `n` times with input `idle` seconds ago, and notes each status that went out:
+/// `(time, said active)`. Checks after every sample that the phone shows what is true: active
+/// within the minute of grace while the machine works.
+async fn watch(d: &Arc<Daemon>, n: usize, idle: Option<u64>, told: &mut Vec<(u64, bool)>) {
+    for _ in 0..n {
+        let before = open_statuses(d).0;
+        sample(d, idle).await;
+        let now = d.now();
+        let st = d.st();
+        let w = st.told_work.expect("an Open status tells the work");
+        if open_statuses(d).0 > before {
+            told.push((now, w.active));
+        }
+        if session::is_active(now, st.saved.last_work) && w.active {
+            assert!(
+                now < w.at + session::ACTIVE_MS + PHONE_GRACE_MS,
+                "the phone's \"active\" ran out at {now}: {told:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_phone_hears_when_the_machine_goes_idle_and_when_it_is_back() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    let start = d.now();
+    assert!(d.st().told_work.unwrap().active, "the open says active");
+    // 10 minutes of work: the phone keeps hearing "active", at most once every 2 minutes
+    let mut told = Vec::new();
+    watch(&d, 40, Some(0), &mut told).await;
+    assert!(told.iter().all(|&(_, active)| active), "{told:?}");
+    assert!(told.windows(2).all(|w| w[1].0 - w[0].0 >= 120_000), "{told:?}");
+    assert!(told.len() <= 5, "{told:?}");
+    // the user stops: one status says idle, 2 minutes after the last work
+    let last_work = d.st().saved.last_work;
+    let mut told = Vec::new();
+    watch(&d, 40, Some(600), &mut told).await;
+    let idle: Vec<_> = told.iter().filter(|&&(_, active)| !active).collect();
+    assert_eq!(idle.len(), 1, "{told:?}");
+    let went_idle = idle[0].0;
+    assert!(went_idle >= last_work + session::ACTIVE_MS, "{told:?}");
+    assert!(went_idle <= last_work + session::ACTIVE_MS + 15_000, "{told:?}");
+    assert_eq!(
+        told.last().copied(),
+        Some((went_idle, false)),
+        "nothing more while idle: {told:?}"
+    );
+    {
+        let st = d.st();
+        let w = st.told_work.unwrap();
+        assert!(!w.active);
+        assert!(
+            w.at <= last_work + 1_000,
+            "the phone counts idle from the last work"
+        );
+    }
+    // back at work: the first sample with input tells the phone
+    let mut told = Vec::new();
+    watch(&d, 1, Some(0), &mut told).await;
+    assert_eq!(told, [(d.now(), true)]);
+    // and going idle at once after it is told once more
+    let mut told = Vec::new();
+    watch(&d, 20, Some(600), &mut told).await;
+    assert_eq!(told.iter().filter(|&&(_, a)| !a).count(), 1, "{told:?}");
+    assert!(d.st().open);
+    // over the whole run, no more than one status every 2 minutes on average
+    let all = open_statuses(&d).0 as u64;
+    assert!(all <= 1 + (d.now() - start) / 120_000, "{all} statuses");
+}
+
+#[tokio::test(start_paused = true)]
+async fn work_close_to_the_hard_stop_still_tells_the_phone_it_is_active() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    // an allowance longer than the day: the deadline is the hard stop and work never moves it,
+    // so the deadline rule sends nothing of its own
+    {
+        let mut st = d.st();
+        st.saved.cap = 30 * 3_600;
+        st.saved.base = 30 * 3_600;
+    }
+    let mut told = Vec::new();
+    watch(&d, 40, Some(0), &mut told).await;
+    let stop = d.st().saved.deadline();
+    assert_eq!(stop, session::hard_stop(d.st().saved.first_open.unwrap()));
+    assert!(told.len() >= 4, "{told:?}");
+    assert!(told.iter().all(|&(_, active)| active), "{told:?}");
+    assert!(told.windows(2).all(|w| w[1].0 - w[0].0 >= 120_000), "{told:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_activity_status_is_tried_again_after_a_minute_not_at_once() {
+    let (d, _) = testing::daemon(DEAD);
+    open(&d, &store_items()).await;
+    settle().await;
+    let mut told = Vec::new();
+    watch(&d, 4, Some(0), &mut told).await;
+    // the relay is down; the user stops
+    *d.t.status_failures.lock().unwrap() = 1_000;
+    let mut tries = Vec::new();
+    for s in 1..=40u64 {
+        let before = open_statuses(&d).1;
+        sample(&d, Some(600)).await;
+        if open_statuses(&d).1 > before {
+            tries.push(s * 15);
+        }
+    }
+    assert!(!tries.is_empty());
+    assert!(tries.windows(2).all(|w| w[1] - w[0] >= 60), "{tries:?}");
+    // back: the retry tells the phone the machine is idle
+    *d.t.status_failures.lock().unwrap() = 0;
+    for _ in 0..5 {
+        sample(&d, Some(600)).await;
+    }
+    let st = d.st();
+    assert!(!st.status_dirty);
+    assert!(!st.told_work.unwrap().active);
 }

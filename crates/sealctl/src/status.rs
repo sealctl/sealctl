@@ -75,6 +75,36 @@ fn describe(paired: &Paired, d: &approve::Delayed) -> (String, Option<String>) {
     }
 }
 
+/// The first line of `sealctl status` while Open, from the daemon's `status`: "active" while
+/// the machine works, else how long it has been idle and when it locks (SPEC 10.1). A daemon
+/// still running from an older version sends only `left`.
+fn open_line(d: &Value) -> String {
+    let stop = d["hardStop"]
+        .as_u64()
+        .map(|h| format!(" · hard stop {}", session::hhmm(h)))
+        .unwrap_or_default();
+    match (d["active"].as_bool(), d["idleSecs"].as_u64()) {
+        (Some(true), _) => {
+            let after = d["allowanceSecs"]
+                .as_u64()
+                .map(|a| format!(" · locks after {} idle", session::duration(a)))
+                .unwrap_or_default();
+            format!("Open · active{after}{stop}")
+        }
+        (Some(false), Some(idle)) => {
+            let at = d["locksAt"]
+                .as_u64()
+                .map(|t| format!(" · locks at {}", session::hhmm(t)))
+                .unwrap_or_default();
+            format!("Open · idle {}{at}{stop}", session::duration(idle))
+        }
+        _ => {
+            let left = d["left"].as_u64().unwrap_or(0);
+            format!("Open · {} left{stop}", session::duration(left))
+        }
+    }
+}
+
 /// `sealctl status [--json]`.
 pub fn status(json_out: bool) -> Result<i32> {
     let paired = machine::load().ok();
@@ -124,6 +154,10 @@ pub fn status(json_out: bool) -> Result<i32> {
             "version": env!("CARGO_PKG_VERSION"),
             "state": if paired.is_some() { state.clone() } else { "unpaired".into() },
             "left": daemon.as_ref().and_then(|d| d["left"].as_u64()),
+            "active": daemon.as_ref().and_then(|d| d["active"].as_bool()),
+            "idleSecs": daemon.as_ref().and_then(|d| d["idleSecs"].as_u64()),
+            "allowanceSecs": daemon.as_ref().and_then(|d| d["allowanceSecs"].as_u64()),
+            "locksAt": daemon.as_ref().and_then(|d| d["locksAt"].as_u64()).map(session::rfc3339),
             "hardStop": daemon.as_ref().and_then(|d| d["hardStop"].as_u64()).map(session::rfc3339),
             "lockReason": daemon.as_ref().and_then(|d| d["lockReason"].as_str().map(str::to_owned)),
             "machine": paired.as_ref().map(|p| json!({"name": p.file.name, "tag": p.file.tag, "paired": true, "relay": p.file.relay}))
@@ -150,15 +184,7 @@ pub fn status(json_out: bool) -> Result<i32> {
         return Ok(exit::NOT_PAIRED);
     };
     let first = match state.as_str() {
-        "open" => {
-            let left = daemon.as_ref().and_then(|d| d["left"].as_u64()).unwrap_or(0);
-            let stop = daemon
-                .as_ref()
-                .and_then(|d| d["hardStop"].as_u64())
-                .map(|h| format!(" · hard stop {}", session::hhmm(h)))
-                .unwrap_or_default();
-            format!("Open · {} left{stop}", session::duration(left))
-        }
+        "open" => open_line(daemon.as_ref().unwrap_or(&Value::Null)),
         "waiting" => {
             let since = daemon
                 .as_ref()
@@ -436,4 +462,49 @@ pub fn doctor(json_out: bool) -> Result<i32> {
         }
     }
     Ok(if problems > 0 { 1 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STOP: u64 = 1_800_000_000_000;
+
+    #[test]
+    fn open_says_active_while_the_machine_works() {
+        let d = json!({"left": 14_390, "active": true, "idleSecs": 10, "allowanceSecs": 14_400,
+            "locksAt": STOP - 3_600_000, "hardStop": STOP});
+        assert_eq!(
+            open_line(&d),
+            format!(
+                "Open · active · locks after 4 h idle · hard stop {}",
+                session::hhmm(STOP)
+            )
+        );
+    }
+
+    #[test]
+    fn open_says_how_long_idle_and_when_it_locks() {
+        let locks = STOP - 5 * 3_600_000;
+        let d = json!({"left": 13_680, "active": false, "idleSecs": 720, "allowanceSecs": 14_400,
+            "locksAt": locks, "hardStop": STOP});
+        assert_eq!(
+            open_line(&d),
+            format!(
+                "Open · idle 12 min · locks at {} · hard stop {}",
+                session::hhmm(locks),
+                session::hhmm(STOP)
+            )
+        );
+    }
+
+    #[test]
+    fn an_older_daemon_still_shows_the_time_left() {
+        let d = json!({"left": 11_520, "hardStop": STOP});
+        assert_eq!(
+            open_line(&d),
+            format!("Open · 3 h 12 min left · hard stop {}", session::hhmm(STOP))
+        );
+        assert_eq!(open_line(&json!({"left": 1_800})), "Open · 30 min left");
+    }
 }

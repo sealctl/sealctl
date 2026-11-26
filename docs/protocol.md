@@ -521,12 +521,14 @@ Status body:
 | --- | --- |
 | `v`, `t` | Version, time |
 | `seq` | Increases by one with every status from this machine; the phone ignores a `seq` it has seen |
-| `state` | `{"s": "locked" \| "open" \| "waiting", "left": <idle seconds left>, "stop": <hard stop time>, "place": <place from the last open>, "busy": [<volumes still mounted after a lock, with the process holding them>]}`; each `busy` item is `{"n": <volume name>, "p": <process name>, "pid"?: <process id>}` |
+| `state` | `{"s": "locked" \| "open" \| "waiting", "left": <idle seconds left>, "idle"?: <seconds since the last work moment>, "allow"?: <idle allowance in seconds>, "stop": <hard stop time>, "place": <place from the last open>, "busy": [<volumes still mounted after a lock, with the process holding them>]}`; each `busy` item is `{"n": <volume name>, "p": <process name>, "pid"?: <process id>}`. `idle` and `allow` come with `left` while Open, at the status's time (`left` = `allow` − `idle`); a machine from before they existed sends `left` alone, and a phone that does not know them ignores them |
 | `log` | Uses since the last acknowledged status, at most 50: `[{"t", "a", "r", "c", "n": [names], "own": bool}]` |
 | `inv` | Objects on this machine, when changed: `[{"p", "i", "w", "c", "o"}]` as in request `keys` |
 | `migrate` | Re-encryption: `{"items": [{"p", "i", "path", "s", "rw": <seconds>, "re": [<min s>, <max s>], "free": <bytes>, "done": <0 to 1>, "paused": <reason or null>}]}` |
 
 The machine sends a status when its state changes, when it holds unsent log entries (at most every 60 seconds), when its lock deadline (the time it locks unless more work comes: the last work moment plus the idle allowance, or `stop` if sooner) moved at least 2 minutes later or 1 minute earlier than the last status's `t` + `left` (at most every 2 minutes), and at least every 15 minutes while Open.
+
+**Active and idle.** An Open machine is *active* while its last work moment (input or a key use) is less than 2 minutes old, and *idle* after that; a status says which by its `idle` (under 120: active). While Open the machine also sends a status when it goes idle after a status that said active, when it is active again after one that said idle, and when it is still active 2 minutes after the last work moment a status implied (`t` − `idle`), each at most once every 2 minutes. The phone shows an active machine as active, without a countdown, for up to 3 minutes after that work moment (2 minutes, and one more for the 15-second sampling and the way to the phone), and an idle one with its idle time now (`idle` + the time since the status) and the time it locks (`t` + `left`, capped by `stop`). Without `idle` it counts `left` down as before.
 
 Message body:
 

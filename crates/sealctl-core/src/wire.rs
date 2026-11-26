@@ -285,6 +285,12 @@ pub struct SessionState {
     /// Idle seconds left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left: Option<u64>,
+    /// Seconds since the last work moment, at the status's time. Absent from older machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<u64>,
+    /// The idle allowance now, seconds. Absent from older machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<u64>,
     /// Hard stop time, Unix ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<u64>,

@@ -26,6 +26,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Changed
 
+- `sealctl status` says `Open · active · locks after 4 h idle · hard stop 21:13` while you work
+  (input or a key use in the last 2 minutes), instead of a time left that went back to the full
+  allowance at every keystroke. Once the machine is idle it says
+  `Open · idle 12 min · locks at 15:42 · hard stop 21:13`. `--json` adds `active`, `idleSecs`,
+  `allowanceSecs` and `locksAt`, and keeps `left`.
+- Protocol: a machine status carries `idle` (seconds since the last work moment) and `allow`
+  (the idle allowance) beside `left`, both optional (docs/protocol.md, Machine status). The
+  machine sends a status when it goes idle and when it is active again, at most once every 2
+  minutes for each, so the phone can show "active" instead of a countdown.
 - The session's hard stop is now 02:00 local time or 24 hours after the first `open` granted
   today, whichever comes first (it was 14 hours). A session first opened in the morning stays
   Open until 02:00 that night while you keep working; one opened at 03:00 runs until 02:00 the
