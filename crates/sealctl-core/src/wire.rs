@@ -454,7 +454,7 @@ pub struct Answer {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Notice {
-    /// `unseal_all`, `leave`, `words` or `delete`.
+    /// `unseal_all`, `leave`, `words`, `delete` or `place`.
     #[serde(default)]
     pub what: String,
     /// `pending`, `cancelled` or `done`.
@@ -472,6 +472,11 @@ pub struct Notice {
     /// Counts of a finished hand-back.
     #[serde(default)]
     pub report: Option<NoticeReport>,
+    /// `place`: the name of the place the phone trusted, as the person typed it on the phone
+    /// (shown cleaned of control and direction characters). Left out of other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    pub place: Option<String>,
 }
 
 /// `notice.report`.

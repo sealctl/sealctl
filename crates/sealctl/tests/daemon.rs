@@ -736,6 +736,7 @@ fn a_finished_delayed_action_leaves_the_pending_list() {
                 to: vec!["keychain".into()],
                 ..NoticeReport::default()
             }),
+            place: None,
         },
     };
     let pending = || {
@@ -761,6 +762,7 @@ fn a_finished_delayed_action_leaves_the_pending_list() {
             delay: Some("old".into()),
             at: Some(now_ms() - 16 * 60_000),
             report: None,
+            place: None,
         },
     };
     env.block(env.phone.send_message(&m, stale)).unwrap();
@@ -773,6 +775,7 @@ fn a_finished_delayed_action_leaves_the_pending_list() {
             delay: Some("untimed".into()),
             at: None,
             report: None,
+            place: None,
         },
     };
     env.block(env.phone.send_message(&m, untimed)).unwrap();
@@ -790,6 +793,40 @@ fn a_finished_delayed_action_leaves_the_pending_list() {
     };
     assert!(until(10, || ids().contains(&"-dLy1d".to_string())));
     assert_eq!(ids(), ["-dLy1d", "untimed"]);
+}
+
+/// A place the phone trusted (protocol.md, Message body): pending under its own name, cleaned
+/// of what a terminal would act on, until its `done` notice.
+#[test]
+fn a_trusted_place_is_pending_under_its_name() {
+    use sealctl_core::wire::Notice;
+    let mut env = Env::fake(Options::default());
+    let m = env.pair();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["open"]));
+    assert_eq!(code, 0, "{err}");
+    channel_up(&env, &m);
+    let notice = |state: &str| MessageKind::Notice {
+        notice: Notice {
+            what: "place".into(),
+            state: state.into(),
+            machine: None,
+            delay: Some("-pLace1".into()),
+            at: Some(now_ms() + 7_200_000),
+            report: None,
+            place: Some("Home\u{1b}[31m\u{202e}".into()),
+        },
+    };
+    let pending = || daemon(&env, json!({"op": "status"}))["pending"].clone();
+    env.block(env.phone.send_message(&m, notice("pending"))).unwrap();
+    assert!(until(10, || pending().as_array().is_some_and(|p| p.len() == 1)));
+    assert_eq!(
+        pending()[0]["what"],
+        "trusting the place Home [31m",
+        "{}",
+        pending()
+    );
+    env.block(env.phone.send_message(&m, notice("done"))).unwrap();
+    assert!(until(10, || pending().as_array().is_some_and(Vec::is_empty)));
 }
 
 /// The relay is slow to answer the machine socket's upgrade (up to the 10 s timeout): the

@@ -24,6 +24,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   planned on the relay). Deleting a phone's relay data deletes its feedback answers and
   intent; the feedback licence record (granted, and its end) stays, as a paid one does.
 
+- A place your phone newly trusts is announced as such: "Your phone trusted the place Home. It
+  skips the two-hour wait from 12:04. Not you? Run: sealctl cancel" (and "Cancelled from your
+  phone: trusting the place Home"). Protocol: the `notice` kind `place` with the place's name
+  (`notice.place`, docs/protocol.md).
+
 ### Changed
 
 - `sealctl status` says `Open · active · locks after 4 h idle · hard stop 21:13` while you work
@@ -43,6 +48,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 
+- A phone notice of a kind this CLI does not know is shown as "a sensitive action" instead of
+  by its code, and machine names in notices are cleaned and cut short before
+  `sealctl status` keeps them, as in the notification.
 - Agent hooks no longer deny writing a script with a quoted here-document
   (`cat > voices.mjs <<'EOF'` … `EOF`, `tee`) because it reads a variable
   (`process.env.ELEVENLABS_API_KEY`), prints the environment or mentions a `.env` file. A quoted
