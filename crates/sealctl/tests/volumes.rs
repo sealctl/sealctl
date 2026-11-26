@@ -909,7 +909,13 @@ fn unseal_volume_to_show_resumed_before_the_change_shows_a_new_passphrase() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert_eq!(status.signal(), Some(9), "killed at the hook");
+    let screen = pty.screen.lock().unwrap().clone();
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "killed at the hook; exit {:?}, screen:\n{screen}",
+        status.code()
+    );
     drop(phone);
     assert!(!hdiutil_opens(&bundle, &first), "the bundle has not changed yet");
 
@@ -992,7 +998,13 @@ fn sealing_a_bundle_resumed_after_a_kill_at_its_marker_uses_its_id() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert_eq!(status.signal(), Some(9), "killed at the hook");
+    let screen = pty.screen.lock().unwrap().clone();
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "killed at the hook; exit {:?}, screen:\n{screen}",
+        status.code()
+    );
     drop(phone);
     let marker: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(bundle.join("sealctl.id")).unwrap()).unwrap();

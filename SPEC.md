@@ -389,6 +389,10 @@ While Open, the daemon keeps the phone informed and listens for locks (protocol.
   - pending: `Your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at 11:00. Not you? Run: sealctl cancel`. The relay's own note, without the phone's details, reads `A sensitive action was approved on your phone. It takes effect at 11:00. Not you? Run: sealctl cancel`;
   - cancelled: `Cancelled from your phone: leaving sealctl on dev@mbp.example.com`;
   - done with a report: `dev@mbp.example.com handed back 9 objects (macOS Keychain). 0 failed.`
+  - a place the phone trusted (`what: "place"`), pending: `Your phone trusted the place Home. It skips the two-hour wait from 12:04. Not you? Run: sealctl cancel`; cancelled: `Cancelled from your phone: trusting the place Home`; done: nothing;
+  - a kind this CLI does not know: named `a sensitive action`, as the relay's note names it.
+
+  Names in a notice (the machine, the place, the stores) come from the phone: control and direction-changing characters are dropped and each is cut to 60 characters before it is shown or kept for `sealctl status`. A notice without a place name says `a new place`.
 - A Locked machine has no machine socket, so it learns of a pending action at its next relay call; `sealctl status` asks the relay (`GET .../delayed`, 2-second timeout) every time it runs.
 
 ### 6.7 Process hardening

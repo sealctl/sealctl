@@ -70,6 +70,76 @@ const DELAYED_EXPIRES_MS: u64 = 15 * 60_000;
 /// without its `releaseAt` takes effect by then.
 const DELAYED_MAX_MS: u64 = 2 * 3_600_000;
 
+/// The longest name shown from the phone (a machine, a place).
+const NAME_MAX: usize = 60;
+
+/// What a `notice` shows (protocol.md, Message body; SPEC 6.6): its desktop notification, if
+/// any, and the action as `sealctl status` names it. `None` for a state this CLI does not know.
+struct NoticeText {
+    text: Option<String>,
+    what: String,
+}
+
+/// The text of a `notice`. Names come from the phone: control and direction-changing
+/// characters are dropped and they are cut to [`NAME_MAX`] characters. A kind this CLI does
+/// not know is named "a sensitive action", as the relay's own note names it, never by its
+/// code.
+fn notice_text(n: &sealctl_core::wire::Notice, now: u64) -> Option<NoticeText> {
+    let name = |s: Option<&str>| s.map(|s| desktop::clean(s, NAME_MAX)).filter(|s| !s.is_empty());
+    let on = name(n.machine.as_deref())
+        .map(|m| format!(" on {m}"))
+        .unwrap_or_default();
+    if n.what == "place" {
+        let place = name(n.place.as_deref()).unwrap_or_else(|| "a new place".into());
+        let what = format!("trusting the place {place}");
+        let text = match n.state.as_str() {
+            "pending" => {
+                let at = delayed_at(n.at, now).0;
+                Some(format!(
+                    "Your phone trusted the place {place}. It skips the two-hour wait from {}. Not you? Run: sealctl cancel",
+                    session::hhmm(at)
+                ))
+            }
+            "cancelled" => Some(format!("Cancelled from your phone: {what}")),
+            "done" => None,
+            _ => return None,
+        };
+        return Some(NoticeText { text, what });
+    }
+    let what = match n.what.as_str() {
+        "unseal_all" | "leave" => "leaving sealctl",
+        "words" => "showing the words",
+        "delete" => "deleting the relay data",
+        _ => "a sensitive action",
+    };
+    let text = match n.state.as_str() {
+        "pending" => {
+            let when = delayed_at(n.at, now).1;
+            Some(format!(
+                "Your phone approved {what}{on} away from a trusted place. It takes effect {when}. Not you? Run: sealctl cancel"
+            ))
+        }
+        "cancelled" => Some(format!("Cancelled from your phone: {what}{on}")),
+        "done" => n.report.as_ref().map(|r| {
+            format!(
+                "{} handed back {} objects ({}). {} failed.",
+                name(n.machine.as_deref()).unwrap_or_default(),
+                r.done,
+                r.to.iter()
+                    .map(|t| desktop::clean(t, NAME_MAX))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                r.failed
+            )
+        }),
+        _ => return None,
+    };
+    Some(NoticeText {
+        text,
+        what: what.into(),
+    })
+}
+
 /// When a delayed action announced at `now` takes effect, and how to say so.
 fn delayed_at(at: Option<u64>, now: u64) -> (u64, String) {
     match at {
@@ -1971,57 +2041,23 @@ impl Daemon {
     }
 
     fn on_notice(&self, n: &sealctl_core::wire::Notice) {
-        let what = match n.what.as_str() {
-            "unseal_all" => "leaving sealctl",
-            "leave" => "leaving sealctl",
-            "words" => "showing the words",
-            "delete" => "deleting the relay data",
-            other => other,
+        let now = self.now();
+        let Some(shown) = notice_text(n, now) else {
+            return;
+        };
+        if let Some(text) = &shown.text {
+            util::notify(text);
         }
-        .to_string();
-        let on = n
-            .machine
-            .as_deref()
-            .map(|m| format!(" on {m}"))
-            .unwrap_or_default();
-        match n.state.as_str() {
-            "pending" => {
-                let (at, when) = delayed_at(n.at, self.now());
-                util::notify(&format!(
-                    "Your phone approved {what}{on} away from a trusted place. It takes effect {when}. Not you? Run: sealctl cancel"
-                ));
-                if let Some(id) = &n.delay {
-                    let mut st = self.st();
-                    st.pending.retain(|p| &p.id != id);
-                    st.pending.push(Pending {
-                        id: id.clone(),
-                        what,
-                        machine: n.machine.clone(),
-                        at,
-                    });
-                }
-            }
-            "cancelled" => {
-                util::notify(&format!("Cancelled from your phone: {what}{on}"));
-                if let Some(id) = &n.delay {
-                    self.st().pending.retain(|p| &p.id != id);
-                }
-            }
-            "done" => {
-                if let Some(id) = &n.delay {
-                    self.st().pending.retain(|p| &p.id != id);
-                }
-                if let Some(r) = &n.report {
-                    util::notify(&format!(
-                        "{} handed back {} objects ({}). {} failed.",
-                        n.machine.clone().unwrap_or_default(),
-                        r.done,
-                        r.to.join(", "),
-                        r.failed
-                    ));
-                }
-            }
-            _ => {}
+        let Some(id) = &n.delay else { return };
+        let mut st = self.st();
+        st.pending.retain(|p| &p.id != id);
+        if n.state == "pending" {
+            st.pending.push(Pending {
+                id: id.clone(),
+                what: shown.what,
+                machine: n.machine.as_deref().map(|m| desktop::clean(m, NAME_MAX)),
+                at: delayed_at(n.at, now).0,
+            });
         }
     }
 
@@ -2456,6 +2492,99 @@ pub fn run(spawned: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn notice(
+        what: &str,
+        state: &str,
+        place: Option<&str>,
+        machine: Option<&str>,
+    ) -> sealctl_core::wire::Notice {
+        sealctl_core::wire::Notice {
+            what: what.into(),
+            state: state.into(),
+            machine: machine.map(Into::into),
+            delay: Some("d1".into()),
+            at: Some(1_795_251_600_000),
+            report: None,
+            place: place.map(Into::into),
+        }
+    }
+
+    /// A place the phone trusted (protocol.md, Message body; SPEC 6.6): named as the place,
+    /// never as an approval away from a trusted place.
+    #[test]
+    fn a_place_notice_names_the_place() {
+        let at = session::hhmm(1_795_251_600_000);
+        let t = notice_text(&notice("place", "pending", Some("Home"), None), 0).unwrap();
+        assert_eq!(
+            t.text.as_deref(),
+            Some(
+                format!("Your phone trusted the place Home. It skips the two-hour wait from {at}. Not you? Run: sealctl cancel")
+                    .as_str()
+            )
+        );
+        assert_eq!(t.what, "trusting the place Home");
+        let t = notice_text(&notice("place", "cancelled", Some("Home"), None), 0).unwrap();
+        assert_eq!(
+            t.text.as_deref(),
+            Some("Cancelled from your phone: trusting the place Home")
+        );
+        let t = notice_text(&notice("place", "done", Some("Home"), None), 0).unwrap();
+        assert_eq!(t.text, None);
+        assert!(notice_text(&notice("place", "later", Some("Home"), None), 0).is_none());
+    }
+
+    /// The place's name comes from the phone: control and direction-changing characters are
+    /// dropped and it is cut short, as machine names are; a missing or empty one is "a new place".
+    #[test]
+    fn a_place_name_from_the_phone_is_cleaned() {
+        let t = notice_text(
+            &notice("place", "pending", Some("Ho\u{1b}[2Jme\n\u{202e}Office"), None),
+            0,
+        )
+        .unwrap();
+        let text = t.text.unwrap();
+        assert!(
+            text.starts_with("Your phone trusted the place Ho [2Jme Office. "),
+            "{text}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{text:?}"
+        );
+        assert_eq!(t.what, "trusting the place Ho [2Jme Office");
+        let long = "x".repeat(200);
+        let t = notice_text(&notice("place", "pending", Some(&long), None), 0).unwrap();
+        assert_eq!(t.what.chars().count(), "trusting the place ".len() + NAME_MAX);
+        for empty in [None, Some(""), Some(" \u{200f}\t")] {
+            let t = notice_text(&notice("place", "pending", empty, None), 0).unwrap();
+            assert_eq!(t.what, "trusting the place a new place", "{empty:?}");
+        }
+    }
+
+    /// The kinds before it read as before; one this CLI does not know is "a sensitive action",
+    /// never its code from the phone.
+    #[test]
+    fn other_notices_read_as_before_and_an_unknown_kind_is_not_echoed() {
+        let at = session::hhmm(1_795_251_600_000);
+        let t = notice_text(
+            &notice("unseal_all", "pending", None, Some("dev@mbp.example.com")),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            t.text.unwrap(),
+            format!("Your phone approved leaving sealctl on dev@mbp.example.com away from a trusted place. It takes effect at {at}. Not you? Run: sealctl cancel")
+        );
+        let t = notice_text(&notice("words", "cancelled", None, None), 0).unwrap();
+        assert_eq!(t.text.unwrap(), "Cancelled from your phone: showing the words");
+        let t = notice_text(&notice("\u{1b}]0;x\u{7}", "pending", None, None), 0).unwrap();
+        assert_eq!(t.what, "a sensitive action");
+        assert!(t
+            .text
+            .unwrap()
+            .starts_with("Your phone approved a sensitive action away"));
+    }
 
     fn entry(i: u64) -> LogEntry {
         LogEntry {

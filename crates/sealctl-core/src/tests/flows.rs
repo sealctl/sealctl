@@ -435,6 +435,18 @@ fn every_message_kind_round_trips() {
                 delay: None,
                 at: Some(T),
                 report: None,
+                place: None,
+            },
+        },
+        MessageKind::Notice {
+            notice: Notice {
+                what: "place".into(),
+                state: "pending".into(),
+                machine: None,
+                delay: Some("-dLy1d".into()),
+                at: Some(T),
+                report: None,
+                place: Some("Home".into()),
             },
         },
     ];
@@ -462,6 +474,32 @@ fn every_message_kind_round_trips() {
         crate::open_machine_status(&keys, m.id(), sealed).unwrap(),
         MachineStatus { version: 1, ..status }
     );
+}
+
+/// `notice.place` (a place the phone trusted) is left out of the other kinds, so their bytes
+/// are as before, and a notice from an app that does not send it reads without it.
+#[test]
+fn a_notice_carries_the_place_only_when_it_has_one() {
+    let unseal = Notice {
+        what: "unseal_all".into(),
+        state: "pending".into(),
+        ..Notice::default()
+    };
+    let v = serde_json::to_value(&unseal).unwrap();
+    assert!(v.get("place").is_none(), "{v}");
+    let place = Notice {
+        what: "place".into(),
+        state: "pending".into(),
+        place: Some("Home".into()),
+        ..Notice::default()
+    };
+    assert_eq!(serde_json::to_value(&place).unwrap()["place"], "Home");
+    let old: Notice = serde_json::from_str(
+        r#"{"what":"words","state":"pending","machine":null,"delay":"d","at":1,"report":null}"#,
+    )
+    .unwrap();
+    assert_eq!(old.place, None);
+    assert_eq!(old.what, "words");
 }
 
 /// `idle` and `allow` are optional: a status from an older machine reads without them, and a
