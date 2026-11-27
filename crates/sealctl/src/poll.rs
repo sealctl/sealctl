@@ -354,7 +354,8 @@ mod tests {
         assert_eq!(r.unwrap(), Some("paid"), "{t:?}");
         // asked again only after each Retry-After, never at the poll's own 2 s pace
         let gaps: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
-        assert!(gaps[1] >= 60.0 && gaps[2] >= 60.0, "{gaps:?}");
+        // (seconds as f64 from the start: their differences may lose the last bit)
+        assert!(gaps[1] >= 59.999 && gaps[2] >= 59.999, "{gaps:?}");
         // a window that outlasts the poll ends it with the relay's answer
         let (r, t) = run(vec![maintenance(); 10], Duration::from_secs(100)).await;
         let e = r.unwrap_err();
