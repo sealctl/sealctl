@@ -80,9 +80,16 @@ impl Pauses {
         }
     }
 
+    /// An answer the caller understood: failures in a row start over (the doubling, and the
+    /// one more ask after `clock_skew`).
+    pub fn answered(&mut self) {
+        self.failed = 0;
+        self.skewed = false;
+    }
+
     /// The pause after a "not yet" answer; `j` is the jitter in `0..1`.
     pub fn not_yet(&mut self, j: f64) -> Duration {
-        self.failed = 0;
+        self.answered();
         let d = self.not_yet;
         self.not_yet = self.not_yet.mul_f64(1.5).min(self.pace.most.max(self.pace.every));
         jittered(d, j)
@@ -138,7 +145,10 @@ where
             Ok(a) => match judge(&a)? {
                 Seen::Done(t) => return Ok(Some(t)),
                 Seen::NotYet => (p.not_yet(jitter()), None),
-                Seen::After(d) => (d, None),
+                Seen::After(d) => {
+                    p.answered();
+                    (d, None)
+                }
                 Seen::Other => match p.answer(&a, jitter()) {
                     Then::Wait(d) => (d, Some(error_for(&a))),
                     Then::Stop => return Err(error_for(&a)),
@@ -202,6 +212,10 @@ mod tests {
         assert_eq!(got, vec![2, 4, 8, 16, 30, 30]);
         // an answer resets the doubling
         p.not_yet(0.5);
+        assert_eq!(p.failed(0.5), Duration::from_secs(2));
+        // so does an answer with its own time to ask again (a delayed reply before releaseAt)
+        p.failed(0.5);
+        p.answered();
         assert_eq!(p.failed(0.5), Duration::from_secs(2));
         let mut p = Pauses::new(PACE);
         let limited = a(
@@ -275,6 +289,7 @@ mod tests {
             |a| {
                 Ok(match a.status {
                     200 => Seen::Done("paid"),
+                    202 => Seen::After(Duration::from_secs(1)),
                     404 => Seen::NotYet,
                     _ => Seen::Other,
                 })
@@ -310,6 +325,30 @@ mod tests {
         let gaps: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
         for (gap, want) in gaps.iter().zip([2.0, 4.0, 8.0, 16.0]) {
             assert!(*gap >= want * 0.8 - 0.01 && *gap <= want * 1.2 + 0.01, "{gaps:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_with_its_own_time_starts_the_failures_over() {
+        let answers = vec![
+            Err(()),
+            Err(()),
+            Err(()),
+            Ok(a(202, json!({}))),
+            Err(()),
+            Ok(a(200, json!({}))),
+        ];
+        let (r, t) = run(answers, Duration::from_secs(900)).await;
+        assert_eq!(r.unwrap(), Some("paid"));
+        let gaps: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+        // 2, 4, 8 s after the failures, 1 s as the answer said, then 2 s again (not 16)
+        for (gap, want) in gaps.iter().zip([2.0, 4.0, 8.0, 1.0, 2.0]) {
+            let (lo, hi) = if want == 1.0 {
+                (1.0, 1.0)
+            } else {
+                (want * 0.8, want * 1.2)
+            };
+            assert!(*gap >= lo - 0.01 && *gap <= hi + 0.01, "{gaps:?}");
         }
     }
 
