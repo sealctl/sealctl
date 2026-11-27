@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Changed
+
+- `sealctl seal volume` of an APFS volume writes its `sealctl <seed>` passphrase hint before it
+  changes the passphrase, and puts your own hint back if the change fails or is undone. Sealing
+  a volume that a seal which did not finish has changed already names that seed and
+  `sealctl recover`.
+- Linux: `unseal --to keychain` talks to the Secret Service through `secret-service` 6 and
+  `zbus` 6 instead of `keyring` 3, and desktop notifications use `zbus` 6. Items written by
+  earlier versions are found and replaced as before. `Cargo.lock` has 30 fewer crates.
+- Release tarballs are reproducible: the same commit builds the same `.tar.gz`, byte for byte,
+  in any folder (`scripts/build-release.sh`, `scripts/package.sh`), and CI checks it.
+
 ## 0.7.2 - 2026-11-27
 
 ### Added

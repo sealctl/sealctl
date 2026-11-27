@@ -358,3 +358,118 @@ fn secrets_to_the_keychain_with_readable_labels() {
         );
     }
 }
+
+/// The Secret Service, CI only: `--features test-hooks` with `SEALCTL_TEST_SECRET_SERVICE` set,
+/// inside a D-Bus session of the job's own with an unlocked gnome-keyring (no desktop session
+/// involved). Each secret becomes one item with its label, found by `service` and `username`;
+/// an item an earlier version wrote under the same attributes is replaced, not doubled.
+#[cfg(all(feature = "test-hooks", target_os = "linux"))]
+#[test]
+fn secrets_to_the_secret_service_with_labels() {
+    use std::process::Command;
+    if std::env::var_os("SEALCTL_TEST_SECRET_SERVICE").is_none() {
+        return;
+    }
+    let bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").expect("a session bus");
+    let (env, a, b) = setup();
+    let service = format!("sealctl-test-{}", &canary()[6..14]);
+    let tool = |args: &[&str], stdin: Option<&str>| {
+        use std::io::Write;
+        let mut c = Command::new("secret-tool")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut i = c.stdin.take().unwrap();
+        if let Some(s) = stdin {
+            i.write_all(s.as_bytes()).unwrap();
+        }
+        drop(i);
+        let o = c.wait_with_output().unwrap();
+        assert!(
+            o.status.success(),
+            "secret-tool {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    // an item as an earlier version wrote it
+    tool(
+        &[
+            "store",
+            "--label",
+            "old",
+            "service",
+            &service,
+            "username",
+            "secret/shop/api-key",
+            "target",
+            "default",
+            "application",
+            "rust-keyring",
+        ],
+        Some("old value"),
+    );
+
+    let mut c = env.cmd();
+    c.env("SEALCTL_TEST_KEYCHAIN_SERVICE", &service)
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+        .args(["unseal", "secrets", "--keep-store", "--secrets-to", "keychain"]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line("y");
+    let start = std::time::Instant::now();
+    let code = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st.code().unwrap_or(-1);
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = pty.child.kill();
+            panic!(
+                "timed out; the phone answered {:?}\nscreen:\n{}",
+                phone.kinds(),
+                pty.screen.lock().unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = pty.screen.lock().unwrap().clone();
+    assert_eq!(code, 0, "{screen}");
+    for (account, value) in [("secret/shop/api-key", &a), ("secret/shop/db.url", &b)] {
+        assert_eq!(
+            &tool(&["lookup", "service", &service, "username", account], None),
+            value
+        );
+        let found = tool(
+            &["search", "--all", "service", &service, "username", account],
+            None,
+        );
+        let name = account.strip_prefix("secret/").unwrap();
+        assert_eq!(found.matches("label = ").count(), 1, "one item: {found}");
+        assert!(
+            found.contains(&format!("label = sealctl: secret {name}")),
+            "{found}"
+        );
+        // and by the attributes earlier versions searched with
+        let also = tool(
+            &[
+                "search",
+                "--all",
+                "service",
+                &service,
+                "username",
+                account,
+                "target",
+                "default",
+                "application",
+                "rust-keyring",
+            ],
+            None,
+        );
+        assert_eq!(also.matches("label = ").count(), 1, "{also}");
+    }
+}

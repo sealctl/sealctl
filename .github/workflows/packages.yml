@@ -63,6 +63,7 @@ jobs:
     outputs:
       macos: ${{ steps.files.outputs.macos }}
       nix-os: ${{ steps.files.outputs.macos == 'true' && '["ubuntu-24.04","macos-latest"]' || '["ubuntu-24.04"]' }}
+      repro-os: ${{ steps.files.outputs.macos == 'true' && '["ubuntu-24.04","macos-latest"]' || '["ubuntu-24.04"]' }}
     steps:
       - id: files
         env:
@@ -84,8 +85,8 @@ jobs:
           macos=false
           while IFS= read -r f; do
             case "$f" in
-              .github/workflows/packages.yml|scripts/package.sh|scripts/render-formula.sh|\
-              flake.nix|flake.lock|rust-toolchain.toml)
+              .github/workflows/packages.yml|scripts/package.sh|scripts/build-release.sh|\
+              scripts/render-formula.sh|flake.nix|flake.lock|rust-toolchain.toml)
                 macos=true ;;
             esac
           done <<< "$files"
@@ -137,7 +138,7 @@ jobs:
       - name: Packaging tools
         run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
       - name: Build
-        run: cargo build --release --locked -p sealctl
+        run: scripts/build-release.sh
       - name: Tarball
         run: scripts/package.sh ${{ matrix.target }} target/release/sealctl
       - name: .deb
@@ -171,8 +172,8 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build both architectures
         run: |
-          cargo build --release --locked -p sealctl --target aarch64-apple-darwin
-          cargo build --release --locked -p sealctl --target x86_64-apple-darwin
+          scripts/build-release.sh aarch64-apple-darwin
+          scripts/build-release.sh x86_64-apple-darwin
       - name: Tarballs
         env:
           COMPLETIONS_BIN: target/aarch64-apple-darwin/release/sealctl
@@ -184,6 +185,59 @@ jobs:
         with:
           name: macos
           path: dist/*
+
+  # ------------------------------------------------------- reproducible ----
+  # Release tarballs are reproducible (SPEC 21): the binary is built and packaged twice, the
+  # second time from a copy of the checkout in another folder with a CARGO_HOME of its own, and
+  # the two archives must be the same bytes. Linux on every run; macOS when packaging changes.
+  reproducible:
+    name: reproducible (${{ matrix.os }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.changes.outputs.repro-os) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build and package twice
+        run: |
+          case "$RUNNER_OS" in
+            macOS) target=aarch64-apple-darwin ;;
+            *) target=x86_64-unknown-linux-gnu ;;
+          esac
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          again="$RUNNER_TEMP/elsewhere/sealctl"
+          mkdir -p "$again"
+          cp -R . "$again"
+          scripts/build-release.sh "$target"
+          first=$(scripts/package.sh "$target" | tail -n 1)
+          (
+            cd "$again"
+            export CARGO_HOME="$RUNNER_TEMP/cargo-home-2"
+            scripts/build-release.sh "$target"
+            scripts/package.sh "$target" > /dev/null
+          )
+          if cmp "$first" "$again/$first"; then
+            echo "Same bytes: $(cut -d' ' -f1 "$first.sha256")  $first"
+            exit 0
+          fi
+          # name the files that differ
+          mkdir -p "$RUNNER_TEMP/a" "$RUNNER_TEMP/b"
+          tar -xzf "$first" -C "$RUNNER_TEMP/a"
+          tar -xzf "$again/$first" -C "$RUNNER_TEMP/b"
+          diff -r "$RUNNER_TEMP/a" "$RUNNER_TEMP/b" || true
+          tar -tvzf "$first" > "$RUNNER_TEMP/a.txt"
+          tar -tvzf "$again/$first" > "$RUNNER_TEMP/b.txt"
+          diff "$RUNNER_TEMP/a.txt" "$RUNNER_TEMP/b.txt" || true
+          echo "::error::two builds of $first differ"
+          exit 1
 
   # ----------------------------------------------------------------- test ----
   deb:

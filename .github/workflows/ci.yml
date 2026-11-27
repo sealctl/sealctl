@@ -147,6 +147,15 @@ jobs:
       # `mount` hold point)
       - if: runner.os == 'macOS' && (needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' volumes '))
         run: cargo test --locked -p sealctl --features test-hooks --test volumes -- resumed a_lock_while_an_open_mounts
+      # the Secret Service store (Linux runner only): gnome-keyring in a D-Bus session of this
+      # step's own, unlocked with a random password; nothing of the runner's session is used
+      - name: Secret Service store
+        if: runner.os == 'Linux' && (needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' stores '))
+        run: |
+          sudo apt-get install -y gnome-keyring libsecret-tools dbus
+          dbus-run-session -- sh -c 'head -c 18 /dev/urandom | base64 | tr -d "\n" |
+            gnome-keyring-daemon --unlock --components=secrets > /dev/null &&
+            SEALCTL_TEST_SECRET_SERVICE=1 cargo test --locked -p sealctl --features test-hooks --test stores secret_service -- --nocapture'
       # the keychain store, in the keychain file made above (macOS runner only)
       - if: runner.os == 'macOS' && (needs.changes.outputs.full != 'false' || contains(needs.changes.outputs.it, ' stores '))
         run: cargo test --locked -p sealctl --features test-hooks --test stores keychain -- --nocapture
