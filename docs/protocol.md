@@ -701,7 +701,7 @@ Other messages to the machine, each followed by the socket closing:
 | `{"type": "error", "error": "unpaired"}` | The machine is no longer paired (1008) |
 | `{"type": "error", "error": "one_request_per_socket"}` | A second request on the same socket (1008) |
 
-Before the upgrade, the relay can refuse with `426 websocket_required`, `403 forbidden`, `429 rate_limited`, or `429 too_many_pending` when 32 waits are already open for that phone (**(planned)** or 8 for that machine). **(planned)** A wait that has sent no request 30 seconds after its upgrade no longer counts and may be closed, so a machine sends its request right after the upgrade.
+Before the upgrade, the relay can refuse with `426 websocket_required`, `403 forbidden`, `429 rate_limited`, or `429 too_many_pending` when 32 waits are already open for that phone (**(planned)** or 8 for that machine). **(planned)** A wait that has sent no request 30 seconds after its upgrade (a `ping` is not a request) no longer counts and may be closed, so a machine sends its request right after the upgrade.
 
 **(planned)** On the wait socket and the phone socket, the client sends the text message `ping` every 30 seconds and the relay answers `pong`. A message over 8,192 bytes closes the socket with `{"type": "error", "error": "too_large"}` and close code 1009.
 
