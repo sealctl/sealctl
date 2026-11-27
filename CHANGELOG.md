@@ -13,6 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   minutes are up instead of failing at once, a delayed `unseal` keeps waiting, and the daemon
   sends its status (a lock included) once the relay is back. A single command says when to try
   again.
+- A request refused because too many requests from this machine already wait for your
+  phone waits for one of them to finish, instead of reporting the phone's daily limit.
 - The session daemon brings the login service file that an earlier version installed up to
   date when it starts (the stop timeout that gives it time to lock). On Linux the new settings
   apply at once; on macOS at the next login or `sealctl pair`.

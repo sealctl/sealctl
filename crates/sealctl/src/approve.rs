@@ -94,10 +94,12 @@ impl PairedMut for &mut Paired {
 /// minutes.
 ///
 /// A wait socket the relay refuses with a `5xx` (its maintenance window answers
-/// `503 maintenance` with `Retry-After`), or closes to restart (1012), is asked again with a
-/// new request after a pause: at least the `Retry-After`, else 2 s doubling up to 30 s, with
+/// `503 maintenance` with `Retry-After`) or with `429 too_many_pending` (this machine has 8
+/// waits open, or the phone 32), or closes to restart (1012), is asked again with a new
+/// request after a pause: at least the `Retry-After`, else 2 s doubling up to 30 s, with
 /// jitter. The request keeps its own expiry: once the next ask would come after it, the wait
-/// ends with the relay's error (exit 6), or as unanswered after a restart.
+/// ends with the relay's error (exit 6, or 7 for too many waits), or as unanswered after a
+/// restart.
 pub async fn send_shared<P: PairedMut>(
     relay: &Relay,
     paired: &tokio::sync::Mutex<P>,
@@ -110,6 +112,7 @@ pub async fn send_shared<P: PairedMut>(
     // set while the relay is down: the expiry of the first ask, which later asks keep
     let mut expires: Option<tokio::time::Instant> = None;
     let mut down = crate::poll::Pauses::new(RELAY_DOWN);
+    let mut said_pending = false;
     loop {
         let (id, request, keys, phone_id, phone_key) = {
             let mut guard = paired.lock().await;
@@ -165,7 +168,7 @@ pub async fn send_shared<P: PairedMut>(
                     relay::slow_down(relay::backoff(&a).unwrap_or(10)).await;
                     continue;
                 }
-                Some(a) if a.status >= 500 => {
+                Some(a) if a.status >= 500 || a.error() == "too_many_pending" => {
                     let crate::poll::Then::Wait(d) = down.answer(&a, crate::poll::jitter()) else {
                         return Err(relay::error_for(&a));
                     };
@@ -176,6 +179,11 @@ pub async fn send_shared<P: PairedMut>(
                         eprintln!(
                             "sealctl: The relay is down for maintenance; asking again in {} s.",
                             d.as_secs()
+                        );
+                    } else if a.error() == "too_many_pending" && !said_pending {
+                        said_pending = true;
+                        eprintln!(
+                            "sealctl: Too many requests from this machine are waiting for your phone; this one waits for one of them to finish."
                         );
                     }
                     tokio::time::sleep(d).await;

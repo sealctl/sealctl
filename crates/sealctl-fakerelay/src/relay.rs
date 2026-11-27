@@ -140,7 +140,12 @@ pub struct App {
     maintenance: Arc<Mutex<Option<u64>>>,
     /// Calls answered `503 maintenance`: when (Unix ms), and `METHOD path`.
     maintenance_calls: Arc<Mutex<Vec<(u64, String)>>>,
+    /// Waits counted for a machine on top of its own (as if open on other sockets).
+    other_waits: Arc<Mutex<HashMap<String, usize>>>,
 }
+
+/// Open waits per machine (protocol.md, Limits).
+const WAITS_PER_MACHINE: usize = 8;
 
 /// Signed calls with `method` whose path contains `part`.
 struct Watched {
@@ -191,6 +196,7 @@ impl FakeRelay {
             hold_delayed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             maintenance: Arc::default(),
             maintenance_calls: Arc::default(),
+            other_waits: Arc::default(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let a2 = app.clone();
@@ -332,6 +338,16 @@ impl FakeRelay {
             .filter(|(_, c)| c.contains(part))
             .map(|(t, _)| *t)
             .collect()
+    }
+
+    /// Counts `n` more open waits for `machine` than it has, as if other requests from it
+    /// waited on the phone: at 8 its wait upgrades answer `429 too_many_pending`.
+    pub fn other_waits(&self, machine: &str, n: usize) {
+        self.app
+            .other_waits
+            .lock()
+            .unwrap()
+            .insert(machine.to_string(), n);
     }
 
     /// Signed calls from phones so far.
@@ -622,6 +638,16 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             ok(200, json!({"machines": n}))
         }
         (Method::GET, ["wait"]) if !is_phone && ws => {
+            let open = {
+                let g = app.inner.lock().unwrap();
+                g.phones
+                    .get(&phone)
+                    .map_or(0, |p| p.pending.values().filter(|r| r.machine == key).count())
+            };
+            let other = app.other_waits.lock().unwrap().get(&key).copied().unwrap_or(0);
+            if open + other >= WAITS_PER_MACHINE {
+                return err(429, "too_many_pending");
+            }
             let req = Request::from_parts(parts, Body::empty());
             let Ok(up) = WebSocketUpgrade::from_request(req, &()).await else {
                 return err(426, "websocket_required");

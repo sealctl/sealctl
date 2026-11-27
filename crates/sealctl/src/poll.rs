@@ -113,6 +113,10 @@ impl Pauses {
     /// What to do after an answer the caller did not expect.
     pub fn answer(&mut self, a: &Answer, j: f64) -> Then {
         match a.status {
+            // the cap on open waits (no scope): waits until a place is free
+            429 if a.error() == "too_many_pending" => {
+                Then::Wait(self.failed_at_least(a.retry_after().unwrap_or(0), j))
+            }
             429 if a.body["scope"].as_str().unwrap_or("phone") == "phone" => Then::Stop,
             429 => Then::Wait(self.failed_at_least(a.retry_after().unwrap_or(10), j)),
             401 if a.error() == "clock_skew" && !self.skewed => {

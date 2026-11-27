@@ -154,6 +154,10 @@ pub fn error_for(answer: &Answer) -> anyhow::Error {
                 format!("This computer's clock is {minutes} minutes off. Set the time automatically and try again."),
             )
         }
+        429 if code == "too_many_pending" => fail(
+            exit::LIMIT,
+            "Too many requests from this machine are waiting for your phone. Answer one there, or stop a command that waits, then try again.",
+        ),
         429 => {
             let retry = answer.body["retryAfter"].as_u64().unwrap_or(60);
             if answer.body["scope"].as_str().unwrap_or("phone") == "phone" {
@@ -518,9 +522,13 @@ fn test_clock_went_on(ahead: Option<u64>) {
 }
 
 /// Seconds to wait for a `429` of the relay's short-term limits (`scope` `network` or `key`,
-/// at most a minute); `None` for the daily limit or anything else.
+/// at most a minute); `None` for the daily limit, `too_many_pending` (it has no scope, and
+/// the wait for the phone waits it out, [`crate::approve`]) or anything else.
 pub fn backoff(a: &Answer) -> Option<u64> {
-    if a.status != 429 || a.body["scope"].as_str().unwrap_or("phone") == "phone" {
+    if a.status != 429
+        || a.error() == "too_many_pending"
+        || a.body["scope"].as_str().unwrap_or("phone") == "phone"
+    {
         return None;
     }
     let s = a.body["retryAfter"].as_u64().unwrap_or(10);
@@ -583,6 +591,16 @@ mod tests {
             "no scope: the daily limit"
         );
         assert_eq!(backoff(&a(503, json!({}))), None);
+        // the cap on open waits has no scope, and is not the daily limit
+        let pending = a(429, json!({"error": "too_many_pending"}));
+        assert_eq!(backoff(&pending), None);
+        let e = error_for(&pending);
+        assert!(
+            e.to_string()
+                .starts_with("Too many requests from this machine are waiting for your phone."),
+            "{e}"
+        );
+        assert!(!e.to_string().contains("daily limit"), "{e}");
         assert_eq!(
             exit::code_of(&error_for(&a(429, json!({"scope": "phone"})))),
             exit::LIMIT

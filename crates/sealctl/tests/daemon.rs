@@ -1278,3 +1278,31 @@ fn a_lock_status_refused_in_a_maintenance_window_is_sent_after_it() {
     assert!(until(25, locked), "the phone hears the lock");
     assert!(now_ms() - start < 45_000);
 }
+
+/// The relay keeps at most 8 waits open per machine and refuses the next with
+/// `429 too_many_pending`, which has no `scope`. That is not the phone's daily limit: the
+/// request waits, asking again at a growing pace, until a place is free.
+#[test]
+fn a_request_over_the_open_waits_cap_waits_for_a_free_place() {
+    let mut env = Env::fake(Options::default());
+    let m = env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    fake.other_waits(&m.key, 8);
+    fake.watch("GET", "/wait", None);
+    let open = start_open(&env);
+    assert!(
+        until(15, || fake.calls("GET", "/wait") > 0),
+        "{:?}",
+        open.err.lock().unwrap()
+    );
+    let first = fake.calls("GET", "/wait");
+    std::thread::sleep(Duration::from_secs(5));
+    let asked = fake.calls("GET", "/wait") - first;
+    fake.other_waits(&m.key, 0);
+    // 2, 4 s apart (±20%), never at once: at most 2 more in those 5 s
+    assert!(asked <= 2, "{asked} more upgrades in 5 s");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || open.finish(60, "sealctl open"));
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("daily limit"), "{err}");
+    assert_eq!(daemon(&env, json!({"op": "status"}))["state"], "open");
+}
