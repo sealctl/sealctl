@@ -34,7 +34,9 @@ pub enum Seen<T> {
     Done(T),
     /// Not yet: ask again at the poll's pace.
     NotYet,
-    /// Not yet: ask again after this long, without jitter (a known release time).
+    /// Not yet: ask again after this long (a known release time), plus 0 to 20% jitter, so
+    /// the ask never comes before that time and machines waiting for the same time do not
+    /// all ask at once.
     After(Duration),
     /// Not an answer the caller knows: the poll decides (wait, or end with its error).
     Other,
@@ -49,6 +51,11 @@ pub fn jitter() -> f64 {
 
 fn jittered(d: Duration, j: f64) -> Duration {
     d.mul_f64(0.8 + 0.4 * j.clamp(0.0, 1.0))
+}
+
+/// A wait for a known time: never shorter, up to 20% longer.
+fn after(d: Duration, j: f64) -> Duration {
+    d.mul_f64(1.0 + 0.2 * j.clamp(0.0, 1.0))
 }
 
 /// The pauses of one poll.
@@ -151,7 +158,7 @@ where
                 Seen::NotYet => (p.not_yet(jitter()), None),
                 Seen::After(d) => {
                     p.answered();
-                    (d, None)
+                    (after(d, jitter()), None)
                 }
                 Seen::Other => match p.answer(&a, jitter()) {
                     Then::Wait(d) => (d, Some(error_for(&a))),
@@ -240,6 +247,18 @@ mod tests {
         );
         // a short one still backs off
         assert_eq!(p.answer(&maintenance(1), 0.5), Then::Wait(Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn a_known_time_is_never_asked_before_it() {
+        let d = Duration::from_secs(10);
+        for j in [0.0, 0.5, 1.0, -3.0, 7.0] {
+            let w = after(d, j);
+            assert!(w >= d && w <= Duration::from_secs(12), "{w:?}");
+        }
+        let spread: std::collections::BTreeSet<u128> =
+            (0..50).map(|_| after(d, jitter()).as_millis()).collect();
+        assert!(spread.len() > 1, "the waits vary");
     }
 
     #[test]
@@ -381,10 +400,11 @@ mod tests {
         let (r, t) = run(answers, Duration::from_secs(900)).await;
         assert_eq!(r.unwrap(), Some("paid"));
         let gaps: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
-        // 2, 4, 8 s after the failures, 1 s as the answer said, then 2 s again (not 16)
+        // 2, 4, 8 s after the failures, 1 s as the answer said (to 1.2 s), then 2 s again
+        // (not 16)
         for (gap, want) in gaps.iter().zip([2.0, 4.0, 8.0, 1.0, 2.0]) {
             let (lo, hi) = if want == 1.0 {
-                (1.0, 1.0)
+                (1.0, 1.2)
             } else {
                 (want * 0.8, want * 1.2)
             };
