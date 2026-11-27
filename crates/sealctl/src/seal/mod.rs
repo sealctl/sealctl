@@ -272,9 +272,30 @@ pub fn seal_volume_given(
     // change fails or is undone: a sparse bundle's id is random, and the key (from the words or
     // the phone) cannot be found again without it; an APFS volume's hint names the seed, so a
     // stop right after the change leaves a volume that says which words open it.
-    let hint_before = match &apfs_uuid {
-        Some(uuid) => volume::apfs::disk_user_hint(uuid)?,
+    // The user's own APFS hint is kept in the state folder from before the marker replaces it
+    // until the seal is done or undone, so a seal that stopped in between and is run again
+    // still puts it back (a `sealctl` hint is never the user's).
+    let saved_hint = match &apfs_uuid {
+        Some(uuid) => Some(paths::state_dir()?.join("apfs-hints").join(uuid)),
         None => None,
+    };
+    let own_hint = match (&apfs_uuid, &saved_hint) {
+        (Some(uuid), Some(file)) => match volume::apfs::disk_user_hint(uuid)? {
+            Some(h) if !h.starts_with("sealctl ") => Some(h),
+            _ => std::fs::read_to_string(file).ok().filter(|h| !h.is_empty()),
+        },
+        _ => None,
+    };
+    if let Some(file) = &saved_hint {
+        if let Some(d) = file.parent() {
+            paths::ensure_private_dir(d)?;
+        }
+        paths::write_private(file, own_hint.as_deref().unwrap_or_default().as_bytes())?;
+    }
+    let forget_hint = || {
+        if let Some(file) = &saved_hint {
+            let _ = std::fs::remove_file(file);
+        }
     };
     let unmark = || match kind {
         Kind::Sparsebundle => {
@@ -282,12 +303,15 @@ pub fn seal_volume_given(
                 let _ = std::fs::remove_file(p);
             }
         }
-        // the user's own hint back; a leftover sealctl hint is not theirs
+        // the user's own hint back
         Kind::Apfs => {
-            let _ = match hint_before.as_deref().filter(|h| !h.starts_with("sealctl ")) {
+            let back = match own_hint.as_deref() {
                 Some(h) => volume::apfs::set_hint(&vol, h),
                 None => volume::apfs::clear_hint(&vol),
             };
+            if back.is_ok() {
+                forget_hint();
+            }
         }
         Kind::Luks => {}
     };
@@ -372,6 +396,7 @@ pub fn seal_volume_given(
     }
     volume::write_marker(&vol)?;
     vol.save()?;
+    forget_hint();
     eprintln!(
         "Sealed volume {name} ({}) with seed {fp}. Your old passphrase no longer opens it.",
         kind.label()

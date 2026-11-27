@@ -1265,6 +1265,22 @@ fn sealing_an_apfs_volume_resumed_after_a_kill_at_its_passphrase_change_names_it
     assert!(apfs_opens(&uuid, &own));
     assert!(!def.exists());
 
+    // killed between the marker and the change, then a change that fails: the user's hint
+    // is back all the same
+    let (status, screen) = seal_apfs(&env, "work", &uuid, &own, None, Some("marked:seal-volume"));
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "killed at the hook; exit {:?}, screen:\n{screen}",
+        status.code()
+    );
+    assert_eq!(hint(), Some(format!("sealctl {}", env.phone.fingerprint())));
+    assert!(apfs_opens(&uuid, &own), "the passphrase has not changed yet");
+    let (status, screen) = seal_apfs(&env, "work", &uuid, &own, Some(&path), None);
+    assert_eq!(status.code(), Some(1), "{screen}");
+    assert_eq!(hint().as_deref(), Some("my own hint"), "{screen}");
+    assert!(apfs_opens(&uuid, &own));
+
     // killed right after the change: the hint names the seed already
     let (status, screen) = seal_apfs(&env, "work", &uuid, &own, None, Some("changed:seal-volume"));
     assert_eq!(
