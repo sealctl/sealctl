@@ -19,11 +19,13 @@ use sealctl_core::relay_auth::{verify_relay_headers, RelayHeaders};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-/// Something sent to a socket: a text frame, or a text frame then close.
+/// Something sent to a socket: a text frame, a text frame then close, or a close with code
+/// 1012 (the relay restarting, as at the start of its maintenance window).
 #[derive(Debug, Clone)]
 enum Out {
     Text(String),
     Close(String),
+    Restart,
 }
 
 struct Pending {
@@ -133,6 +135,11 @@ pub struct App {
     /// While set, `GET .../delayed/{id}` leaves out a released reply (a relay that has not
     /// released it yet).
     hold_delayed: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, the maintenance window: every call answers `503 maintenance` with this
+    /// `Retry-After` (relay SPEC 3.18).
+    maintenance: Arc<Mutex<Option<u64>>>,
+    /// Calls answered `503 maintenance`: when (Unix ms), and `METHOD path`.
+    maintenance_calls: Arc<Mutex<Vec<(u64, String)>>>,
 }
 
 /// Signed calls with `method` whose path contains `part`.
@@ -182,6 +189,8 @@ impl FakeRelay {
             machine_socket_tries: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             watched: Arc::default(),
             hold_delayed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            maintenance: Arc::default(),
+            maintenance_calls: Arc::default(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let a2 = app.clone();
@@ -287,6 +296,42 @@ impl FakeRelay {
         self.app
             .hold_delayed
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Starts (`Some(retry_after)`) or ends (`None`) a maintenance window, as the relay's
+    /// `MAINTENANCE` secret does (relay SPEC 3.18): every call, health included, answers
+    /// `503 {"error": "maintenance", "retryAfter": N}` with `Retry-After: N`, and the start
+    /// closes every open socket with 1012. Requests waiting on the relay go with their sockets.
+    pub fn maintenance(&self, retry_after: Option<u64>) {
+        *self.app.maintenance.lock().unwrap() = retry_after;
+        if retry_after.is_none() {
+            return;
+        }
+        let mut g = self.app.inner.lock().unwrap();
+        for p in g.phones.values_mut() {
+            for (_, r) in std::mem::take(&mut p.pending) {
+                let _ = r.tx.send(Out::Restart);
+            }
+            for (_, t) in p.machine_sockets.drain() {
+                let _ = t.send(Out::Restart);
+            }
+            for t in p.phone_sockets.drain(..) {
+                let _ = t.send(Out::Restart);
+            }
+        }
+    }
+
+    /// When (Unix ms) the calls whose `METHOD path` contains `part` were answered
+    /// `503 maintenance`, in order.
+    pub fn maintenance_calls(&self, part: &str) -> Vec<u64> {
+        self.app
+            .maintenance_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| c.contains(part))
+            .map(|(t, _)| *t)
+            .collect()
     }
 
     /// Signed calls from phones so far.
@@ -401,6 +446,19 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
             Err(_) => return err(413, "too_large"),
         }
     };
+    let maintenance = *app.maintenance.lock().unwrap();
+    if let Some(secs) = maintenance {
+        app.maintenance_calls
+            .lock()
+            .unwrap()
+            .push((now_ms(), format!("{} {path}", parts.method)));
+        let mut r = ok(503, json!({"error": "maintenance", "retryAfter": secs}));
+        r.headers_mut().insert(
+            "retry-after",
+            axum::http::HeaderValue::from_str(&secs.to_string()).expect("header"),
+        );
+        return r;
+    }
     if parts.method == Method::GET && s == ["v1", "health"] {
         return ok(
             200,
@@ -1068,6 +1126,14 @@ async fn pump(
                 Some(Out::Close(t)) => {
                     let _ = sock.send(Message::Text(t.into())).await;
                     let _ = sock.send(Message::Close(None)).await;
+                    return;
+                }
+                Some(Out::Restart) => {
+                    let frame = axum::extract::ws::CloseFrame {
+                        code: axum::extract::ws::close_code::RESTART,
+                        reason: "".into(),
+                    };
+                    let _ = sock.send(Message::Close(Some(frame))).await;
                     return;
                 }
                 None => return,

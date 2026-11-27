@@ -3,8 +3,8 @@
 //!
 //! Every pause gets ±20% jitter. "Not yet" answers are asked again after `every`, growing by
 //! half each time up to `most`. Failed calls (the relay unreachable after its own retries, a
-//! `5xx`, a short-term `429`) wait `every`, doubling up to 30 s, and at least a `429`'s
-//! `retryAfter`. A final answer ends the poll at once: the daily limit (`429` scope `phone`),
+//! `5xx`, a short-term `429`) wait `every`, doubling up to 30 s, and at least the `retryAfter`
+//! (or `Retry-After`) of a `429` or a `5xx` such as the relay's `503 maintenance`. A final answer ends the poll at once: the daily limit (`429` scope `phone`),
 //! `401` (`clock_skew` is asked once more), `403`, any other `4xx` the caller does not expect.
 
 use std::future::Future;
@@ -107,12 +107,12 @@ impl Pauses {
     pub fn answer(&mut self, a: &Answer, j: f64) -> Then {
         match a.status {
             429 if a.body["scope"].as_str().unwrap_or("phone") == "phone" => Then::Stop,
-            429 => Then::Wait(self.failed_at_least(a.body["retryAfter"].as_u64().unwrap_or(10), j)),
+            429 => Then::Wait(self.failed_at_least(a.retry_after().unwrap_or(10), j)),
             401 if a.error() == "clock_skew" && !self.skewed => {
                 self.skewed = true;
                 Then::Wait(self.failed(j))
             }
-            s if s >= 500 => Then::Wait(self.failed(j)),
+            s if s >= 500 => Then::Wait(self.failed_at_least(a.retry_after().unwrap_or(0), j)),
             _ => Then::Stop,
         }
     }
@@ -209,6 +209,19 @@ mod tests {
             json!({"error": "rate_limited", "scope": "network", "retryAfter": 45}),
         );
         assert_eq!(p.answer(&limited, 0.5), Then::Wait(Duration::from_secs(45)));
+        // the relay's maintenance window: its Retry-After, and never more than an hour
+        let mut p = Pauses::new(PACE);
+        let maintenance = |secs: u64| a(503, json!({"error": "maintenance", "retryAfter": secs}));
+        assert_eq!(
+            p.answer(&maintenance(120), 0.5),
+            Then::Wait(Duration::from_secs(120))
+        );
+        assert_eq!(
+            p.answer(&maintenance(86_400), 0.5),
+            Then::Wait(Duration::from_secs(3600))
+        );
+        // a short one still backs off
+        assert_eq!(p.answer(&maintenance(1), 0.5), Then::Wait(Duration::from_secs(8)));
     }
 
     #[test]
@@ -311,6 +324,28 @@ mod tests {
         for (gap, want) in gaps.iter().zip([2.0, 4.0, 8.0, 16.0]) {
             assert!(*gap >= want * 0.8 - 0.01 && *gap <= want * 1.2 + 0.01, "{gaps:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_maintenance_window_is_waited_out() {
+        let maintenance = || Ok(a(503, json!({"error": "maintenance", "retryAfter": 60})));
+        let answers = vec![
+            Ok(a(404, json!({}))),
+            maintenance(),
+            maintenance(),
+            Ok(a(200, json!({}))),
+        ];
+        let (r, t) = run(answers, Duration::from_secs(900)).await;
+        assert_eq!(r.unwrap(), Some("paid"), "{t:?}");
+        // asked again only after each Retry-After, never at the poll's own 2 s pace
+        let gaps: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps[1] >= 60.0 && gaps[2] >= 60.0, "{gaps:?}");
+        // a window that outlasts the poll ends it with the relay's answer
+        let (r, t) = run(vec![maintenance(); 10], Duration::from_secs(100)).await;
+        let e = r.unwrap_err();
+        assert_eq!(exit::code_of(&e), exit::RELAY);
+        assert!(e.to_string().contains("maintenance"), "{e}");
+        assert_eq!(t.len(), 2, "{t:?}");
     }
 
     #[tokio::test(start_paused = true)]

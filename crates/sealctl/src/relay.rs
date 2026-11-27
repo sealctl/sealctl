@@ -2,9 +2,13 @@
 //!
 //! Every call is signed with the pairing key (protocol.md, Relay API, Signing). TLS through
 //! rustls with the platform verifier. Network errors and `5xx` are retried at 1, 2 and 4 s,
-//! then the command fails with exit 6; a `429` with scope `network` or `key` is waited out
-//! (its `retryAfter`, up to 60 s, at most three times), the daily limit (scope `phone`) is not
-//! retried (exit 7); `401 clock_skew` is exit 12. Only method, path, status and duration are logged, never headers or bodies.
+//! then the command fails with exit 6; a `5xx` with `Retry-After` (the relay's maintenance
+//! window answers `503 maintenance`) is not asked again before that time: the call returns it,
+//! and the loops that wait on the relay (approvals, polls, statuses, the machine socket) wait
+//! it out. A `429` with scope `network` or `key` is waited out (its `retryAfter`, up to 60 s,
+//! at most three times), the daily limit (scope `phone`) is not retried (exit 7);
+//! `401 clock_skew` is exit 12. Only method, path, status and duration are logged, never
+//! headers or bodies.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,6 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use sealctl_core::MachineKeys;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, http::HeaderValue, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -38,8 +43,28 @@ pub struct Relay {
 pub struct Answer {
     /// HTTP status.
     pub status: u16,
-    /// The JSON body (`null` when empty or not JSON).
+    /// The JSON body (`null` when empty or not JSON). A `Retry-After` header in seconds is
+    /// added as `retryAfter` when the body has none.
     pub body: Value,
+}
+
+/// The longest `Retry-After` taken from the relay (an hour, its longest maintenance window).
+pub const RETRY_AFTER_CAP: u64 = 3600;
+
+/// `body` with the seconds of a `Retry-After` header as `retryAfter`, unless it has one.
+fn with_retry_after(mut body: Value, header: Option<&[u8]>) -> Value {
+    let secs = header
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .and_then(|h| h.trim().parse::<u64>().ok());
+    if let Some(secs) = secs {
+        if body.is_null() {
+            body = json!({});
+        }
+        if let Some(o) = body.as_object_mut() {
+            o.entry("retryAfter").or_insert(json!(secs));
+        }
+    }
+    body
 }
 
 impl Answer {
@@ -51,6 +76,24 @@ impl Answer {
     /// 2xx.
     pub fn ok(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Seconds to wait before asking again, for a `429` or a `5xx` that says (`retryAfter`
+    /// or `Retry-After`), at most [`RETRY_AFTER_CAP`].
+    pub fn retry_after(&self) -> Option<u64> {
+        if self.status != 429 && self.status < 500 {
+            return None;
+        }
+        self.body["retryAfter"].as_u64().map(|s| s.min(RETRY_AFTER_CAP))
+    }
+}
+
+/// "in 40 s" or "in 2 min".
+fn in_time(secs: u64) -> String {
+    if secs < 120 {
+        format!("in {secs} s")
+    } else {
+        format!("in {} min", secs.div_ceil(60))
     }
 }
 
@@ -70,6 +113,9 @@ pub enum WaitEnd {
     Expired,
     /// The relay closed the wait with an error code (`unpaired`, `moved`, ...).
     Error(String),
+    /// The relay closed the socket to restart (close code 1012, as at the start of its
+    /// maintenance window): the request is gone from it, and may be asked again.
+    Restarted,
 }
 
 fn unix_now() -> u64 {
@@ -122,10 +168,26 @@ pub fn error_for(answer: &Answer) -> anyhow::Error {
                 )
             }
         }
-        s if s >= 500 => fail(
-            exit::RELAY,
-            format!("The relay failed ({s}). Status: {STATUS_PAGE}"),
-        ),
+        s if s >= 500 => match answer.retry_after() {
+            Some(secs) if code == "maintenance" => fail(
+                exit::RELAY,
+                format!(
+                    "The relay is down for maintenance. Try again {}. Status: {STATUS_PAGE}",
+                    in_time(secs)
+                ),
+            ),
+            Some(secs) => fail(
+                exit::RELAY,
+                format!(
+                    "The relay failed ({s}). Try again {}. Status: {STATUS_PAGE}",
+                    in_time(secs)
+                ),
+            ),
+            None => fail(
+                exit::RELAY,
+                format!("The relay failed ({s}). Status: {STATUS_PAGE}"),
+            ),
+        },
         s => fail(
             exit::RELAY,
             format!("The relay refused the call ({s} {code}). Status: {STATUS_PAGE}"),
@@ -193,14 +255,20 @@ impl Relay {
             s
         })?;
         let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .map(|h| h.as_bytes().to_vec());
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
         log::debug!("{method} {path} {status} {} ms", started.elapsed().as_millis());
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let body = with_retry_after(body, retry_after.as_deref());
         Ok(Answer { status, body })
     }
 
     /// A call with retries (network errors and 5xx at 1, 2, 4 s). Returns any answer the relay
-    /// gave, success or not; fails only when the relay cannot be reached or keeps failing.
+    /// gave, success or not; fails only when the relay cannot be reached or keeps failing. A
+    /// `5xx` with `Retry-After` is returned at once: the relay said when to ask again.
     pub async fn request(
         &self,
         keys: Option<&MachineKeys>,
@@ -220,6 +288,7 @@ impl Relay {
                 tokio::time::sleep(Duration::from_secs([0u64, 1, 2, 4][attempt])).await;
             }
             match self.once(keys, method, path, &bytes).await {
+                Ok(a) if a.status >= 500 && a.retry_after().is_some() => return Ok(a),
                 Ok(a) if a.status >= 500 && attempt < 3 => {
                     last_err = format!("{}", a.status);
                 }
@@ -264,7 +333,12 @@ impl Relay {
             .await
             .map_err(|e| self.unreachable(e))?;
         let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .map(|h| h.as_bytes().to_vec());
         let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let body = with_retry_after(body, retry_after.as_deref());
         if status != 200 {
             return Err(error_for(&Answer { status, body }));
         }
@@ -313,6 +387,8 @@ impl Relay {
                     .as_ref()
                     .and_then(|b| serde_json::from_slice(b).ok())
                     .unwrap_or(Value::Null);
+                let retry_after = resp.headers().get("retry-after").map(|h| h.as_bytes());
+                let body = with_retry_after(body, retry_after);
                 Err(anyhow::Error::new(Refused(Answer { status, body })))
             }
             Err(e) => Err(self.unreachable(e)),
@@ -372,6 +448,9 @@ impl Relay {
                     let m = m.map_err(|e| self.unreachable(e))?;
                     let text = match m {
                         Message::Text(t) => t.to_string(),
+                        Message::Close(Some(f)) if f.code == CloseCode::Restart => {
+                            return Ok(WaitEnd::Restarted);
+                        }
                         Message::Close(_) => return Err(self.unreachable("the relay closed the connection")),
                         _ => continue,
                     };
@@ -508,5 +587,32 @@ mod tests {
             exit::code_of(&error_for(&a(429, json!({"scope": "phone"})))),
             exit::LIMIT
         );
+    }
+
+    #[test]
+    fn a_maintenance_window_says_when_to_come_back() {
+        let a = |status: u16, body: Value| Answer { status, body };
+        // the header counts when the body has no retryAfter; the body's wins
+        let body = with_retry_after(json!({"error": "maintenance"}), Some(b"120"));
+        assert_eq!(body["retryAfter"], 120);
+        assert_eq!(with_retry_after(Value::Null, Some(b" 30 "))["retryAfter"], 30);
+        let body = with_retry_after(json!({"retryAfter": 5}), Some(b"120"));
+        assert_eq!(body["retryAfter"], 5);
+        assert!(with_retry_after(Value::Null, Some(b"Fri, 27 Nov 2026 10:00:00 GMT")).is_null());
+        let m = a(503, json!({"error": "maintenance", "retryAfter": 120}));
+        assert_eq!(m.retry_after(), Some(120));
+        assert_eq!(a(503, json!({"retryAfter": 86_400})).retry_after(), Some(3600));
+        assert_eq!(a(503, json!({})).retry_after(), None);
+        assert_eq!(a(404, json!({"retryAfter": 5})).retry_after(), None);
+        let e = error_for(&m);
+        assert_eq!(exit::code_of(&e), exit::RELAY);
+        assert!(
+            e.to_string()
+                .starts_with("The relay is down for maintenance. Try again in 2 min."),
+            "{e}"
+        );
+        assert!(error_for(&a(502, json!({"retryAfter": 40})))
+            .to_string()
+            .starts_with("The relay failed (502). Try again in 40 s."));
     }
 }

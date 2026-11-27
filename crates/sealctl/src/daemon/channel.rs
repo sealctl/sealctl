@@ -21,7 +21,8 @@ use crate::relay::{self, WaitEnd};
 /// and drops at once (two daemons sharing a machine key evict each other's socket; a relay
 /// restart) therefore cannot make a reconnect every 2 s forever, each of which costs the
 /// phone's daily limit. Waits get ±20% jitter so that daemons do not reconnect in step, and
-/// a `429` is waited out for at least its `retryAfter` (staging incident 2026-11-22).
+/// a `429` is waited out for at least its `retryAfter` (staging incident 2026-11-22), as is a
+/// `5xx` that has one (the relay's maintenance window, `503 maintenance` with `Retry-After`).
 #[derive(Debug, Clone)]
 pub struct Reconnect {
     next: u64,
@@ -111,9 +112,7 @@ pub async fn run(d: Arc<Daemon>) {
                         // Still paired, yet refused: wait like any failure, never at once.
                     }
                 }
-                let retry_after = relay::refused(&e)
-                    .filter(|a| a.status == 429)
-                    .and_then(|a| a.body["retryAfter"].as_u64());
+                let retry_after = relay::refused(&e).and_then(relay::Answer::retry_after);
                 log::info!("machine socket {keys_path}: {e:#}");
                 tokio::time::sleep(wait.after(None, retry_after, jitter())).await;
                 continue;
@@ -248,7 +247,18 @@ pub async fn report_loop(d: &Arc<Daemon>, for_how_long: Duration) -> bool {
                 }
             }
             Ok(_) => {}
-            Err(e) => log::info!("report: {e:#}"),
+            Err(e) => {
+                log::info!("report: {e:#}");
+                // a refusal that says when to come back (`429`, the maintenance window's `503`)
+                if let Some(secs) = relay::refused(&e).and_then(relay::Answer::retry_after) {
+                    let back = tokio::time::Instant::now() + Duration::from_secs(secs);
+                    if !d.st().open {
+                        return true;
+                    }
+                    tokio::time::sleep_until(back.max(started + Duration::from_secs(60))).await;
+                    continue;
+                }
+            }
         }
         if !d.st().open {
             return true;

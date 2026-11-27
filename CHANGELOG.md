@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Changed
 
+- When the relay answers `503` with `Retry-After` (as in a maintenance window), sealctl waits
+  that long before asking again: a request waiting for your phone is sent again until its five
+  minutes are up instead of failing at once, a delayed `unseal` keeps waiting, and the daemon
+  sends its status (a lock included) once the relay is back. A single command says when to try
+  again.
+- The session daemon brings the login service file that an earlier version installed up to
+  date when it starts (the stop timeout that gives it time to lock). On Linux the new settings
+  apply at once; on macOS at the next login or `sealctl pair`.
 - `sealctl pair`, `sealctl buy` and `sealctl unseal` (waiting for a delayed approval) ask the
   relay less often while they wait, with jitter; they back off when the relay fails and stop on
   a final answer such as the phone's daily limit.

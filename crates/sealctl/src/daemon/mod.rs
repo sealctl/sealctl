@@ -28,7 +28,7 @@ use crate::backup::Backup;
 use crate::desktop::{self, Desktop};
 use crate::exit::{self, fail};
 use crate::machine::{self, Paired};
-use crate::relay::Relay;
+use crate::relay::{self, Relay};
 use crate::store::Store;
 use crate::volume::Volume;
 use crate::{paths, util};
@@ -383,6 +383,10 @@ struct State {
     busy_retries: u64,
     status_dirty: bool,
     last_status: u64,
+    /// When the relay said to send statuses again (a `Retry-After` on a failed one, as in its
+    /// maintenance window), Unix ms; 0 when it did not. None goes out before then, and a
+    /// failed one is sent again from then on instead of a minute later.
+    status_retry_at: u64,
     /// The session state the last status told the phone (`open`, `waiting`, `locked`).
     sent_state: String,
     /// Volumes a lock could not close, while the session stays Locked (SPEC 6.5 step 3).
@@ -1886,6 +1890,15 @@ impl Daemon {
     }
 
     async fn send_status(&self) -> Result<()> {
+        let retry_at = self.st().status_retry_at;
+        if self.now() < retry_at {
+            // the relay asked to wait; the tick sends it then
+            self.st().status_dirty = true;
+            return Err(anyhow::anyhow!(
+                "the relay asked to wait {} s more",
+                (retry_at - self.now()).div_ceil(1000)
+            ));
+        }
         let mut paired = self.paired.lock().await;
         paired.file.status_seq += 1;
         let seq = paired.file.status_seq;
@@ -1938,11 +1951,21 @@ impl Daemon {
             paired.phone_id(),
             paired.file.machine
         );
-        self.relay
-            .call(&paired.keys, "PUT", &path, Some(&json!({"sealed": sealed})))
+        let a = self
+            .relay
+            .request(Some(&paired.keys), "PUT", &path, Some(&json!({"sealed": sealed})))
             .await?;
         drop(paired);
+        if !a.ok() {
+            if let Some(secs) = a.retry_after() {
+                // ±10%: daemons waiting out one maintenance window do not all come back at once
+                let ms = (secs.max(1) * 1000) as f64 * (0.9 + 0.2 * crate::poll::jitter());
+                self.st().status_retry_at = self.now() + ms as u64;
+            }
+            return Err(relay::error_for(&a));
+        }
         let mut st = self.st();
+        st.status_retry_at = 0;
         st.last_status = self.now();
         st.told(
             status.state.map(|s| s.session).unwrap_or_default(),
@@ -2144,9 +2167,14 @@ impl Daemon {
                 Some(session::Activity::Resumed) => st.activity_tried.resumed = n,
                 None => {}
             }
+            // A status the relay refused with a Retry-After waits for that time, then goes out
+            // at the next tick, instead of a minute after the failure.
+            let retry_at = st.status_retry_at;
+            let retry_due = retry_at != 0 && n >= retry_at;
             let due = st.open
+                && n >= retry_at
                 && (n.saturating_sub(st.last_status) > 15 * 60 * 1000
-                    || (st.status_dirty && n.saturating_sub(st.last_status) > 60 * 1000)
+                    || (st.status_dirty && (retry_due || n.saturating_sub(st.last_status) > 60 * 1000))
                     || (changed && n.saturating_sub(st.last_status) >= 10 * 1000)
                     || moved
                     || activity.is_some());
@@ -2157,7 +2185,7 @@ impl Daemon {
             let unsent_lock = !st.open
                 && idle_locks
                 && (matches!(st.sent_state.as_str(), "open" | "waiting") || st.busy != st.sent_busy)
-                && n.saturating_sub(st.last_status) > 60 * 1000;
+                && (retry_due || (n >= retry_at && n.saturating_sub(st.last_status) > 60 * 1000));
             due || unsent_lock
         };
         if status_due && !self.inproc {
@@ -2458,6 +2486,11 @@ pub fn run(spawned: bool) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
         crate::ssh::start_agent(d.clone());
+        // A daemon run by its login service brings the service file an earlier version
+        // installed up to date, once it serves requests, without stopping itself (SPEC 6.1).
+        if !spawned {
+            tokio::task::spawn_blocking(crate::service::refresh_daemon);
+        }
         // the service manager stops the daemon with SIGTERM (logout, `launchctl bootout`,
         // `systemctl stop`): that is a daemon exit too, and locks
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

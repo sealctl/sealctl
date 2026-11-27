@@ -131,7 +131,19 @@ fn launchd_plist(s: &Service, path_env: &str, log: &str) -> String {
         .iter()
         .map(|a| format!("    <string>{}</string>\n", xml_escape(a)))
         .collect();
-    let schedule = match s.every_secs {
+    render_plist(
+        s.label,
+        &args,
+        s.every_secs,
+        &xml_escape(path_env),
+        &xml_escape(log),
+    )
+}
+
+/// The plist text, from its parts as written in it (`args`: the `<string>` lines; `path`
+/// and `log` already escaped).
+fn render_plist(label: &str, args: &str, every_secs: Option<u64>, path: &str, log: &str) -> String {
+    let schedule = match every_secs {
         Some(secs) => format!("  <key>StartInterval</key><integer>{secs}</integer>\n"),
         None => format!(
             "  <key>KeepAlive</key><true/>\n  <key>ExitTimeOut</key><integer>{STOP_TIMEOUT_SECS}</integer>\n"
@@ -155,9 +167,6 @@ fn launchd_plist(s: &Service, path_env: &str, log: &str) -> String {
 </dict>
 </plist>
 "#,
-        label = s.label,
-        path = xml_escape(path_env),
-        log = xml_escape(log),
     )
 }
 
@@ -168,9 +177,19 @@ fn systemd_service(s: &Service, path_env: &str) -> String {
         .map(|a| systemd_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
+    render_unit(
+        s.description,
+        s.every_secs,
+        &systemd_quote(&format!("PATH={path_env}")),
+        &exec,
+    )
+}
+
+/// The unit text, from its parts as written in it (`environment` and `exec` already quoted).
+fn render_unit(description: &str, every_secs: Option<u64>, environment: &str, exec: &str) -> String {
     // A long-running daemon gets SIGTERM alone (`KillMode=mixed`): it stops its own restic
     // child with SIGINT. Whatever is left gets SIGKILL after the stop timeout.
-    let (svc_type, extra) = if s.every_secs.is_some() {
+    let (svc_type, extra) = if every_secs.is_some() {
         ("oneshot", String::new())
     } else {
         (
@@ -179,10 +198,126 @@ fn systemd_service(s: &Service, path_env: &str) -> String {
         )
     };
     format!(
-        "[Unit]\nDescription={}\n\n[Service]\nType={svc_type}\nEnvironment={}\nExecStart={exec}\n{extra}\n[Install]\nWantedBy=default.target\n",
-        s.description,
-        systemd_quote(&format!("PATH={path_env}"))
+        "[Unit]\nDescription={description}\n\n[Service]\nType={svc_type}\nEnvironment={environment}\nExecStart={exec}\n{extra}\n[Install]\nWantedBy=default.target\n",
     )
+}
+
+/// The text between `start` and the next `end` in `text`.
+fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let rest = &text[text.find(start)? + start.len()..];
+    Some(&rest[..rest.find(end)?])
+}
+
+/// What this version writes for the daemon's service file `text` (`launchd`: a plist, else a
+/// systemd unit), keeping what came from where it was installed (the program and its
+/// arguments, `PATH`, the log file) as written in it. `None` when `text` is not one sealctl
+/// wrote for the daemon (changed by hand): such a file is left as it is. Only the lines a
+/// version changed may differ (0.7.0: the stop timeout); a version that changes another line
+/// names it here too.
+fn daemon_file_now(text: &str, launchd: bool) -> Option<String> {
+    if launchd {
+        if between(text, "<key>Label</key><string>", "</string>")? != DAEMON_LABEL {
+            return None;
+        }
+        let args = between(text, "<key>ProgramArguments</key>\n  <array>\n", "  </array>\n")?;
+        let path = between(text, "<key>PATH</key><string>", "</string>")?;
+        let log = between(text, "<key>StandardOutPath</key><string>", "</string>")?;
+        let now = render_plist(DAEMON_LABEL, args, None, path, log);
+        // only the lines this version changed may differ
+        same_but(text, &now, &["ExitTimeOut"]).then_some(now)
+    } else {
+        let line = |key: &str| text.lines().find_map(|l| l.strip_prefix(key));
+        let description = line("Description=")?;
+        let environment = line("Environment=")?;
+        let exec = line("ExecStart=")?;
+        let now = render_unit(description, None, environment, exec);
+        same_but(text, &now, &["KillMode=", "TimeoutStopSec="]).then_some(now)
+    }
+}
+
+/// Whether `a` and `b` have the same lines once the lines that contain one of `keys` are
+/// left out of both.
+fn same_but(a: &str, b: &str, keys: &[&str]) -> bool {
+    let rest = |t: &str| -> Vec<String> {
+        t.lines()
+            .filter(|l| !keys.iter().any(|k| l.contains(k)))
+            .map(str::to_string)
+            .collect()
+    };
+    rest(a) == rest(b)
+}
+
+/// Rewrites the daemon's service file at `path` when it differs from what this version
+/// writes ([`daemon_file_now`]). The new text goes to a file beside it that is then renamed
+/// over it, so the service manager never reads half a file. A missing file, a symbolic link
+/// (a unit managed elsewhere, e.g. by Nix) and a file changed by hand are left alone.
+/// Returns whether it was rewritten.
+fn refresh_file(path: &std::path::Path, launchd: bool) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    let text = fs::read_to_string(path)?;
+    if !launchd && text.contains("\nType=oneshot\n") {
+        return Ok(false);
+    }
+    let Some(now) = daemon_file_now(&text, launchd) else {
+        log::info!("{} was changed by hand; left as it is", path.display());
+        return Ok(false);
+    };
+    if now == text {
+        return Ok(false);
+    }
+    let name = path.file_name().context("service file name")?.to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.new"));
+    fs::write(&tmp, &now)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
+    fs::rename(&tmp, path)?;
+    Ok(true)
+}
+
+/// At the start of a daemon run by its login service: brings the service file that an
+/// earlier version installed up to what this version writes (the stop timeout, SPEC 6.1),
+/// without stopping this daemon.
+///
+/// The file is replaced first (written beside it, then renamed over it). Then:
+/// - systemd: `systemctl --user daemon-reload`, which reads the unit again and leaves running
+///   services running; the new stop settings apply to this daemon's next stop. Never `restart`.
+/// - launchd: nothing more. launchd reads the plist only when the job is loaded (the next
+///   login, or the reinstall of `sealctl pair`). Loading it now takes `launchctl bootout`,
+///   which stops the job's running process, this daemon, with the old timeout, and would end
+///   the `bootstrap` that must follow along with it.
+///
+/// Not from a temporary HOME or with `SEALCTL_NO_SERVICE` ([`allowed`]). Errors are logged.
+pub fn refresh_daemon() {
+    if !allowed() {
+        return;
+    }
+    let launchd = cfg!(target_os = "macos");
+    let path = if launchd {
+        plist_path(DAEMON_LABEL)
+    } else {
+        home().map(|h| {
+            h.join(".config/systemd/user")
+                .join(format!("{}.service", unit_name(DAEMON_LABEL)))
+        })
+    };
+    let r = path.and_then(|p| {
+        if !refresh_file(&p, launchd)? {
+            return Ok(());
+        }
+        log::info!("updated {}", p.display());
+        if !launchd {
+            run(crate::util::system_cmd("systemctl").args(["--user", "daemon-reload"]))?;
+        }
+        Ok(())
+    });
+    if let Err(e) = r {
+        log::warn!("service file: {e:#}");
+    }
 }
 
 pub fn uninstall(label: &str) -> Result<()> {
@@ -295,6 +430,90 @@ mod systemd_tests {
         };
         assert!(!launchd_plist(&timer, "/usr/bin", "/tmp/x.log").contains("ExitTimeOut"));
         assert!(systemd_service(&timer, "/usr/bin").contains("Type=oneshot\n"));
+    }
+
+    /// The daemon's plist as versions before 0.7.0 wrote it (no `ExitTimeOut`: launchd's 20 s).
+    const OLD_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.sealctl.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/sealctl</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/a&amp;b:/usr/bin</string></dict>
+  <key>StandardOutPath</key><string>/Users/u/.local/state/sealctl/sealctl.log</string>
+  <key>StandardErrorPath</key><string>/Users/u/.local/state/sealctl/sealctl.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+"#;
+
+    /// The daemon's unit as versions before 0.7.0 wrote it (no `KillMode`, no stop timeout).
+    const OLD_UNIT: &str = "[Unit]\nDescription=sealctl session daemon\n\n[Service]\nType=simple\nEnvironment=\"PATH=/usr/bin:/a b\"\nExecStart=\"/home/u/.local/bin/sealctl\" \"daemon\"\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n";
+
+    #[test]
+    fn a_service_file_from_an_earlier_version_gets_the_stop_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.sealctl.daemon.plist");
+        std::fs::write(&plist, OLD_PLIST).unwrap();
+        assert!(refresh_file(&plist, true).unwrap());
+        let s = Service {
+            args: vec!["/opt/homebrew/bin/sealctl".into(), "daemon".into()],
+            ..daemon()
+        };
+        // what `sealctl pair` writes today, with the program, PATH and log it was installed with
+        assert_eq!(
+            std::fs::read_to_string(&plist).unwrap(),
+            launchd_plist(
+                &s,
+                "/opt/homebrew/bin:/a&b:/usr/bin",
+                "/Users/u/.local/state/sealctl/sealctl.log"
+            )
+        );
+        assert!(!refresh_file(&plist, true).unwrap(), "up to date: left alone");
+
+        let unit = dir.path().join("sealctl.service");
+        std::fs::write(&unit, OLD_UNIT).unwrap();
+        assert!(refresh_file(&unit, false).unwrap());
+        let s = Service {
+            args: vec!["/home/u/.local/bin/sealctl".into(), "daemon".into()],
+            ..daemon()
+        };
+        assert_eq!(
+            std::fs::read_to_string(&unit).unwrap(),
+            systemd_service(&s, "/usr/bin:/a b")
+        );
+        assert!(!refresh_file(&unit, false).unwrap());
+        assert!(!dir.path().join(".sealctl.service.new").exists());
+    }
+
+    #[test]
+    fn a_service_file_changed_by_hand_or_linked_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("sealctl.service");
+        assert!(!refresh_file(&unit, false).unwrap(), "no file");
+        let edited = OLD_UNIT.replace("Restart=on-failure\n", "Restart=always\nNice=5\n");
+        std::fs::write(&unit, &edited).unwrap();
+        assert!(!refresh_file(&unit, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&unit).unwrap(), edited);
+        let plist = dir.path().join("p.plist");
+        let other = OLD_PLIST.replace("com.sealctl.daemon", "com.example.other");
+        std::fs::write(&plist, &other).unwrap();
+        assert!(!refresh_file(&plist, true).unwrap());
+        assert_eq!(std::fs::read_to_string(&plist).unwrap(), other);
+        // a unit managed elsewhere (a link into a read-only store)
+        let target = dir.path().join("managed.service");
+        std::fs::write(&target, OLD_UNIT).unwrap();
+        let link = dir.path().join("linked.service");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!refresh_file(&link, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), OLD_UNIT);
     }
 
     #[test]
