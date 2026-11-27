@@ -79,28 +79,9 @@ fn a_list_in_the_folder_store_format() {
     let bundle = env.h().join("mine.sparsebundle");
     let vpw = canary();
     if cfg!(target_os = "macos") {
-        let mut c = Command::new("/usr/bin/hdiutil")
-            .args([
-                "create",
-                "-quiet",
-                "-size",
-                "32m",
-                "-type",
-                "SPARSEBUNDLE",
-                "-fs",
-                "APFS",
-                "-encryption",
-                "AES-256",
-                "-stdinpass",
-                "-volname",
-                "mine",
-            ])
-            .arg(&bundle)
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        c.stdin.take().unwrap().write_all(vpw.as_bytes()).unwrap();
-        assert!(c.wait().unwrap().success());
+        // the product's create: hdiutil's reason on a failure, and a create refused as
+        // `Resource busy` (other tests' images) tried again
+        sealctl::volume::sparsebundle::create_image(&bundle, "32m", "mine", vpw.as_bytes()).unwrap();
         passwords.push_str(&format!("volume mine: {vpw}\n"));
         objects.push(json!({"kind": "volume", "name": "mine", "volume": "sparsebundle",
             "uuid": "8c8e2a3e-5d27-4b8c-9c51-2f0d1a4b7e10", "path": "~/mine.sparsebundle",

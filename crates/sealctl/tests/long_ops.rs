@@ -526,33 +526,13 @@ fn scan_keeps_history_lines_written_while_the_phone_answers() {
 #[cfg(target_os = "macos")]
 #[test]
 fn two_seals_of_one_bundle_leave_a_marker_that_opens_it() {
-    use std::io::Write;
     let mut env = Env::new();
     env.pair();
     let own = canary();
     let bundle = env.h().join("mine.sparsebundle");
-    let mut c = Command::new("/usr/bin/hdiutil")
-        .args([
-            "create",
-            "-quiet",
-            "-size",
-            "32m",
-            "-type",
-            "SPARSEBUNDLE",
-            "-fs",
-            "APFS",
-            "-encryption",
-            "AES-256",
-            "-stdinpass",
-            "-volname",
-            "mine",
-        ])
-        .arg(&bundle)
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    c.stdin.take().unwrap().write_all(own.as_bytes()).unwrap();
-    assert!(c.wait().unwrap().success());
+    // the product's create: hdiutil's reason on a failure, and a create refused as
+    // `Resource busy` (other tests' images) tried again
+    sealctl::volume::sparsebundle::create_image(&bundle, "32m", "mine", own.as_bytes()).unwrap();
     let release_first = Arc::new(AtomicBool::new(false));
     let r2 = release_first.clone();
     let phone = Scripted::start(env.phone.clone(), move |req| {
@@ -653,7 +633,6 @@ fn a_new_re_encryption_never_replaces_a_running_job() {
 #[cfg(target_os = "macos")]
 #[test]
 fn re_encryption_makes_a_stale_copy_again() {
-    use std::io::Write;
     let mut env = Env::new();
     env.pair();
     let bundle = env.h().join("w.sparsebundle");
@@ -679,28 +658,9 @@ fn re_encryption_makes_a_stale_copy_again() {
     env.run(&["lock"]);
     // the copy an earlier job made under its own new id
     let stale = env.h().join(".w.migrating.sparsebundle");
-    let mut c = Command::new("/usr/bin/hdiutil")
-        .args([
-            "create",
-            "-quiet",
-            "-size",
-            "32m",
-            "-type",
-            "SPARSEBUNDLE",
-            "-fs",
-            "APFS",
-            "-encryption",
-            "AES-256",
-            "-stdinpass",
-            "-volname",
-            "w",
-        ])
-        .arg(&stale)
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    c.stdin.take().unwrap().write_all(canary().as_bytes()).unwrap();
-    assert!(c.wait().unwrap().success());
+    // the product's create: hdiutil's reason on a failure, and a create refused as
+    // `Resource busy` (other tests' images) tried again
+    sealctl::volume::sparsebundle::create_image(&stale, "32m", "w", canary().as_bytes()).unwrap();
     let ((code, _, err), _) =
         env.with_phone(Answer::Session, || env.run(&["migrate", "--yes", "--foreground"]));
     assert_eq!(code, 0, "{err}");
