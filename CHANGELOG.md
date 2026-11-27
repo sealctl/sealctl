@@ -6,67 +6,70 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+## 0.7.2 - 2026-11-27
+
 ### Added
 
-- `sealctl buy` while card payments are not open on the relay: `1  I'd buy it` records that you
-  would buy (nothing is charged) so sealctl can tell you when you can, and `2  Give feedback`
-  asks four short questions and gives a year's licence, once per phone. The answers are sent
-  with the phone's id; no name or email. With payments open, the usual menu adds
-  `4  Give feedback instead` until this phone has given feedback. Wrong answers in the menus
-  are asked again instead of ending the command, and the menus are refused in CI as well as in
-  pipes and AI agents.
-- `sealctl status` shows `Licensed until 2027-11-26 (feedback)` while a feedback licence lasts,
-  and `--json` has `"licence": "feedback"` with `"until"`. When it ends, sealctl counts the
-  phone as unpaid at once instead of waiting for the hour-long licence cache. In its last 30
-  days, one line after a command you typed says when it ends.
-- Protocol: `POST /v1/phones/{phone}/intent` and `POST /v1/phones/{phone}/feedback`, and the
-  licence answer's `kind`, `until`, `feedback`, `intent` and `payments` (docs/protocol.md,
-  planned on the relay). Deleting a phone's relay data deletes its feedback answers and
-  intent; the feedback licence record (granted, and its end) stays, as a paid one does.
-
-- A place your phone newly trusts is announced as such: "Your phone trusted the place Home. It
-  skips the two-hour wait from 12:04. Not you? Run: sealctl cancel" (and "Cancelled from your
-  phone: trusting the place Home"). Protocol: the `notice` kind `place` with the place's name
-  (`notice.place`, docs/protocol.md).
+- `sealctl buy` while card payments are not open yet: `1  I'd buy it` records that you would
+  buy (nothing is charged) so sealctl can tell you when you can, and `2  Give feedback` asks
+  four short questions and gives a year's licence, once per phone. The answers are sent with the
+  phone's id only, no name or email. Once payments are open, the usual menu adds
+  `4  Give feedback instead` until this phone has given feedback.
+- `sealctl status` shows `Licensed until 2027-11-26 (feedback)` while a feedback licence lasts
+  (`--json`: `"licence": "feedback"` with `"until"`). In its last 30 days, one line after a
+  command you typed says when it ends. When it ends, sealctl counts the phone as unpaid at once
+  instead of waiting for the hour-long licence cache.
+- When your phone newly trusts a place, the notice names it: "Your phone trusted the place Home.
+  It skips the two-hour wait from 12:04. Not you? Run: sealctl cancel" (and "Cancelled from your
+  phone: trusting the place Home").
+- Protocol (docs/protocol.md): `POST /v1/phones/{phone}/intent` and
+  `POST /v1/phones/{phone}/feedback`, and the licence answer's `kind`, `until`, `feedback`,
+  `intent` and `payments` (planned on the relay); the `notice` kind `place` with the place's
+  name (`notice.place`). Deleting a phone's relay data deletes its feedback answers and intent;
+  the feedback licence record (granted, and its end) stays, as a paid one does.
 
 ### Changed
 
-- `sealctl status` says `Open · active · locks after 4 h idle · hard stop 21:13` while you work
-  (input or a key use in the last 2 minutes), instead of a time left that went back to the full
-  allowance at every keystroke. Once the machine is idle it counts down to the lock in whole
-  minutes: `Open · locks in 3 h 47 min · hard stop 21:13` (`locks in 47 min`,
-  `locks in under a minute`), to the hard stop when that comes first. `--json` adds `active`,
-  `idleSecs`, `allowanceSecs` and `locksAt`, and keeps `left`.
-- Protocol: a machine status carries `idle` (seconds since the last work moment) and `allow`
-  (the idle allowance) beside `left`, both optional (docs/protocol.md, Machine status). The
-  machine sends a status when it goes idle and when it is active again, at most once every 2
-  minutes for each, so the phone can show "active" instead of a countdown.
-- The session's hard stop is now 02:00 local time or 24 hours after the first `open` granted
-  today, whichever comes first (it was 14 hours). A session first opened in the morning stays
-  Open until 02:00 that night while you keep working; one opened at 03:00 runs until 02:00 the
-  next night. The idle allowance, the nights when the clocks change and a clock set back work
-  as before.
+- `sealctl status` while you work (input or a key use in the last 2 minutes) says
+  `Open · active · locks after 4 h idle · hard stop 02:00`, instead of a time left that went back
+  to the full allowance at every keystroke.
+- Once the machine is idle, `sealctl status` counts down to the lock in whole minutes:
+  `Open · locks in 3 h 47 min · hard stop 02:00` (`locks in 47 min`, `locks in under a minute`),
+  or to the hard stop when that comes first. `--json` adds `active`, `idleSecs`,
+  `allowanceSecs` and `locksAt`, and keeps `left`.
+- The machine tells the phone when it goes idle and when it is active again (at most once every
+  2 minutes for each), so the phone can show "active" instead of a countdown. Protocol: a
+  machine status carries `idle` (seconds since the last work moment) and `allow` (the idle
+  allowance) beside `left`, both optional (docs/protocol.md, Machine status).
+- The session's hard stop is 02:00 local time or 24 hours after the first `open` granted today,
+  whichever comes first (it was 14 hours). A session first opened in the morning stays Open
+  until 02:00 that night while you keep working; one opened at 03:00 runs until 02:00 the next
+  night. The idle allowance, the nights when the clocks change and a clock set back work as
+  before.
+- `sealctl buy` asks again after a wrong answer in its menus instead of ending the command, and
+  its menus are refused in CI as well as in pipes and AI agents.
+- Agent hooks deny code that opens a `.env` or credentials file by a quoted path
+  (`open('.env')`) in `python3 -c`, `node -e` or a here-document body that runs.
 
 ### Fixed
 
-- A phone notice of a kind this CLI does not know is shown as "a sensitive action" instead of
-  by its code, and machine names in notices are cleaned and cut short before
-  `sealctl status` keeps them, as in the notification.
-- Agent hooks no longer deny writing a script with a quoted here-document
-  (`cat > voices.mjs <<'EOF'` … `EOF`, `tee`) because it reads a variable
-  (`process.env.ELEVENLABS_API_KEY`), prints the environment or mentions a `.env` file. A quoted
+- Agent hooks no longer deny writing a file with a quoted here-document
+  (`cat > voices.mjs <<'EOF'` … `EOF`, or `tee`) because the body reads a variable
+  (`process.env.ELEVENLABS_API_KEY`), prints the environment or mentions a `.env` file. Such a
   body is data only when `cat` or `tee` writes it to a file and nothing else on the command line
   uses it. A body fed to any other program (a shell, `node -`, `python3 -`, `awk -f -`,
   `make -f -`, `psql`, an unknown program), piped on, or written to a file that the same line
-  then runs or reads is still checked. Code that opens a `.env` or credentials file by a quoted
-  path in `python3 -c`, `node -e` or a body that runs (`open('.env')`) is now denied. `.env` is
-  matched as a file path, not inside `process.env`. `printenv`, `env` and `export` count as
-  environment dumps when they run as commands, including on a line of their own in a body a
-  shell reads, but not as a line of a commit message.
-- A reference to a secret kept elsewhere (`process.env.ELEVENLABS_API_KEY` or
-  `settings.stripe.secret_key` assigned to a key-like name, `os.getenv("API_KEY")`) is no
-  longer taken for a key-like literal in written files, commands or prompts. Quoted values and
-  dotted tokens still are.
+  then runs or reads is still checked.
+- Agent hooks no longer take a reference to a secret kept elsewhere for a key-like literal in
+  written files, commands or prompts: `process.env.ELEVENLABS_API_KEY` or
+  `settings.stripe.secret_key` assigned to a key-like name, `os.getenv("API_KEY")`. Quoted
+  values and dotted tokens still count.
+- Agent hooks match `.env` as a file path, not inside `process.env`, and count `printenv`, `env`
+  and `export` as environment dumps when they run as commands (also on a line of their own in a
+  body a shell reads), not when they are a line of a commit message.
+- A phone notice of a kind this CLI does not know is shown as "a sensitive action" instead of by
+  its code, and machine names in notices are cleaned and cut short before `sealctl status` keeps
+  them, as in the notification.
 
 ## 0.7.1 - 2026-11-25
 
