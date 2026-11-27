@@ -623,6 +623,12 @@ Each endpoint below lists the roles it accepts.
 
 Every authorised call to a phone counts towards its abuse limit, WebSocket upgrades included: `ABUSE_LIMIT_PER_DAY` calls (5,000 by default) per UTC day, the same for paid and unpaid phones. Over the limit the relay answers `429 rate_limited` with `{"retryAfter": <seconds>}` and a `Retry-After` header that both point at the next UTC midnight. **(planned)** The body also says which limit was hit: `{"error": "rate_limited", "retryAfter": <seconds>, "scope": "phone" | "network" | "key" | "relay"}`; `phone` is the daily limit above, `network` and `key` are short-term limits per network address and per signing key, and `relay` is a short-term limit on the relay as a whole (checkout only), each with its own `retryAfter`. Clients treat any scope other than `phone` as short-term. Calls refused with `403` do not count, so a stranger cannot use up someone else's limit. The counter is kept in memory and can reset if the phone's object is evicted while idle.
 
+The relay may answer any call, `GET /v1/health` and WebSocket upgrades included, `503` with a `Retry-After` header in seconds, for example during a maintenance window: `503 {"error": "maintenance", "retryAfter": <seconds>}`, answered before anything is read, counted or written. At the start of such a window it closes open sockets with code 1012 (restart). Clients do not depend on the error code. They treat the answer as a failed call that says when to come back, never as a final one:
+
+- They ask again no sooner than `Retry-After` (or `retryAfter`; at most an hour is taken), with their usual backoff and jitter, and never at once.
+- A request waiting for the phone is sent again, as a new request, until its own expiry; a delayed reply is asked for until its record expires; a machine's statuses and the phone's machine messages (`lock` included) are sent again once the window is over, not dropped.
+- A socket closed with 1012 is a restart: the client reconnects with its backoff. A request that waited on a wait socket closed that way is gone from the relay and is sent again.
+
 Errors always have the shape `{"error": "<code>", ...}`.
 
 ### Endpoints
@@ -701,7 +707,7 @@ Other messages to the machine, each followed by the socket closing:
 | `{"type": "error", "error": "unpaired"}` | The machine is no longer paired (1008) |
 | `{"type": "error", "error": "one_request_per_socket"}` | A second request on the same socket (1008) |
 
-Before the upgrade, the relay can refuse with `426 websocket_required`, `403 forbidden`, `429 rate_limited`, or `429 too_many_pending` when 32 waits are already open for that phone (**(planned)** or 8 for that machine). **(planned)** A wait that has sent no request 30 seconds after its upgrade (a `ping` is not a request) no longer counts and may be closed, so a machine sends its request right after the upgrade.
+Before the upgrade, the relay can refuse with `426 websocket_required`, `403 forbidden`, `429 rate_limited`, or `429 too_many_pending` when 32 waits are already open for that phone (**(planned)** or 8 for that machine). **(planned)** A wait that has sent no request 30 seconds after its upgrade (a `ping` is not a request) no longer counts and may be closed, so a machine sends its request right after the upgrade. `429 too_many_pending` has no `scope` and is not the daily limit: the machine waits and asks again with its backoff (2 s doubling up to 30 s, with jitter, and at least a `Retry-After` if one is given) until its request's own expiry, then reports that too many of its requests wait for the phone.
 
 **(planned)** On the wait socket and the phone socket, the client sends the text message `ping` every 30 seconds and the relay answers `pong`. A message over 8,192 bytes closes the socket with `{"type": "error", "error": "too_large"}` and close code 1009.
 

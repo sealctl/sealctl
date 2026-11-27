@@ -92,6 +92,14 @@ impl PairedMut for &mut Paired {
 /// seal the request and to follow a move, never while the phone is waited for, so that
 /// statuses and machine messages (a `lock` from the phone) go on during a wait of up to 5
 /// minutes.
+///
+/// A wait socket the relay refuses with a `5xx` (its maintenance window answers
+/// `503 maintenance` with `Retry-After`) or with `429 too_many_pending` (this machine has 8
+/// waits open, or the phone 32), or closes to restart (1012), is asked again with a new
+/// request after a pause: at least the `Retry-After`, else 2 s doubling up to 30 s, with
+/// jitter. The request keeps its own expiry: once the next ask would come after it, the wait
+/// ends with the relay's error (exit 6, or 7 for too many waits), or as unanswered after a
+/// restart.
 pub async fn send_shared<P: PairedMut>(
     relay: &Relay,
     paired: &tokio::sync::Mutex<P>,
@@ -101,6 +109,10 @@ pub async fn send_shared<P: PairedMut>(
 ) -> Result<Asked> {
     let mut moved_once = false;
     let mut slowed = 0;
+    // set while the relay is down: the expiry of the first ask, which later asks keep
+    let mut expires: Option<tokio::time::Instant> = None;
+    let mut down = crate::poll::Pauses::new(RELAY_DOWN);
+    let mut said_pending = false;
     loop {
         let (id, request, keys, phone_id, phone_key) = {
             let mut guard = paired.lock().await;
@@ -117,24 +129,64 @@ pub async fn send_shared<P: PairedMut>(
             )
         };
         waiting(request.number);
-        let deadline = tokio::time::Instant::now() + wait;
+        let now = tokio::time::Instant::now();
+        let deadline = expires.unwrap_or(now + wait);
+        let ttl = deadline.saturating_duration_since(now).as_secs();
         let end = relay
             .wait(
                 &keys,
                 &phone_id,
                 &id,
                 &request.sealed,
-                wait.as_secs().clamp(1, 300),
+                ttl.clamp(1, 300),
                 deadline,
             )
             .await;
+        // the relay is down for now: ask again after a pause, if the request has time left
+        let mut pause = |d: Duration| {
+            let ok = tokio::time::Instant::now() + d < deadline;
+            if ok {
+                expires = Some(deadline);
+            }
+            ok
+        };
         let end = match end {
+            Ok(WaitEnd::Restarted) => {
+                let d = down.failed(crate::poll::jitter());
+                if !pause(d) {
+                    return Err(no_answer());
+                }
+                log::info!("the relay restarted; asking again in {} s", d.as_secs());
+                tokio::time::sleep(d).await;
+                continue;
+            }
             Ok(e) => e,
             Err(e) => match relay::refused(&e).cloned() {
                 Some(a) if a.status == 403 => WaitEnd::Error("forbidden".into()),
                 Some(a) if slowed < 3 && relay::backoff(&a).is_some() => {
                     slowed += 1;
                     relay::slow_down(relay::backoff(&a).unwrap_or(10)).await;
+                    continue;
+                }
+                Some(a) if a.status >= 500 || a.error() == "too_many_pending" => {
+                    let crate::poll::Then::Wait(d) = down.answer(&a, crate::poll::jitter()) else {
+                        return Err(relay::error_for(&a));
+                    };
+                    if !pause(d) {
+                        return Err(relay::error_for(&a));
+                    }
+                    if a.error() == "maintenance" {
+                        eprintln!(
+                            "sealctl: The relay is down for maintenance; asking again in {} s.",
+                            d.as_secs()
+                        );
+                    } else if a.error() == "too_many_pending" && !said_pending {
+                        said_pending = true;
+                        eprintln!(
+                            "sealctl: Too many requests from this machine are waiting for your phone; this one waits for one of them to finish."
+                        );
+                    }
+                    tokio::time::sleep(d).await;
                     continue;
                 }
                 Some(a) => return Err(relay::error_for(&a)),
@@ -154,10 +206,11 @@ pub async fn send_shared<P: PairedMut>(
                 return Ok(Asked::Reply { reply, id, request });
             }
             WaitEnd::Delayed { release_at, .. } => return Ok(Asked::Delayed { request, release_at }),
-            WaitEnd::Expired => return Err(fail(exit::NO_ANSWER, "No answer from your phone in 5 minutes.")),
+            WaitEnd::Expired | WaitEnd::Restarted => return Err(no_answer()),
             WaitEnd::Error(code) if matches!(code.as_str(), "unpaired" | "moved" | "forbidden") => {
                 if !moved_once && look_up(relay, paired.lock().await.get()).await? {
                     moved_once = true;
+                    expires = None;
                     continue;
                 }
                 return Err(exit::unpaired());
@@ -173,6 +226,17 @@ pub async fn send_shared<P: PairedMut>(
             }
         }
     }
+}
+
+/// The pace of asking again while the relay is down: 2 s, doubling up to 30 s, and at least
+/// its `Retry-After`.
+const RELAY_DOWN: crate::poll::Pace = crate::poll::Pace {
+    every: Duration::from_secs(2),
+    most: Duration::from_secs(30),
+};
+
+fn no_answer() -> anyhow::Error {
+    fail(exit::NO_ANSWER, "No answer from your phone in 5 minutes.")
 }
 
 /// After `403` or a wait closed with `unpaired`/`moved`: `GET /v1/machines/{M}`. A valid move

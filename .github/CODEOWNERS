@@ -1,5 +1,6 @@
-# Paths that need the maintainer's review (SPEC.md section 21): the protocol and crypto core,
-# the vectors, the code that handles keys, values and agents, and the supply chain.
+# Paths that get the closest reading (SPEC.md section 21): the protocol and crypto core, the
+# vectors, the code that handles keys, values and agents, and the supply chain. GitHub asks the
+# maintainer to review them; the ruleset on main does not require that review (SPEC 21 says why).
 crates/sealctl-core/**                @oleksiyp
 docs/protocol.md                      @oleksiyp
 docs/vectors/**                       @oleksiyp

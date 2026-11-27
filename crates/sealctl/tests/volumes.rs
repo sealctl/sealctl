@@ -283,6 +283,45 @@ fn attached(bundle: &std::path::Path) -> bool {
     })
 }
 
+/// The last `/dev` entry (the file system) of the image at `bundle` in `hdiutil info`.
+///
+/// Other tests run at the same time with images of the same name in their own HOMEs, so the
+/// block is found by its image-path, never by a name in it. While an image attaches or
+/// detaches beside it, `hdiutil info` can fail or list an image without its devices, so it is
+/// read again every 100 ms for up to 10 s.
+#[cfg(target_os = "macos")]
+fn image_device(bundle: &std::path::Path) -> String {
+    let real = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
+    let mut last = String::new();
+    for _ in 0..100 {
+        let info = Command::new("hdiutil").arg("info").output().unwrap();
+        last = String::from_utf8_lossy(&info.stdout).into_owned();
+        let dev = last
+            .split("================================================")
+            .find(|b| {
+                b.lines().any(|l| {
+                    l.strip_prefix("image-path")
+                        .and_then(|r| r.split_once(':'))
+                        .is_some_and(|(_, p)| {
+                            let p = std::path::Path::new(p.trim());
+                            p == bundle || p == real
+                        })
+                })
+            })
+            .and_then(|b| b.lines().rfind(|l| l.starts_with("/dev/")))
+            .and_then(|l| l.split('\t').next())
+            .map(|d| d.trim().to_string());
+        if let Some(dev) = dev {
+            return dev;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "hdiutil info does not list {} with its devices:\n{last}",
+        bundle.display()
+    );
+}
+
 /// What a failed check needs: a command's output, the daemon's log, and the `hdiutil info`
 /// blocks of this HOME's images (not the machine's other images).
 fn report(env: &Env, what: &str, (code, out, err): &(i32, String, String)) -> String {
@@ -631,19 +670,7 @@ fn volume_open_of_a_bundle_mounted_elsewhere_says_so() {
     let (mnt, marker) = bundle_with_a_file(&env);
     unmount(&mnt);
     // the image's file system device: the last /dev entry of its `hdiutil info` block
-    let info = Command::new("hdiutil").arg("info").output().unwrap();
-    let info = String::from_utf8_lossy(&info.stdout);
-    let block = info
-        .split("================================================")
-        .find(|b| b.contains("u.sparsebundle"))
-        .expect("the bundle is attached");
-    let dev = block
-        .lines()
-        .rfind(|l| l.starts_with("/dev/"))
-        .and_then(|l| l.split('\t').next())
-        .unwrap()
-        .trim()
-        .to_string();
+    let dev = image_device(&env.h().join("u.sparsebundle"));
     let other = env.h().join("elsewhere");
     std::fs::create_dir_all(&other).unwrap();
     let out = Command::new("diskutil")

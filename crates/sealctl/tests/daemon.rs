@@ -1214,3 +1214,101 @@ fn a_git_signature_from_an_agent_shows_a_desktop_notification() {
         "notifications: {shown}"
     );
 }
+
+// The three tests below hold a relay condition (a maintenance window, the open-waits cap) for
+// a few seconds of real time: the daemon is a separate process on the real clock, and its
+// pauses are what is measured. The counts are upper bounds, so a slow machine cannot fail
+// them; that the daemon did ask again is shown by the command succeeding (exit 0) and, for the
+// status, by the phone hearing Locked well before the minute a failed status used to wait.
+
+/// The relay's maintenance window (relay SPEC 3.18) closes the request's socket with 1012, then
+/// answers every call `503 maintenance` with `Retry-After`. A request waiting on the phone is
+/// asked again after the window, within its own five minutes, instead of failing (exit 6), and
+/// the wait socket is not asked for sooner than the relay said.
+#[test]
+fn an_approval_waits_out_the_relays_maintenance_window() {
+    let mut env = Env::fake(Options::default());
+    env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    let open = start_open(&env);
+    open.waits();
+    assert!(until(10, || !env.block(env.phone.requests()).unwrap().is_empty()));
+    fake.maintenance(Some(2));
+    // the request went with its socket; asking again meets the window
+    assert!(
+        until(15, || !fake.maintenance_calls("/wait").is_empty()),
+        "asked again: {:?}",
+        open.err.lock().unwrap()
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    let asked = fake.maintenance_calls("/wait");
+    fake.maintenance(None);
+    // 2 s after the restart, then at least 2 s (Retry-After), doubling: never every second
+    assert!(asked.len() <= 3, "{asked:?}");
+    assert!(
+        asked.windows(2).all(|w| w[1] - w[0] >= 1_600),
+        "asked again before Retry-After: {asked:?}"
+    );
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || open.finish(60, "sealctl open"));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(daemon(&env, json!({"op": "status"}))["state"], "open");
+}
+
+/// A status the relay refuses in its maintenance window (`503` with `Retry-After`) is not asked
+/// again at once, and goes out once the relay said to come back, not a minute later: here the
+/// Locked status of a lock made during the window.
+#[test]
+fn a_lock_status_refused_in_a_maintenance_window_is_sent_after_it() {
+    let mut env = Env::fake(Options::default());
+    let m = env.pair();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || env.run(&["open"]));
+    assert_eq!(code, 0, "{err}");
+    channel_up(&env, &m);
+    let fake = env.fake.as_ref().unwrap();
+    fake.maintenance(Some(2));
+    let start = now_ms();
+    let (code, _, err) = env.run(&["lock"]);
+    assert_eq!(code, 0, "{err}");
+    // longer than the 1, 2 and 4 s a single call's own retries take
+    std::thread::sleep(Duration::from_secs(9));
+    let asked = fake.maintenance_calls("/status");
+    fake.maintenance(None);
+    assert!(!asked.is_empty(), "the lock tried to tell the phone");
+    // the lock's own try, and at most one tick's after Retry-After
+    assert!(asked.len() <= 2, "{asked:?}");
+    let locked = || {
+        matches!(env.block(env.phone.status_of(&m)), Ok(Some(s))
+            if s.state.as_ref().is_some_and(|st| st.session == "locked"))
+    };
+    // the next 15 s tick after the window sends it; a minute's wait would not be over yet
+    assert!(until(25, locked), "the phone hears the lock");
+    assert!(now_ms() - start < 45_000);
+}
+
+/// The relay keeps at most 8 waits open per machine and refuses the next with
+/// `429 too_many_pending`, which has no `scope`. That is not the phone's daily limit: the
+/// request waits, asking again at a growing pace, until a place is free.
+#[test]
+fn a_request_over_the_open_waits_cap_waits_for_a_free_place() {
+    let mut env = Env::fake(Options::default());
+    let m = env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    fake.other_waits(&m.key, 8);
+    fake.watch("GET", "/wait", None);
+    let open = start_open(&env);
+    assert!(
+        until(15, || fake.calls("GET", "/wait") > 0),
+        "{:?}",
+        open.err.lock().unwrap()
+    );
+    let first = fake.calls("GET", "/wait");
+    std::thread::sleep(Duration::from_secs(5));
+    let asked = fake.calls("GET", "/wait") - first;
+    fake.other_waits(&m.key, 0);
+    // 2, 4 s apart (±20%), never at once: at most 2 more in those 5 s
+    assert!(asked <= 2, "{asked} more upgrades in 5 s");
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || open.finish(60, "sealctl open"));
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("daily limit"), "{err}");
+    assert_eq!(daemon(&env, json!({"op": "status"}))["state"], "open");
+}

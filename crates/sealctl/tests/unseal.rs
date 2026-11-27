@@ -197,6 +197,41 @@ fn a_delayed_reply_is_asked_for_at_a_growing_pace() {
         .contains(&value));
 }
 
+/// A delayed approval that waits through the relay's maintenance window (relay SPEC 3.18:
+/// `503 maintenance` with `Retry-After`) asks for its reply no sooner than the relay said, and
+/// runs once the window is over, instead of ending at the first `503`.
+#[test]
+fn a_delayed_reply_waits_out_the_relays_maintenance_window() {
+    let (env, value) = setup();
+    let Some(fake) = env.fake.as_ref() else {
+        return;
+    };
+    let mut c = env.cmd();
+    c.args(["unseal", "secrets"]);
+    let pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, Some(3));
+    pty.line("y");
+    pty.expect("Starts in", Duration::from_secs(60));
+    fake.maintenance(Some(5));
+    // the release comes during the window
+    std::thread::sleep(Duration::from_secs(14));
+    let asked = fake.maintenance_calls("/delayed/");
+    fake.maintenance(None);
+    assert!(!asked.is_empty(), "asked during the window");
+    // never sooner than Retry-After (5 s, less 10% for the timers), and not every 1, 2, 4 s
+    assert!(
+        asked.windows(2).all(|w| w[1] - w[0] >= 4_500),
+        "asked again before Retry-After: {asked:?}"
+    );
+    let (code, _, screen) = pty.wait(Duration::from_secs(60));
+    assert_eq!(code, 0, "{screen}");
+    let run = unseal_run_dir(&env);
+    assert!(std::fs::read_to_string(run.join("secrets.env"))
+        .unwrap()
+        .contains(&value));
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
