@@ -25,7 +25,7 @@ Output uses these words and no others for the same things: **Locked**, **Open**,
 ## 2. Workspace layout
 
 ```text
-Cargo.toml                    workspace, version 0.7.1, edition 2021, rust-version 1.89
+Cargo.toml                    workspace, version 0.7.2, edition 2021, rust-version 1.89
 rust-toolchain.toml           pinned stable toolchain (reproducible builds)
 crates/
   sealctl-core/               protocol and crypto; no I/O except the clock and the RNG; feature `uniffi`
@@ -123,7 +123,7 @@ Proc-macro annotations only (no UDL), so the app can build `sealctl-core` togeth
 | `seal_machine_message(keys, machine_key, machine_box_key, message)` | Sealed message | `MachineMessage { version, time, seq, kind }`, `kind` one of `Lock`, `Answers`, `Ack`, `Notice` |
 | `open_machine_status(keys, machine_key, sealed)` | `MachineStatus` | |
 | `backup_item_encode(words, fingerprint, created)`, `backup_item_decode(bytes)` | 45 bytes; fields | |
-| `core_version()`, `protocol_version()` | `"0.7.1"`, `"1"` | |
+| `core_version()`, `protocol_version()` | `"0.7.2"`, `"1"` | |
 
 The CLI uses the same functions from Rust (machine side: `seal_request`, which also returns the number match when the body has `match`; `open_reply`; `plan_text` and `verify_plan_signature`; `seal_status`, `open_message`, `.id` and `.sealed` handling), which are not exported to the apps.
 

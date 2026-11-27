@@ -12,7 +12,7 @@ keywords = ["secrets", "encryption", "ssh", "restic", "cli"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
-sealctl-core = { path = "../sealctl-core", version = "0.7.1" }
+sealctl-core = { path = "../sealctl-core", version = "0.7.2" }
 anyhow.workspace = true
 log.workspace = true
 clap.workspace = true

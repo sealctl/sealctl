@@ -536,6 +536,6 @@ fn a_status_carries_idle_and_allowance_when_the_machine_sends_them() {
 
 #[test]
 fn versions() {
-    assert_eq!(crate::core_version(), "0.7.1");
+    assert_eq!(crate::core_version(), "0.7.2");
     assert_eq!(crate::protocol_version(), "1");
 }
