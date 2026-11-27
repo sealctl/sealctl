@@ -528,6 +528,17 @@ fn by_name(paired: &Paired, key: &str) -> String {
     }
 }
 
+/// How often `unseal` asks for a delayed reply once its time came: after 2 s, growing to 30 s.
+/// Before then it asks every minute and at `releaseAt`.
+const RELEASED_PACE: crate::poll::Pace = crate::poll::Pace {
+    every: Duration::from_secs(2),
+    most: Duration::from_secs(30),
+};
+
+/// How long the relay keeps a machine's delayed reply after `releaseAt` (protocol.md, Delayed
+/// approvals).
+const DELAYED_KEPT_MS: u64 = 900_000;
+
 /// Waits out a delayed approval, showing the time left; returns the released sealed reply.
 fn wait_delayed(
     rt: &tokio::runtime::Runtime,
@@ -543,63 +554,73 @@ fn wait_delayed(
     );
     eprintln!("Your phone and every paired machine can cancel it until then.");
     let tty = term::stderr_tty();
-    let started = machine::now_ms();
     let mut last_line = 0u64;
-    loop {
-        let now = machine::now_ms();
-        let left = release_at.saturating_sub(now);
-        let mins = left.div_ceil(60_000);
+    let mut show = |now: u64| {
+        let mins = release_at.saturating_sub(now).div_ceil(60_000);
         if tty {
             eprint!(
                 "\r\x1b[2KStarts in {mins} min. Ctrl-C stops waiting; running it again needs a new approval."
             );
-        } else if now.saturating_sub(last_line) >= 10 * 60_000 || last_line == 0 {
+        } else if last_line == 0 || now.saturating_sub(last_line) >= 10 * 60_000 {
             eprintln!("Starts in {mins} min. Ctrl-C stops waiting; running it again needs a new approval.");
-            last_line = now.max(1);
-        }
-        if last_line == 0 || now == started {
-            let cmd = if all {
-                "sealctl unseal --all --words"
-            } else {
-                "sealctl unseal <object> --words"
-            };
-            if !tty {
+            if last_line == 0 {
+                let cmd = if all {
+                    "sealctl unseal --all --words"
+                } else {
+                    "sealctl unseal <object> --words"
+                };
                 eprintln!("Or use your card now: {cmd}");
             }
+            last_line = now.max(1);
         }
-        // read the record every 60 s, and at releaseAt
-        let wait = if left == 0 { 2_000 } else { left.min(60_000) };
-        std::thread::sleep(Duration::from_millis(wait.max(500)));
-        let rec = rt.block_on(approve::delayed_get(relay, paired, id))?;
-        let Some(rec) = rec else {
-            if tty {
-                eprintln!();
+    };
+    show(machine::now_ms());
+    let path = format!("/v1/phones/{}/delayed/{id}", paired.phone_id());
+    let kept = (release_at + DELAYED_KEPT_MS).saturating_sub(machine::now_ms());
+    let got = rt.block_on(crate::poll::until(
+        RELEASED_PACE,
+        tokio::time::Instant::now() + Duration::from_millis(kept),
+        || relay.request(Some(&paired.keys), "GET", &path, None),
+        |a| {
+            if a.status == 404 {
+                return Err(gone());
             }
-            return Err(fail(
-                exit::DECLINED,
-                "The approval is gone from the relay. Nothing was changed.",
-            ));
-        };
-        if rec.state == "cancelled" || rec.by.is_some() {
-            if tty {
-                eprintln!();
+            if !a.ok() {
+                return Ok(crate::poll::Seen::Other);
             }
-            let by = rec.by.as_deref().unwrap_or("phone");
-            return Err(fail(
-                exit::DECLINED,
-                format!("Cancelled from {}.", by_name(paired, by)),
-            ));
-        }
-        if let Some(s) = rec.sealed {
-            if tty {
-                eprintln!();
+            let rec = approve::Delayed::from_json(&a.body);
+            if rec.state == "cancelled" || rec.by.is_some() {
+                let by = rec.by.as_deref().unwrap_or("phone");
+                return Err(fail(
+                    exit::DECLINED,
+                    format!("Cancelled from {}.", by_name(paired, by)),
+                ));
             }
-            return Ok(s);
-        }
-        if last_line == 0 {
-            last_line = 1;
-        }
+            if let Some(s) = rec.sealed {
+                return Ok(crate::poll::Seen::Done(s));
+            }
+            let now = machine::now_ms();
+            show(now);
+            let left = release_at.saturating_sub(now);
+            Ok(if left > 0 {
+                // read the record every 60 s, and at releaseAt
+                crate::poll::Seen::After(Duration::from_millis(left.clamp(500, 60_000)))
+            } else {
+                crate::poll::Seen::NotYet
+            })
+        },
+    ));
+    if tty {
+        eprintln!();
     }
+    got?.ok_or_else(gone)
+}
+
+fn gone() -> anyhow::Error {
+    fail(
+        exit::DECLINED,
+        "The approval is gone from the relay. Nothing was changed.",
+    )
 }
 
 /// Waits until `nb` by this machine's wall clock (`now`, Unix ms). The wait is slept in steps

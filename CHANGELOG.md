@@ -8,6 +8,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Changed
 
+- `sealctl pair`, `sealctl buy` and `sealctl unseal` (waiting for a delayed approval) ask the
+  relay less often while they wait, with jitter; they back off when the relay fails and stop on
+  a final answer such as the phone's daily limit.
+- Ctrl-C of `ssh` or `ssh-keygen` while its signature waits for the phone withdraws the request
+  there, as Ctrl-C of a sealctl command does.
 - `sealctl seal volume` of an APFS volume writes its `sealctl <seed>` passphrase hint before it
   changes the passphrase, and puts your own hint back if the change fails or is undone. Sealing
   a volume that a seal which did not finish has changed already names that seed and

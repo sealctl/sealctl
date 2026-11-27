@@ -140,3 +140,43 @@ fn pairing_at_a_terminal_shows_the_qr_code() {
         "{screen}"
     );
 }
+
+/// While `pair` waits for the phone it asks the relay less and less often, with jitter: after
+/// 2 s, growing to 5 s. A final answer (here `403`) ends the wait at once.
+#[test]
+fn pair_waits_for_the_phone_at_a_growing_pace() {
+    let env = Env::fake(sealctl_fakerelay::Options::default());
+    let fake = env.fake.as_ref().unwrap();
+    fake.watch("GET", "/v1/machines/", None);
+    let mut child = env
+        .cmd()
+        .args(["pair", "--name", "tester@box.test"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(15));
+    let calls = fake.calls("GET", "/v1/machines/");
+    // after 2, 3, 4.5 and 5 s (±20%): at most 5 calls in 15 s; every 2 s would be 8
+    assert!((2..=5).contains(&calls), "{calls} calls in 15 s");
+    // a final answer ends the wait at once
+    fake.watch(
+        "GET",
+        "/v1/machines/",
+        Some((403, serde_json::json!({"error": "forbidden"}))),
+    );
+    let mut code = None;
+    for _ in 0..100 {
+        if let Some(s) = child.try_wait().unwrap() {
+            code = s.code();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if code.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert_eq!(code, Some(6), "pair ends on a final answer");
+}

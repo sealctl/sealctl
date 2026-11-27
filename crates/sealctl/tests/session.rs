@@ -196,6 +196,48 @@ fn buy_seats_and_claim_a_code() {
     assert_eq!(c, 2, "--seats is 2 to 1,000: {err}");
 }
 
+/// While `buy` waits for the payment, a final answer from the relay (the phone's daily limit)
+/// ends the wait at once with that error, instead of asking again for 15 minutes.
+#[test]
+fn buy_stops_waiting_on_a_final_answer() {
+    let mut env = Env::fake(Options::default());
+    env.pair();
+    let fake = env.fake.as_ref().unwrap();
+    let limited = serde_json::json!({"error": "rate_limited", "retryAfter": 3600, "scope": "phone"});
+    fake.watch("GET", "/licence", Some((429, limited)));
+    let mut child = env
+        .cmd()
+        .args(["buy", "--seats", "3"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut done = false;
+    for _ in 0..300 {
+        if child.try_wait().unwrap().is_some() {
+            done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !done {
+        let _ = child.kill();
+    }
+    let o = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(done, "buy still waits after 30 s: {err}");
+    assert_eq!(o.status.code(), Some(7), "{err}");
+    assert!(err.contains("daily limit"), "{err}");
+    assert!(
+        err.contains("sealctl status shows the payment when it arrives."),
+        "{err}"
+    );
+    // the seat codes before the checkout, then one look while waiting
+    let calls = fake.calls("GET", "/licence");
+    assert!(calls <= 2, "{calls}");
+}
+
 /// `26 Nov 2027` from the date part of `2027-11-26T...`.
 fn long_date(rfc3339: &str) -> String {
     const MONTHS: [&str; 12] = [

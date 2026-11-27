@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::Daemon;
 use crate::approve;
+use crate::poll::jitter;
 use crate::relay::{self, WaitEnd};
 
 /// How long the machine socket waits before the next upgrade.
@@ -49,12 +50,6 @@ impl Reconnect {
         self.next = (self.next * 2).min(Self::MAX);
         Duration::from_secs_f64(base as f64 * (0.8 + 0.4 * jitter.clamp(0.0, 1.0)))
     }
-}
-
-fn jitter() -> f64 {
-    let mut b = [0u8; 2];
-    let _ = getrandom::fill(&mut b);
-    f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX)
 }
 
 /// The relay answers every `ping` (sent each 30 s) with `pong`. A socket that has carried

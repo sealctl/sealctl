@@ -17,6 +17,13 @@ use crate::{licence, paths, service, term};
 /// How long a pairing code lives.
 pub const PAIRING_SECS: u64 = 600;
 
+/// How often `pair` asks the relay whether the phone registered this machine: after 2 s,
+/// growing to 5 s (SPEC 7, polling).
+pub const PAIR_PACE: crate::poll::Pace = crate::poll::Pace {
+    every: Duration::from_secs(2),
+    most: Duration::from_secs(5),
+};
+
 /// Options of `sealctl pair`.
 pub struct PairOpts {
     /// `--name`.
@@ -134,39 +141,36 @@ pub fn pair(opts: PairOpts) -> Result<()> {
     }
 
     let rt = crate::relay::runtime()?;
-    let (phone, phone_box) = rt.block_on(async {
-        let path = format!("/v1/machines/{}", keys.id());
-        loop {
-            if machine::now_ms() / 1000 >= expires {
-                return Err(fail(
-                    exit::NO_ANSWER,
-                    "The pairing code expired. Run: sealctl pair",
-                ));
-            }
-            let a = relay.request(Some(&keys), "GET", &path, None).await?;
-            match a.status {
+    let path = format!("/v1/machines/{}", keys.id());
+    let left = (expires * 1000).saturating_sub(machine::now_ms());
+    let wrong = || {
+        fail(
+            exit::ERROR,
+            "This pairing did not come from your phone. Run sealctl pair again.",
+        )
+    };
+    let got = rt.block_on(crate::poll::until(
+        PAIR_PACE,
+        tokio::time::Instant::now() + Duration::from_millis(left),
+        || relay.request(Some(&keys), "GET", &path, None),
+        |a| {
+            Ok(match a.status {
                 200 => {
                     let phone = a.body["phone"].as_str().unwrap_or("").to_string();
                     let proof = a.body["proof"].as_str().unwrap_or("");
-                    let p = machine::decode_key32(&phone).ok_or_else(|| {
-                        fail(
-                            exit::ERROR,
-                            "This pairing did not come from your phone. Run sealctl pair again.",
-                        )
-                    })?;
-                    let x = verify_pairing_proof(&code, keys.public(), &p, proof).map_err(|_| {
-                        fail(
-                            exit::ERROR,
-                            "This pairing did not come from your phone. Run sealctl pair again.",
-                        )
-                    })?;
-                    return Ok((phone, machine::b64u(&x)));
+                    let p = machine::decode_key32(&phone).ok_or_else(wrong)?;
+                    let x = verify_pairing_proof(&code, keys.public(), &p, proof).map_err(|_| wrong())?;
+                    crate::poll::Seen::Done((phone, machine::b64u(&x)))
                 }
-                404 => tokio::time::sleep(Duration::from_secs(2)).await,
-                _ => return Err(crate::relay::error_for(&a)),
-            }
-        }
-    })?;
+                404 if machine::now_ms() / 1000 >= expires => return Err(expired()),
+                404 => crate::poll::Seen::NotYet,
+                _ => crate::poll::Seen::Other,
+            })
+        },
+    ))?;
+    let Some((phone, phone_box)) = got else {
+        return Err(expired());
+    };
 
     // A daemon of the old pairing holds old keys: stop it before switching.
     crate::daemon::client::stop_running();
@@ -187,6 +191,10 @@ pub fn pair(opts: PairOpts) -> Result<()> {
         eprintln!("Free to use. If it earns its place, $5.99 once keeps the relay running: sealctl buy");
     }
     Ok(())
+}
+
+fn expired() -> anyhow::Error {
+    fail(exit::NO_ANSWER, "The pairing code expired. Run: sealctl pair")
 }
 
 /// Installs the daemon's login service where allowed; otherwise the CLI starts the daemon.
