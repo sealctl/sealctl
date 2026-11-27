@@ -621,7 +621,7 @@ On every path under `/v1/phones/{phone}`, the signer is either:
 
 Each endpoint below lists the roles it accepts.
 
-Every authorised call to a phone counts towards its abuse limit, WebSocket upgrades included: `ABUSE_LIMIT_PER_DAY` calls (5,000 by default) per UTC day, the same for paid and unpaid phones. Over the limit the relay answers `429 rate_limited` with `{"retryAfter": <seconds>}` and a `Retry-After` header that both point at the next UTC midnight. **(planned)** The body also says which limit was hit: `{"error": "rate_limited", "retryAfter": <seconds>, "scope": "phone" | "network" | "key"}`; `phone` is the daily limit above, `network` and `key` are short-term limits per network address and per signing key, with their own `retryAfter`. Calls refused with `403` do not count, so a stranger cannot use up someone else's limit. The counter is kept in memory and can reset if the phone's object is evicted while idle.
+Every authorised call to a phone counts towards its abuse limit, WebSocket upgrades included: `ABUSE_LIMIT_PER_DAY` calls (5,000 by default) per UTC day, the same for paid and unpaid phones. Over the limit the relay answers `429 rate_limited` with `{"retryAfter": <seconds>}` and a `Retry-After` header that both point at the next UTC midnight. **(planned)** The body also says which limit was hit: `{"error": "rate_limited", "retryAfter": <seconds>, "scope": "phone" | "network" | "key" | "relay"}`; `phone` is the daily limit above, `network` and `key` are short-term limits per network address and per signing key, and `relay` is a short-term limit on the relay as a whole (checkout only), each with its own `retryAfter`. Clients treat any scope other than `phone` as short-term. Calls refused with `403` do not count, so a stranger cannot use up someone else's limit. The counter is kept in memory and can reset if the phone's object is evicted while idle.
 
 The relay may answer any call, `GET /v1/health` and WebSocket upgrades included, `503` with a `Retry-After` header in seconds, for example during a maintenance window: `503 {"error": "maintenance", "retryAfter": <seconds>}`, answered before anything is read, counted or written. At the start of such a window it closes open sockets with code 1012 (restart). Clients do not depend on the error code. They treat the answer as a failed call that says when to come back, never as a final one:
 
@@ -702,12 +702,12 @@ Other messages to the machine, each followed by the socket closing:
 | `{"type": "expired", "id"}` | The request passed its `expires` time |
 | `{"type": "delayed", "id", "releaseAt"}` **(planned)** | The phone approved with a delay; the machine fetches the reply from `GET .../delayed/{id}` after `releaseAt` (closes normally) |
 | `{"type": "error", "error": "bad_json"}` | The message was not JSON (close code 1007) |
-| `{"type": "error", "error": "bad_request"}` | Wrong type, id or sealed (1008) |
+| `{"type": "error", "error": "bad_request"}` | Wrong type, id or sealed (1008); **(planned)** also when no request came within 30 seconds of the upgrade |
 | `{"type": "error", "error": "duplicate_id"}` | Another pending request has this id (1008) |
 | `{"type": "error", "error": "unpaired"}` | The machine is no longer paired (1008) |
 | `{"type": "error", "error": "one_request_per_socket"}` | A second request on the same socket (1008) |
 
-Before the upgrade, the relay can refuse with `426 websocket_required`, `403 forbidden`, `429 rate_limited`, or `429 too_many_pending` when 32 waits are already open for that phone.
+Before the upgrade, the relay can refuse with `426 websocket_required`, `403 forbidden`, `429 rate_limited`, or `429 too_many_pending` when 32 waits are already open for that phone (**(planned)** or 8 for that machine). **(planned)** A wait that has sent no request 30 seconds after its upgrade (a `ping` is not a request) no longer counts and may be closed, so a machine sends its request right after the upgrade.
 
 **(planned)** On the wait socket and the phone socket, the client sends the text message `ping` every 30 seconds and the relay answers `pong`. A message over 8,192 bytes closes the socket with `{"type": "error", "error": "too_large"}` and close code 1009.
 
@@ -770,7 +770,7 @@ The relay only says whether to ask. When and where to print the request to pay (
 { "items": [{ "price_id": "<PADDLE_PRICE_ID>", "quantity": <seats> }], "custom_data": { "phone": "<phone>", "seats": <seats> } }
 ```
 
-- Errors: `400 bad_seats`; `409 already_paid` for one seat on a paid phone; `503 payments_not_configured` without the Paddle settings; `502 payments_unavailable` when Paddle fails.
+- Errors: `400 bad_seats`; `409 already_paid` for one seat on a paid phone; `503 payments_not_configured` without the Paddle settings; `502 payments_unavailable` when Paddle fails; **(planned)** `429 rate_limited` when too many checkouts came from the caller's network (`scope: "network"`) or to the relay as a whole (`scope: "relay"`) in the last minute, with `retryAfter` 60.
 - More seats can be bought on a paid phone, for a team.
 
 **Paddle webhook.** `POST /v1/paddle/webhook` checks `Paddle-Signature: ts=<unix>;h1=<hex>`. `h1` is HMAC-SHA256 with the webhook secret over `<ts>:<raw body>`; any one of several `h1` values may match. `ts` must be within 5 seconds, as in Paddle's SDKs.
@@ -890,9 +890,12 @@ The phone runs these steps in order, while it still holds the old root:
 | Sealed request or reply | 4,096 base64url characters |
 | Request lifetime | 1 to 300 seconds, default 300 |
 | Open waits per phone | 32 |
+| Open waits per machine **(planned)** | 8 of the phone's 32 |
+| Wait without a request **(planned)** | closed 30 seconds after the upgrade |
 | Machines per phone | 100 |
 | State blob | 1 MiB |
 | Seats per checkout | 1,000 |
+| Checkouts **(planned)** | 5 a minute per network, 30 a minute for the whole relay |
 | Feedback `text`, intent `note` **(planned)** | 280 code points after trimming; no control characters |
 | Feedback licence **(planned)** | 365 days from the first feedback; once per phone key |
 | Paddle webhook clock tolerance | 5 seconds |
