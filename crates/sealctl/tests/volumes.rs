@@ -673,28 +673,9 @@ fn seal_an_existing_sparse_bundle_and_restic_repository() {
     env.pair();
     let own = canary();
     let bundle = env.h().join("mine.sparsebundle");
-    let mut c = Command::new("/usr/bin/hdiutil")
-        .args([
-            "create",
-            "-quiet",
-            "-size",
-            "32m",
-            "-type",
-            "SPARSEBUNDLE",
-            "-fs",
-            "APFS",
-            "-encryption",
-            "AES-256",
-            "-stdinpass",
-            "-volname",
-            "mine",
-        ])
-        .arg(&bundle)
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    c.stdin.take().unwrap().write_all(own.as_bytes()).unwrap();
-    assert!(c.wait().unwrap().success());
+    // the product's create: hdiutil's reason on a failure, and a create refused as
+    // `Resource busy` (other tests' images) tried again
+    sealctl::volume::sparsebundle::create_image(&bundle, "32m", "mine", own.as_bytes()).unwrap();
 
     let mut c = env.cmd();
     c.args([
@@ -951,28 +932,9 @@ fn sealing_a_bundle_resumed_after_a_kill_at_its_marker_uses_its_id() {
     env.pair();
     let own = canary();
     let bundle = env.h().join("left.sparsebundle");
-    let mut c = Command::new("/usr/bin/hdiutil")
-        .args([
-            "create",
-            "-quiet",
-            "-size",
-            "32m",
-            "-type",
-            "SPARSEBUNDLE",
-            "-fs",
-            "APFS",
-            "-encryption",
-            "AES-256",
-            "-stdinpass",
-            "-volname",
-            "left",
-        ])
-        .arg(&bundle)
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    c.stdin.take().unwrap().write_all(own.as_bytes()).unwrap();
-    assert!(c.wait().unwrap().success());
+    // the product's create: hdiutil's reason on a failure, and a create refused as
+    // `Resource busy` (other tests' images) tried again
+    sealctl::volume::sparsebundle::create_image(&bundle, "32m", "left", own.as_bytes()).unwrap();
 
     let mut c = env.cmd();
     c.env("SEALCTL_TEST_KILL", "marked:seal-volume").args([
