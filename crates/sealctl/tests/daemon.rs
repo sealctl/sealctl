@@ -1215,6 +1215,12 @@ fn a_git_signature_from_an_agent_shows_a_desktop_notification() {
     );
 }
 
+// The three tests below hold a relay condition (a maintenance window, the open-waits cap) for
+// a few seconds of real time: the daemon is a separate process on the real clock, and its
+// pauses are what is measured. The counts are upper bounds, so a slow machine cannot fail
+// them; that the daemon did ask again is shown by the command succeeding (exit 0) and, for the
+// status, by the phone hearing Locked well before the minute a failed status used to wait.
+
 /// The relay's maintenance window (relay SPEC 3.18) closes the request's socket with 1012, then
 /// answers every call `503 maintenance` with `Retry-After`. A request waiting on the phone is
 /// asked again after the window, within its own five minutes, instead of failing (exit 6), and

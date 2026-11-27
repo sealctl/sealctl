@@ -302,6 +302,17 @@ impl UsageLog {
 }
 
 impl State {
+    /// When statuses may go out again at `n` (Unix ms; 0: now). The relay's `Retry-After` is
+    /// at most an hour (plus 10% jitter here), so a time further ahead than that means the
+    /// clock was set back since the refusal: it is dropped, and statuses go out again.
+    fn status_retry_at(&mut self, n: u64) -> u64 {
+        let most = (crate::relay::RETRY_AFTER_CAP + crate::relay::RETRY_AFTER_CAP / 10) * 1000;
+        if self.status_retry_at > n.saturating_add(most) {
+            self.status_retry_at = 0;
+        }
+        self.status_retry_at
+    }
+
     /// The state of a daemon starting at `n` with `saved` from `session.json`.
     fn restored(saved: Saved, n: u64) -> State {
         State {
@@ -1890,13 +1901,14 @@ impl Daemon {
     }
 
     async fn send_status(&self) -> Result<()> {
-        let retry_at = self.st().status_retry_at;
-        if self.now() < retry_at {
+        let n = self.now();
+        let retry_at = self.st().status_retry_at(n);
+        if n < retry_at {
             // the relay asked to wait; the tick sends it then
             self.st().status_dirty = true;
             return Err(anyhow::anyhow!(
                 "the relay asked to wait {} s more",
-                (retry_at - self.now()).div_ceil(1000)
+                (retry_at - n).div_ceil(1000)
             ));
         }
         let mut paired = self.paired.lock().await;
@@ -2169,7 +2181,7 @@ impl Daemon {
             }
             // A status the relay refused with a Retry-After waits for that time, then goes out
             // at the next tick, instead of a minute after the failure.
-            let retry_at = st.status_retry_at;
+            let retry_at = st.status_retry_at(n);
             let retry_due = retry_at != 0 && n >= retry_at;
             let due = st.open
                 && n >= retry_at
@@ -2535,6 +2547,24 @@ pub fn run(spawned: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused status waits for the relay's Retry-After, but a clock set back after the
+    /// refusal never holds statuses for longer than the longest Retry-After.
+    #[test]
+    fn a_status_retry_time_beyond_the_longest_retry_after_is_dropped() {
+        let n = 1_795_000_000_000;
+        let mut st = State::default();
+        assert_eq!(st.status_retry_at(n), 0);
+        st.status_retry_at = n + 120_000;
+        assert_eq!(st.status_retry_at(n), n + 120_000);
+        // an hour and 10% ahead is still a Retry-After
+        st.status_retry_at = n + 3_960_000;
+        assert_eq!(st.status_retry_at(n), n + 3_960_000);
+        // the clock went back two hours after a 2-minute Retry-After
+        st.status_retry_at = n + 7_200_000 + 120_000;
+        assert_eq!(st.status_retry_at(n), 0);
+        assert_eq!(st.status_retry_at, 0);
+    }
 
     fn notice(
         what: &str,
