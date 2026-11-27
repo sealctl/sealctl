@@ -166,6 +166,17 @@ pub fn set_hint(v: &Volume, hint: &str) -> Result<()> {
     Ok(())
 }
 
+/// Removes the passphrase hint of the disk user.
+pub fn clear_hint(v: &Volume) -> Result<()> {
+    check(
+        crate::util::system_cmd("diskutil")
+            .args(["apfs", "setPassphraseHint", &v.id, "-user", "disk", "-clear"])
+            .output()?,
+        "diskutil apfs setPassphraseHint -clear",
+    )?;
+    Ok(())
+}
+
 /// Does `passphrase` open the volume (a UUID or disk identifier)? (`diskutil apfs unlockVolume
 /// -verify`.) `-verify` needs the cryptographic user named by UUID on recent macOS: the disk
 /// user's is the volume UUID.
@@ -296,16 +307,41 @@ pub fn find(target: &str) -> Result<Option<(String, Option<String>)>> {
     Ok(Some((uuid.to_lowercase(), mp)))
 }
 
-/// The words fingerprint in the passphrase hint `sealctl <fp>`, readable while locked
-/// (`diskutil apfs listUsers`).
-pub fn hint_words(uuid: &str) -> Result<Option<String>> {
+/// `diskutil apfs listUsers` of a volume; `None` when diskutil refuses.
+fn list_users(uuid: &str) -> Result<Option<String>> {
     let out = crate::util::system_cmd("diskutil")
         .args(["apfs", "listUsers", uuid])
         .output()?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    Ok(hint_in(&String::from_utf8_lossy(&out.stdout)))
+    Ok(out
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// The words fingerprint in the passphrase hint `sealctl <fp>`, readable while locked
+/// (`diskutil apfs listUsers`).
+pub fn hint_words(uuid: &str) -> Result<Option<String>> {
+    Ok(list_users(uuid)?.as_deref().and_then(hint_in))
+}
+
+/// The disk user's passphrase hint as it is, whoever set it (`diskutil apfs listUsers`).
+pub fn disk_user_hint(uuid: &str) -> Result<Option<String>> {
+    Ok(list_users(uuid)?.as_deref().and_then(disk_user_hint_in))
+}
+
+/// The `Hint:` of the `Type: Disk User` entry in `diskutil apfs listUsers` output.
+fn disk_user_hint_in(text: &str) -> Option<String> {
+    // one entry per user, each starting with `+-- <uuid>`
+    text.split("+--").find_map(|user| {
+        let mut lines = user.lines().map(str::trim);
+        if !lines.clone().any(|l| l == "Type: Disk User") {
+            return None;
+        }
+        lines
+            .find_map(|l| l.strip_prefix("Hint:"))
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+    })
 }
 
 /// `Hint: sealctl <fp>` in `diskutil apfs listUsers` output.
@@ -344,6 +380,20 @@ mod tests {
         assert_eq!(super::hint_in(out).as_deref(), Some("AbCd"));
         assert_eq!(super::hint_in("    Hint: my own words\n"), None);
         assert_eq!(super::hint_in("    Type: Disk User\n"), None);
+    }
+
+    #[test]
+    fn the_disk_user_hint_is_read_as_it_is() {
+        let out = "Cryptographic users for disk7s2 (2 found)\n|\n\
+            +-- 11C167BE-32EB-4BD7-936B-A4ACA1BF5A67\n    Type: Personal Recovery User\n    Hint: not this one\n|\n\
+            +-- 00C167BE-32EB-4BD7-936B-A4ACA1BF5A67\n    Type: Disk User\n    Hint: my own words\n \n";
+        assert_eq!(super::disk_user_hint_in(out).as_deref(), Some("my own words"));
+        let none = "+-- 00C167BE-32EB-4BD7-936B-A4ACA1BF5A67\n    Type: Disk User\n \n";
+        assert_eq!(super::disk_user_hint_in(none), None);
+        assert_eq!(
+            super::disk_user_hint_in("+-- X\n    Type: Disk User\n    Hint:   \n"),
+            None
+        );
     }
 
     fn vol(name: &str, uuid: &str, dev: &str) -> super::Listed {

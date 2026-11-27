@@ -125,6 +125,7 @@ docs/*.md                                   none
 LICENSE                                     none
 # packaging: packages.yml builds and install-tests these on every pull request
 scripts/package.sh                          none
+scripts/build-release.sh                    none
 scripts/render-formula.sh                   none
 scripts/render-pkgbuild.sh                  none
 scripts/notices.sh                          none

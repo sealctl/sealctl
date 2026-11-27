@@ -44,8 +44,6 @@ qrcode = { version = "0.15", default-features = false }
 jiff = "0.2"
 command-fds = "0.3"
 nix = { version = "0.31", default-features = false, features = ["fs", "user", "resource", "socket", "term", "process", "signal"] }
-# `unseal --to keychain`: macOS Keychain, or the Secret Service over zbus (no libdbus)
-keyring = { version = "3", features = ["apple-native", "async-secret-service", "tokio", "crypto-rust"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # proc_pidinfo, proc_pidpath and KERN_PROCARGS2: who started a credential helper
@@ -55,9 +53,10 @@ security-framework = "3"
 core-foundation = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# desktop notifications over D-Bus (org.freedesktop.Notifications); the same zbus 4 that keyring
-# already brings for the Secret Service, so no new crate
-zbus = { version = "4", default-features = false, features = ["tokio"] }
+# desktop notifications over D-Bus (org.freedesktop.Notifications), and the Secret Service for
+# `unseal --to keychain` (pure Rust over zbus, no libdbus)
+zbus = { version = "6", default-features = false, features = ["tokio"] }
+secret-service = { version = "6", default-features = false, features = ["rt-tokio", "crypto-rust"] }
 
 [features]
 # Tests only: the keychain service name can be overridden (SEALCTL_TEST_KEYCHAIN_SERVICE), a run
