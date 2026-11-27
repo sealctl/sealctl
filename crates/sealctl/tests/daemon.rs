@@ -658,6 +658,51 @@ fn ctrl_c_of_the_asker_withdraws_its_request() {
     assert_eq!(daemon(&env, json!({"op": "status"}))["state"], "open");
 }
 
+/// Ctrl-C of `ssh` (or `ssh-keygen`) while its signature waits for the phone: the SSH agent
+/// sees the connection close and withdraws the request, as for a command's Ctrl-C.
+#[test]
+fn ctrl_c_of_an_ssh_client_withdraws_its_signature() {
+    if !common::have("ssh-keygen") {
+        return;
+    }
+    let mut env = Env::fake(Options::default());
+    env.pair();
+    let ((code, _, err), _) = env.with_phone(Answer::Session, || {
+        env.run(&["ssh", "keygen", "ed25519", "--comment", "t@test"])
+    });
+    assert_eq!(code, 0, "{err}");
+    env.run(&["lock"]);
+    let data = env.h().join("data.txt");
+    std::fs::write(&data, "hello").unwrap();
+    let mut signer = std::process::Command::new("ssh-keygen")
+        .env("SSH_AUTH_SOCK", env.h().join("s/sealctl/ssh-agent.sock"))
+        .args(["-Y", "sign", "-n", "git", "-f"])
+        .arg(env.h().join(".ssh/sealctl_ed25519.pub"))
+        .arg(&data)
+        .current_dir(env.h())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut seen = Vec::new();
+    let r = next_request(&env, &mut seen);
+    signer.kill().unwrap();
+    signer.wait().unwrap();
+    assert!(
+        until(5, || !listed(&env, &r.id)),
+        "the signature of an ssh client that stopped is withdrawn"
+    );
+    let st = daemon(&env, json!({"op": "status"}));
+    assert_eq!(st["state"], "locked", "{st}");
+    // a late answer to it opens nothing
+    let _ = env.block(env.phone.auto(&r, &Answer::Session));
+    std::thread::sleep(Duration::from_millis(300));
+    let st = daemon(&env, json!({"op": "status"}));
+    assert_eq!(st["state"], "locked", "{st}");
+    assert!(!env.h().join("data.txt.sig").exists());
+}
+
 /// Waits until the phone holds a status from the machine (its channel is up).
 fn channel_up(env: &Env, m: &sealctl_fakerelay::Machine) {
     assert!(until(10, || matches!(

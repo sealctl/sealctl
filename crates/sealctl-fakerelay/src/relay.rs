@@ -127,6 +127,20 @@ pub struct App {
     stall_machine_sockets: Arc<std::sync::atomic::AtomicBool>,
     /// Machine socket upgrades asked for so far.
     machine_socket_tries: Arc<std::sync::atomic::AtomicU64>,
+    /// Signed calls counted by method and part of the path, some answered in place of the
+    /// route (to test how clients poll).
+    watched: Arc<Mutex<Vec<Watched>>>,
+    /// While set, `GET .../delayed/{id}` leaves out a released reply (a relay that has not
+    /// released it yet).
+    hold_delayed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Signed calls with `method` whose path contains `part`.
+struct Watched {
+    method: String,
+    part: String,
+    calls: u64,
+    answer: Option<(u16, Value)>,
 }
 
 fn now_ms() -> u64 {
@@ -166,6 +180,8 @@ impl FakeRelay {
             phone_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stall_machine_sockets: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             machine_socket_tries: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            watched: Arc::default(),
+            hold_delayed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let a2 = app.clone();
@@ -241,6 +257,36 @@ impl FakeRelay {
         self.app
             .machine_socket_tries
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Counts signed calls with `method` whose path contains `part` (from now on), and with
+    /// `answer` set gives them that status and body instead of the route's answer.
+    pub fn watch(&self, method: &str, part: &str, answer: Option<(u16, Value)>) {
+        let mut w = self.app.watched.lock().unwrap();
+        match w.iter_mut().find(|w| w.method == method && w.part == part) {
+            Some(r) => r.answer = answer,
+            None => w.push(Watched {
+                method: method.into(),
+                part: part.into(),
+                calls: 0,
+                answer,
+            }),
+        }
+    }
+
+    /// Signed calls counted by [`FakeRelay::watch`] for `method` and `part`.
+    pub fn calls(&self, method: &str, part: &str) -> u64 {
+        let w = self.app.watched.lock().unwrap();
+        w.iter()
+            .find(|w| w.method == method && w.part == part)
+            .map_or(0, |w| w.calls)
+    }
+
+    /// While `on`, `GET .../delayed/{id}` leaves out a released reply.
+    pub fn hold_delayed_replies(&self, on: bool) {
+        self.app
+            .hold_delayed
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Signed calls from phones so far.
@@ -391,6 +437,20 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
         }
     };
     let m = parts.method.clone();
+    {
+        let mut w = app.watched.lock().unwrap();
+        let mut answer = None;
+        for r in w
+            .iter_mut()
+            .filter(|r| r.method == m.as_str() && path.contains(&r.part))
+        {
+            r.calls += 1;
+            answer = answer.or_else(|| r.answer.clone());
+        }
+        if let Some((status, v)) = answer {
+            return ok(status, v);
+        }
+    }
 
     // GET /v1/machines/{m}
     if m == Method::GET && s.len() == 3 && s[0] == "v1" && s[1] == "machines" {
@@ -857,7 +917,12 @@ async fn handle(State(app): State<App>, req: Request) -> Response {
                 return err(404, "gone");
             };
             let mut v = delayed_json(id, &d, n);
-            if d.machine.as_deref() == Some(key.as_str()) && n >= d.release_at && d.cancelled.is_none() {
+            let held = app.hold_delayed.load(std::sync::atomic::Ordering::SeqCst);
+            if d.machine.as_deref() == Some(key.as_str())
+                && n >= d.release_at
+                && d.cancelled.is_none()
+                && !held
+            {
                 if let Some(s) = &d.sealed {
                     v["sealed"] = json!(s);
                     p.delayed.remove(*id);

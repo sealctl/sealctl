@@ -154,8 +154,18 @@ tokio::task_local! {
     static GONE: tokio::sync::watch::Receiver<bool>;
 }
 
-/// Resolves once the client of the request being handled has gone; never outside a socket
-/// request (the SSH agent, `SEALCTL_NO_DAEMON`, unit tests).
+/// Runs `work` for a client whose connection `gone` watches (an SSH agent connection): once
+/// it says the client has gone, a wait for the phone in `work` ends and its request is
+/// withdrawn, as for a daemon socket request.
+pub async fn for_client<F: std::future::Future>(
+    gone: tokio::sync::watch::Receiver<bool>,
+    work: F,
+) -> F::Output {
+    GONE.scope(gone, work).await
+}
+
+/// Resolves once the client of the request being handled has gone; never outside a client's
+/// request (`SEALCTL_NO_DAEMON`, unit tests).
 async fn caller_gone() {
     match GONE.try_with(Clone::clone) {
         Ok(mut g) => {

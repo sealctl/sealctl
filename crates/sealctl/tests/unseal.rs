@@ -157,6 +157,53 @@ fn delayed_approval_runs_after_the_delay() {
     assert!(run.join("kept/store").is_dir());
 }
 
+/// Once a delayed approval's time came, `unseal` asks for the reply less and less often, with
+/// jitter (after 2 s, growing to 30 s), until the relay has released it.
+#[test]
+fn a_delayed_reply_is_asked_for_at_a_growing_pace() {
+    let (env, value) = setup();
+    let Some(fake) = env.fake.as_ref() else {
+        return;
+    };
+    fake.hold_delayed_replies(true);
+    fake.watch("GET", "/delayed/", None);
+    let mut c = env.cmd();
+    c.args(["unseal", "secrets"]);
+    let pty = Pty::spawn(c);
+    pty.expect("Start?", Duration::from_secs(30));
+    let _phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, Some(3));
+    pty.line("y");
+    pty.expect("Starts in", Duration::from_secs(60));
+    let release_at = env.block(env.phone.delayed()).unwrap()[0]["releaseAt"]
+        .as_u64()
+        .unwrap();
+    let calls_at = |ms: u64| {
+        let now = now_ms();
+        if ms > now {
+            std::thread::sleep(Duration::from_millis(ms - now));
+        }
+        fake.calls("GET", "/delayed/")
+    };
+    let from = calls_at(release_at + 500);
+    let to = calls_at(release_at + 15_500);
+    // after 2, 3, 4.5 and 6.75 s (±20%): at most 4 calls; every 2 s would be 7
+    assert!(to - from <= 5, "{} calls in 15 s after the release", to - from);
+    fake.hold_delayed_replies(false);
+    let (code, _, screen) = pty.wait(Duration::from_secs(60));
+    assert_eq!(code, 0, "{screen}");
+    let run = unseal_run_dir(&env);
+    assert!(std::fs::read_to_string(run.join("secrets.env"))
+        .unwrap()
+        .contains(&value));
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 #[test]
 fn cancel_from_another_machine() {
     let (env, _) = setup();

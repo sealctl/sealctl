@@ -271,6 +271,12 @@ fn payments_closed(a: &relay::Answer) -> bool {
     matches!(a.error(), "payments_not_configured" | "payments_unavailable")
 }
 
+/// How often `buy` asks for the licence while the payment is made: after 5 s, growing to 15 s.
+const PAYMENT_PACE: crate::poll::Pace = crate::poll::Pace {
+    every: Duration::from_secs(5),
+    most: Duration::from_secs(15),
+};
+
 /// What `buy` talks to.
 struct Ctx {
     rt: tokio::runtime::Runtime,
@@ -607,18 +613,36 @@ fn checkout(ctx: &Ctx, choice: usize, n: u32) -> Result<std::result::Result<(), 
     println!("{url}");
     let _ = std::io::stdout().flush();
     eprintln!("Waiting for the payment. Ctrl-C stops waiting; sealctl status shows it later.");
-    let paid = ctx.rt.block_on(async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if let Ok(v) = fetch(&ctx.relay, &ctx.paired).await {
-                if (n == 1 && v["licence"] == "paid") || (n > 1 && new_code(&v, &before).is_some()) {
-                    return Some(v);
-                }
-            }
+    let path = format!("{}/licence", ctx.base);
+    let paid = ctx.rt.block_on(crate::poll::until(
+        PAYMENT_PACE,
+        tokio::time::Instant::now() + Duration::from_secs(15 * 60),
+        || ctx.relay.request(Some(&ctx.paired.keys), "GET", &path, None),
+        |a| {
+            Ok(if !a.ok() {
+                crate::poll::Seen::Other
+            } else if (n == 1 && a.body["licence"] == "paid")
+                || (n > 1 && new_code(&a.body, &before).is_some())
+            {
+                crate::poll::Seen::Done(a.body.clone())
+            } else {
+                crate::poll::Seen::NotYet
+            })
+        },
+    ));
+    let paid = match paid {
+        Ok(p) => p,
+        // the relay stopped answering, or refused: the payment may still come
+        Err(e) => {
+            return Err(fail(
+                exit::code_of(&e),
+                format!(
+                    "{} sealctl status shows the payment when it arrives.",
+                    exit::message_of(&e)
+                ),
+            ))
         }
-        None
-    });
+    };
     match paid {
         Some(v) => {
             save_answer(v.clone());

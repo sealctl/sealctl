@@ -253,7 +253,7 @@ mac    = HMAC(c, "sealctl/v1/pair" ‖ 0x00 ‖ P ‖ X ‖ M)
 proof  = b64u(X ‖ mac)                                   # 64 bytes, 86 characters
 ```
 
-The machine polls `GET /v1/machines/{M}` every 2 seconds for up to 10 minutes. On `200 {"phone", "proof"}` it:
+The machine polls `GET /v1/machines/{M}` for up to 10 minutes, after 2 seconds and then less often (up to every 5 seconds, with jitter). On `200 {"phone", "proof"}` it:
 
 1. decodes `proof` and refuses any length other than 64 bytes;
 2. computes `mac` with its own `c` and the returned `phone` as `P`, and compares in constant time;

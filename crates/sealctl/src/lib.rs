@@ -23,6 +23,7 @@ pub mod machine;
 pub mod migrate;
 pub mod pair;
 pub mod paths;
+pub mod poll;
 pub mod project;
 pub mod recover;
 pub mod relay;

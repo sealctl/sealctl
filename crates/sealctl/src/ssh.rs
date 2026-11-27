@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ssh_agent_lib::agent::{listen, Session};
+use ssh_agent_lib::agent::{listen, ListeningSocket, Session};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
 use ssh_key::private::KeypairData;
@@ -134,6 +134,8 @@ struct Agent {
     daemon: Arc<Daemon>,
     /// The process at the other end of the agent socket (`ssh`, `ssh-keygen`), when known.
     peer: Option<i32>,
+    /// Becomes `true` when that process closed the connection.
+    gone: tokio::sync::watch::Receiver<bool>,
 }
 
 /// One [`Agent`] per connection, knowing the process that connected.
@@ -141,12 +143,104 @@ struct Agents {
     daemon: Arc<Daemon>,
 }
 
-impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for Agents {
-    fn new_session(&mut self, socket: &tokio::net::UnixStream) -> impl Session {
+impl ssh_agent_lib::agent::Agent<Listener> for Agents {
+    fn new_session(&mut self, socket: &Conn) -> impl Session {
         Agent {
             daemon: self.daemon.clone(),
-            peer: socket.peer_cred().ok().and_then(|c| c.pid()),
+            peer: socket.peer,
+            gone: socket.gone.clone(),
         }
+    }
+}
+
+/// The agent socket. Each connection is served through an in-memory pipe: the agent protocol
+/// reads a request only after it answered the last one, so the pipe is what sees the client
+/// close its end (Ctrl-C of `ssh`) while a signature waits for the phone, and withdraws it.
+#[derive(Debug)]
+struct Listener(tokio::net::UnixListener);
+
+#[ssh_agent_lib::async_trait]
+impl ListeningSocket for Listener {
+    type Stream = Conn;
+
+    async fn accept(&mut self) -> std::io::Result<Conn> {
+        let (s, _) = self.0.accept().await?;
+        Ok(Conn::serve(s))
+    }
+}
+
+/// One connection as the agent protocol sees it.
+struct Conn {
+    io: tokio::io::DuplexStream,
+    peer: Option<i32>,
+    gone: tokio::sync::watch::Receiver<bool>,
+}
+
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Conn")
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Conn {
+    /// Copies between the client and the pipe until both ends are closed; the client closing
+    /// its end (or failing) marks the connection gone.
+    fn serve(client: tokio::net::UnixStream) -> Conn {
+        use tokio::io::AsyncWriteExt;
+        let peer = client.peer_cred().ok().and_then(|c| c.pid());
+        let (io, ours) = tokio::io::duplex(64 * 1024);
+        let (gone_tx, gone) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            let (mut from_client, mut to_client) = client.into_split();
+            let (mut from_agent, mut to_agent) = tokio::io::split(ours);
+            let up = async {
+                let _ = tokio::io::copy(&mut from_client, &mut to_agent).await;
+                let _ = gone_tx.send(true);
+                let _ = to_agent.shutdown().await;
+            };
+            let down = async {
+                let _ = tokio::io::copy(&mut from_agent, &mut to_client).await;
+                let _ = to_client.shutdown().await;
+            };
+            tokio::join!(up, down);
+        });
+        Conn { io, peer, gone }
+    }
+}
+
+impl tokio::io::AsyncRead for Conn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Conn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -209,9 +303,10 @@ impl Session for Agent {
         let about = tokio::task::spawn_blocking(move || about_signature(&key, peer))
             .await
             .ok();
-        let vals = self
-            .daemon
-            .op_values(
+        // the client closing the connection (Ctrl-C) withdraws the request on the phone
+        let vals = crate::daemon::for_client(
+            self.gone.clone(),
+            self.daemon.op_values(
                 ValuesReq {
                     names: vec![format!("ssh/{name}")],
                     agent: None,
@@ -223,9 +318,10 @@ impl Session for Agent {
                     about,
                 },
                 &ev,
-            )
-            .await
-            .map_err(|e| agent_err(exit::message_of(&e)))?;
+            ),
+        )
+        .await
+        .map_err(|e| agent_err(exit::message_of(&e)))?;
         let text = Zeroizing::new(String::from_utf8_lossy(&vals[0].1).into_owned());
         let key = PrivateKey::from_openssh(&*text).map_err(agent_err)?;
         sign_with(&key, &req.data, req.flags).map_err(agent_err)
@@ -319,7 +415,7 @@ pub fn start_agent(daemon: Arc<Daemon>) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
     tokio::spawn(async move {
-        if let Err(e) = listen(listener, Agents { daemon }).await {
+        if let Err(e) = listen(Listener(listener), Agents { daemon }).await {
             log::warn!("SSH agent: {e}");
         }
     });

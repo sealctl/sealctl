@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## Unreleased
 
+### Changed
+
+- `sealctl pair`, `sealctl buy` and `sealctl unseal` (waiting for a delayed approval) ask the
+  relay less often while they wait, with jitter; they back off when the relay fails and stop on
+  a final answer such as the phone's daily limit.
+- Ctrl-C of `ssh` or `ssh-keygen` while its signature waits for the phone withdraws the request
+  there, as Ctrl-C of a sealctl command does.
+
 ## 0.7.2 - 2026-11-27
 
 ### Added
