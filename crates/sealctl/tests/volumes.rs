@@ -1036,6 +1036,289 @@ fn sealing_a_bundle_resumed_after_a_kill_at_its_marker_uses_its_id() {
     env.run(&["volume", "close", "left"]);
 }
 
+/// An APFS container in a disk image of the test, attached; detached (forced) when dropped.
+#[cfg(feature = "test-hooks")]
+struct ApfsImage {
+    /// The whole disk of the image, e.g. `disk5`.
+    disk: String,
+    /// Its APFS container, e.g. `disk7`.
+    container: String,
+}
+
+#[cfg(feature = "test-hooks")]
+impl ApfsImage {
+    fn attach(dir: &std::path::Path) -> ApfsImage {
+        let base = dir.join("container");
+        let out = Command::new("/usr/bin/hdiutil")
+            .args([
+                "create", "-size", "1g", "-type", "SPARSE", "-fs", "APFS", "-volname",
+            ])
+            .arg(random_name("svc"))
+            .arg(&base)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nomount", "-plist"])
+            .arg(base.with_extension("sparseimage"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        // whole disks: the image's own (its partition scheme), then the APFS container
+        // synthesized from its APFS partition
+        let text = String::from_utf8_lossy(&out.stdout);
+        let whole: Vec<String> = text
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("<string>/dev/disk")?
+                    .strip_suffix("</string>")
+            })
+            .filter(|n| !n.contains('s'))
+            .map(|n| format!("disk{n}"))
+            .collect();
+        assert_eq!(whole.len(), 2, "{text}");
+        ApfsImage {
+            disk: whole[0].clone(),
+            container: whole[1].clone(),
+        }
+    }
+
+    /// A new encrypted APFS volume in the container with the user's own `passphrase`, not
+    /// mounted; its UUID in lower case.
+    fn add_volume(&self, name: &str, passphrase: &str) -> String {
+        let mut c = Command::new("/usr/sbin/diskutil")
+            .args([
+                "apfs",
+                "addVolume",
+                &self.container,
+                "APFS",
+                name,
+                "-stdinpassphrase",
+                "-nomount",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(passphrase.as_bytes()).unwrap();
+        let out = c.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let dev = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Created new APFS Volume "))
+            .expect("new volume")
+            .trim()
+            .to_string();
+        diskutil_value(&["info", &dev], "Volume UUID")
+            .expect("volume UUID")
+            .to_lowercase()
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for ApfsImage {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-force", &format!("/dev/{}", self.disk)])
+            .output();
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+fn random_name(prefix: &str) -> String {
+    let mut b = [0u8; 3];
+    getrandom::fill(&mut b).unwrap();
+    format!(
+        "{prefix}{}",
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    )
+}
+
+/// `key: value` from `diskutil <args>` output.
+#[cfg(feature = "test-hooks")]
+fn diskutil_value(args: &[&str], key: &str) -> Option<String> {
+    let out = Command::new("/usr/sbin/diskutil").args(args).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        l.trim()
+            .strip_prefix(key)
+            .map(|r| r.trim_start_matches(':').trim().to_string())
+    })
+}
+
+/// Does `passphrase` open the APFS volume (`diskutil apfs unlockVolume -verify`)?
+#[cfg(feature = "test-hooks")]
+fn apfs_opens(uuid: &str, passphrase: &str) -> bool {
+    let mut c = Command::new("/usr/sbin/diskutil")
+        .args([
+            "apfs",
+            "unlockVolume",
+            uuid,
+            "-user",
+            uuid,
+            "-verify",
+            "-stdinpassphrase",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(passphrase.as_bytes()).unwrap();
+    c.wait().unwrap().success()
+}
+
+/// `sealctl seal volume <name> <uuid>` on a terminal, typing `passphrase`, with the phone
+/// approving; `kill` sets `SEALCTL_TEST_KILL`. The exit code (or signal), and the screen.
+#[cfg(feature = "test-hooks")]
+fn seal_apfs(
+    env: &Env,
+    name: &str,
+    uuid: &str,
+    passphrase: &str,
+    path: Option<&str>,
+    kill: Option<&str>,
+) -> (std::process::ExitStatus, String) {
+    let mut c = env.cmd();
+    if let Some(p) = path {
+        c.env("PATH", p);
+    }
+    if let Some(k) = kill {
+        c.env("SEALCTL_TEST_KILL", k);
+    }
+    c.args(["seal", "volume", name, uuid]);
+    let mut pty = Pty::spawn(c);
+    pty.expect("Passphrase of", Duration::from_secs(30));
+    let phone = PhoneThread::start(env.phone.clone(), pty.screen.clone(), Pick::Right, None);
+    pty.line(passphrase);
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = pty.child.try_wait().unwrap() {
+            break st;
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = pty.child.kill();
+            panic!("no end; screen:\n{}", pty.screen.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // what the terminal shows after the end
+    std::thread::sleep(Duration::from_millis(200));
+    drop(phone);
+    let screen = pty.screen.lock().unwrap().clone();
+    (status, screen)
+}
+
+/// An APFS volume's hint names the seed before its passphrase changes. `seal volume` killed
+/// (SIGKILL) right after the change leaves a volume whose hint names the seed that opens it;
+/// sealing it again says that an earlier seal changed it. A change that fails puts the user's
+/// own hint back.
+#[cfg(all(target_os = "macos", feature = "test-hooks"))]
+#[test]
+fn sealing_an_apfs_volume_resumed_after_a_kill_at_its_passphrase_change_names_its_seed() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut env = Env::new();
+    env.pair();
+    let own = canary();
+    let image = ApfsImage::attach(env.h());
+    let uuid = image.add_volume(&random_name("sav"), &own);
+    let set = Command::new("/usr/sbin/diskutil")
+        .args([
+            "apfs",
+            "setPassphraseHint",
+            &uuid,
+            "-user",
+            "disk",
+            "-hint",
+            "my own hint",
+        ])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{}", String::from_utf8_lossy(&set.stderr));
+    let hint = || diskutil_value(&["apfs", "listUsers", &uuid], "Hint");
+    assert_eq!(hint().as_deref(), Some("my own hint"));
+    let def = env.h().join(".config/sealctl/volumes/work.toml");
+
+    // the passphrase change fails: the user's hint is back, their passphrase still opens it
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.h().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("diskutil"),
+        "#!/bin/sh\ncase \" $* \" in *' changePassphrase '*) echo 'stand-in: refused' >&2; exit 1;; esac\n\
+         exec /usr/sbin/diskutil \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("diskutil"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let (status, screen) = seal_apfs(&env, "work", &uuid, &own, Some(&path), None);
+    assert_eq!(status.code(), Some(1), "{screen}");
+    assert!(screen.contains("stand-in: refused"), "{screen}");
+    assert_eq!(hint().as_deref(), Some("my own hint"), "{screen}");
+    assert!(apfs_opens(&uuid, &own));
+    assert!(!def.exists());
+
+    // killed right after the change: the hint names the seed already
+    let (status, screen) = seal_apfs(&env, "work", &uuid, &own, None, Some("changed:seal-volume"));
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "killed at the hook; exit {:?}, screen:\n{screen}",
+        status.code()
+    );
+    assert_eq!(
+        hint(),
+        Some(format!("sealctl {}", env.phone.fingerprint())),
+        "the hint is written before the change"
+    );
+    assert!(!apfs_opens(&uuid, &own), "the passphrase has changed");
+    assert!(!def.exists());
+
+    // sealing it again names the seed of the seal that did not finish
+    let (status, screen) = seal_apfs(&env, "work", &uuid, &own, None, None);
+    assert_eq!(status.code(), Some(10), "{screen}");
+    assert!(
+        screen.contains(&format!(
+            "The volume has the marker of a seal that did not finish (seed {})",
+            env.phone.fingerprint()
+        )),
+        "{screen}"
+    );
+    assert!(screen.contains("sealctl recover"), "{screen}");
+
+    // and the 24 words of that seed open it, from a HOME with nothing in it
+    let other = tempfile::Builder::new().prefix("sc").tempdir_in("/tmp").unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_sealctl"));
+    c.env_clear()
+        .env("HOME", other.path())
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("SEALCTL_AGENT", "0")
+        .env("SEALCTL_RELAY", "http://127.0.0.1:9")
+        .args(["recover", &uuid]);
+    let pty = Pty::spawn(c);
+    for (i, w) in env.phone.words().iter().enumerate() {
+        pty.expect(&format!("Word {} of 24:", i + 1), Duration::from_secs(30));
+        pty.line(w);
+    }
+    let (code, _, screen) = pty.wait(Duration::from_secs(120));
+    assert_eq!(code, 0, "{screen}");
+    assert_eq!(
+        diskutil_value(&["info", &uuid], "Mounted").as_deref(),
+        Some("Yes")
+    );
+    let _ = Command::new("/usr/sbin/diskutil")
+        .args(["apfs", "lockVolume", &uuid])
+        .output();
+    drop(image);
+}
+
 #[test]
 fn unreadable_files_still_make_a_backup_and_retention_runs() {
     if !have("restic") {

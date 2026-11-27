@@ -163,6 +163,22 @@ pub fn seal_volume_given(
     // a marker with no volume of this machine on the bundle: left by a seal that stopped
     // before it finished; its id is used again if the passphrase still opens the bundle
     let mut leftover = None;
+    // the same for an APFS volume's hint `sealctl <fp>`: its id is its UUID anyway
+    let mut leftover_seed = None;
+    if let Some(uuid) = &apfs_uuid {
+        if let Some(fp) = volume::apfs::hint_words(uuid)? {
+            if Volume::list()?
+                .iter()
+                .any(|v| v.kind == Kind::Apfs && v.id.eq_ignore_ascii_case(uuid))
+            {
+                return Err(fail(
+                    exit::USAGE,
+                    format!("{target} is sealed already (seed {fp})."),
+                ));
+            }
+            leftover_seed = Some(fp);
+        }
+    }
     if kind == Kind::Sparsebundle {
         if let Some(f) = volume::read_marker(kind, target)? {
             let ours = Volume::list()?.iter().any(|v| {
@@ -177,6 +193,7 @@ pub fn seal_volume_given(
                     format!("{target} is sealed already (seed {}).", f.words),
                 ));
             }
+            leftover_seed = Some(f.words.clone());
             leftover = Some(f);
         }
     }
@@ -192,14 +209,14 @@ pub fn seal_volume_given(
         }
     };
     if !opens(old.as_bytes())? {
-        if let Some(f) = &leftover {
+        if let Some(fp) = &leftover_seed {
             return Err(fail(
                 exit::WRONG_KEY,
                 format!(
-                    "That passphrase does not open {target}. Check it and try again. The bundle has \
-                     the marker of a seal that did not finish (seed {}): if your passphrase is right, \
+                    "That passphrase does not open {target}. Check it and try again. The {} has \
+                     the marker of a seal that did not finish (seed {fp}): if your passphrase is right, \
                      that seal changed it already, and sealctl recover opens it with the 24 words of that seed.",
-                    f.words
+                    if kind == Kind::Apfs { "volume" } else { "bundle" }
                 ),
             ));
         }
@@ -251,14 +268,30 @@ pub fn seal_volume_given(
         },
         manual,
     };
-    // a sparse bundle's id is random: it is on disk before the passphrase changes, since the
-    // key (from the words or the phone) cannot be found again without it
-    let unmark = || {
-        if let Some(p) = volume::sparsebundle::id_path(&vol) {
-            let _ = std::fs::remove_file(p);
-        }
+    // The marker is on the volume before its passphrase changes, and goes again when the
+    // change fails or is undone: a sparse bundle's id is random, and the key (from the words or
+    // the phone) cannot be found again without it; an APFS volume's hint names the seed, so a
+    // stop right after the change leaves a volume that says which words open it.
+    let hint_before = match &apfs_uuid {
+        Some(uuid) => volume::apfs::disk_user_hint(uuid)?,
+        None => None,
     };
-    if kind == Kind::Sparsebundle {
+    let unmark = || match kind {
+        Kind::Sparsebundle => {
+            if let Some(p) = volume::sparsebundle::id_path(&vol) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        // the user's own hint back; a leftover sealctl hint is not theirs
+        Kind::Apfs => {
+            let _ = match hint_before.as_deref().filter(|h| !h.starts_with("sealctl ")) {
+                Some(h) => volume::apfs::set_hint(&vol, h),
+                None => volume::apfs::clear_hint(&vol),
+            };
+        }
+        Kind::Luks => {}
+    };
+    if matches!(kind, Kind::Sparsebundle | Kind::Apfs) {
         volume::write_marker(&vol)?;
         journal::test_kill("seal-volume", "marked");
     }
@@ -273,7 +306,13 @@ pub fn seal_volume_given(
                 unmark();
             }
         })?,
-        Kind::Apfs => volume::apfs::change_passphrase(&id, old.as_bytes(), new.as_bytes())?,
+        Kind::Apfs => {
+            volume::apfs::change_passphrase(&id, old.as_bytes(), new.as_bytes()).inspect_err(|_| {
+                if opens(old.as_bytes()).unwrap_or(false) {
+                    unmark();
+                }
+            })?
+        }
         Kind::Luks => {
             let out = util::run_with_fds(
                 util::system_cmd("cryptsetup")
@@ -286,6 +325,7 @@ pub fn seal_volume_given(
             util::check(out, "cryptsetup luksAddKey")?;
         }
     }
+    journal::test_kill("seal-volume", "changed");
     // LUKS has slots: the user's goes only once the new key is known to open it, and once the
     // definition and marker are saved, so a stop right after never leaves a container that only
     // sealctl's key opens without sealctl knowing it
@@ -321,7 +361,7 @@ pub fn seal_volume_given(
                 ),
                 _ => volume::apfs::change_passphrase(&id, new.as_bytes(), old.as_bytes()),
             };
-            if back.is_ok() && kind == Kind::Sparsebundle {
+            if back.is_ok() {
                 unmark();
             }
         }

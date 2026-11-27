@@ -183,8 +183,9 @@ impl Run {
 /// Tests only (`test-hooks`): with `SEALCTL_TEST_KILL=<state>:<step>` (a step id such as
 /// `secrets:2 secrets`, or just its kind, `secrets`; for example `done:secrets`) the process
 /// kills itself with SIGKILL right after that journal line is on disk: a power cut at a known
-/// point of the run, for the resume tests. `seal volume` has one more point outside any
-/// journal: `marked:seal-volume`, a sparse bundle's marker on disk before its passphrase changes.
+/// point of the run, for the resume tests. `seal volume` has two more points outside any
+/// journal: `marked:seal-volume`, the marker of a sparse bundle or APFS volume written before
+/// its passphrase changes, and `changed:seal-volume`, right after the change.
 #[allow(unused_variables)]
 pub(crate) fn test_kill(step: &str, state: &str) {
     #[cfg(feature = "test-hooks")]

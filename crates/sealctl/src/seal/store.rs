@@ -278,13 +278,12 @@ fn which(bin: &str) -> bool {
 }
 
 pub fn keychain_available() -> bool {
-    if cfg!(target_os = "macos") {
-        return true;
-    }
-    match keyring::Entry::new(&keychain_service(), "availability-check") {
-        Ok(e) => matches!(e.get_password(), Ok(_) | Err(keyring::Error::NoEntry)),
-        Err(_) => false,
-    }
+    #[cfg(target_os = "macos")]
+    return true;
+    #[cfg(target_os = "linux")]
+    return secret_items::available();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    false
 }
 
 pub fn op_available() -> bool {
@@ -771,10 +770,14 @@ fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Reads a keychain item into memory.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn keychain_get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
-    let e = keyring::Entry::new(service, account)?;
-    Ok(Zeroizing::new(e.get_secret()?))
+    secret_items::get(service, account)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn keychain_get(_service: &str, _account: &str) -> Result<Zeroizing<Vec<u8>>> {
+    bail!("no keychain on this system")
 }
 
 /// macOS: the Keychain item with a readable label (`sealctl: volume safe`); Keychain Access
@@ -810,16 +813,108 @@ fn keychain_set(service: &str, account: &str, label: &str, value: &[u8]) -> Resu
     }
 }
 
-/// The Secret Service (and other keyring back ends): the secret, then the label.
-#[cfg(not(target_os = "macos"))]
+/// The Secret Service item, with its label.
+#[cfg(target_os = "linux")]
 fn keychain_set(service: &str, account: &str, label: &str, value: &[u8]) -> Result<()> {
-    let e = keyring::Entry::new(service, account)?;
-    e.set_secret(value)?;
-    let mut attrs = std::collections::HashMap::new();
-    attrs.insert("label", label);
-    // back ends without labels ignore it
-    let _ = e.update_attributes(&attrs);
-    Ok(())
+    secret_items::set(service, account, label, value)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn keychain_set(_service: &str, _account: &str, _label: &str, _value: &[u8]) -> Result<()> {
+    bail!("no keychain on this system")
+}
+
+/// The Secret Service (`org.freedesktop.secrets`: GNOME Keyring, KWallet) on the session bus.
+/// Items carry the attributes `service`, `username`, `target` (`default`) and `application`
+/// (`rust-keyring`), as earlier versions of sealctl wrote them, and are found by `service` and
+/// `username`, so items those versions wrote are read and replaced as before.
+#[cfg(target_os = "linux")]
+mod secret_items {
+    use std::collections::HashMap;
+
+    use anyhow::{anyhow, bail, Context, Result};
+    use secret_service::{EncryptionType, SecretService};
+    use zeroize::Zeroizing;
+
+    /// Runs `f` on a runtime of its own, on a thread of its own, so a caller inside or outside a
+    /// tokio runtime can wait for it.
+    fn run<T: Send + 'static>(
+        f: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>>>> + Send + 'static,
+    ) -> Result<T> {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("starting a runtime for the Secret Service")?
+                .block_on(f())
+        })
+        .join()
+        .map_err(|_| anyhow!("the Secret Service call panicked"))?
+    }
+
+    fn search(service: &str, account: &str) -> HashMap<&'static str, String> {
+        HashMap::from([
+            ("service", service.to_string()),
+            ("username", account.to_string()),
+        ])
+    }
+
+    fn by_ref<'a>(m: &'a HashMap<&'static str, String>) -> HashMap<&'a str, &'a str> {
+        m.iter().map(|(k, v)| (*k, v.as_str())).collect()
+    }
+
+    /// Is a Secret Service running, with a default collection?
+    pub fn available() -> bool {
+        run(|| {
+            Box::pin(async {
+                let ss = SecretService::connect(EncryptionType::Dh).await?;
+                ss.get_default_collection().await?;
+                Ok(())
+            })
+        })
+        .is_ok()
+    }
+
+    pub fn get(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let attrs = search(service, account);
+        let what = format!("{account} in {service}");
+        run(move || {
+            Box::pin(async move {
+                let ss = SecretService::connect(EncryptionType::Dh).await?;
+                let found = ss.search_items(by_ref(&attrs)).await?;
+                let item = match (found.unlocked.first(), found.locked.first()) {
+                    (Some(i), _) => i,
+                    (None, Some(i)) => {
+                        ss.unlock_all(&[i]).await?;
+                        i
+                    }
+                    (None, None) => bail!("no Secret Service item {what}"),
+                };
+                Ok(Zeroizing::new(item.get_secret().await?))
+            })
+        })
+    }
+
+    pub fn set(service: &str, account: &str, label: &str, value: &[u8]) -> Result<()> {
+        let mut attrs = search(service, account);
+        attrs.insert("target", "default".into());
+        attrs.insert("application", "rust-keyring".into());
+        let label = label.to_string();
+        let value = Zeroizing::new(value.to_vec());
+        run(move || {
+            Box::pin(async move {
+                let ss = SecretService::connect(EncryptionType::Dh).await?;
+                let c = ss.get_default_collection().await?;
+                if c.is_locked().await? {
+                    c.unlock().await?;
+                }
+                // replaces an item with the same attributes
+                c.create_item(&label, by_ref(&attrs), &value, true, "text/plain")
+                    .await?;
+                Ok(())
+            })
+        })
+    }
 }
 
 /// The `folder` store: plain files in the run folder, written durably (data and directory

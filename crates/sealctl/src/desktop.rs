@@ -669,7 +669,7 @@ mod backend {
 
     use std::collections::{HashMap, HashSet};
 
-    use zbus::zvariant::Value;
+    use zbus::Variant;
 
     use super::Post;
 
@@ -789,9 +789,9 @@ mod backend {
                 }
             };
             let m = message(p, markup, replaces);
-            let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
-            hints.insert("desktop-entry", Value::from(m.desktop_entry));
-            hints.insert("urgency", Value::U8(m.urgency));
+            let mut hints: HashMap<&str, Variant<'_>> = HashMap::new();
+            hints.insert("desktop-entry", Variant::from(m.desktop_entry));
+            hints.insert("urgency", Variant::U8(m.urgency));
             let actions: Vec<&str> = Vec::new();
             bus.call_method(
                 Some(DEST),
