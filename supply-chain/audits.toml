@@ -1,4 +1,834 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.arrayvec]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+delta = "0.7.6 -> 0.7.8"
+notes = "0.7.6 -> 0.7.8 diff reviewed by an AI agent (Claude) on 2026-11-27: no build script, proc macros or dependency changes; adds the safe spare_capacity_mut (returns the uninitialised tail as MaybeUninit), fixes a zero-sized-type double drop in extend_from_iter with mem::forget, a u16 length type on 16-bit targets (lossless there), docs, tests and CI; no new unsafe outside a doc example; no I/O; not a human audit."
+
+[[audits.base64]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+delta = "0.22.1 -> 0.23.1"
+notes = "0.22.1 -> 0.23.1 diff reviewed by an AI agent (Claude) on 2026-11-27: new default feature simd-unsafe adds src/engine/simd.rs (read in full), AVX2 and NEON encode/decode kernels whose unaligned loads and stores are guarded against the slice lengths, chosen only after a runtime CPU check, a compile-time target feature or an unsafe constructor; the rest of the crate is deny(unsafe_code) and the default engines stay scalar; configurable padding symbol and error variant changes in safe code; no runtime dependencies, no build script, no I/O; SIMD arithmetic not proven correct; not a human audit."
+
+[[audits.bip39]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "3.0.0"
+notes = "3.0.0 reviewed by an AI agent (Claude) on 2026-11-27: no build script, no proc macros, no unsafe code; the ten src/language files are only [&str; 2048] arrays of plain string literals; PBKDF2-HMAC-SHA512 in safe Rust over bitcoin_hashes; OsRng only in the optional rand generate functions; no file, network, process or environment access; not a cryptographic review, not a human audit."
+
+[[audits.bitcoin_hashes]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "0.14.101"
+notes = "0.14.101 reviewed by an AI agent (Claude) on 2026-11-27: no build script, no proc macros, no FFI or asm, no file, network, process or environment access; unsafe is repr(transparent) byte-array-to-hash reference casts, volatile reads and writes in fixed_time_eq, the x86 SHA-NI sha256 path behind runtime is_x86_feature_detected checks with in-bounds unaligned loads and stores, and in-bounds unchecked loads in the SipHash-2-4 port of old std (copies from a pointer derived from a &u8, an aliasing-model nit); not a cryptographic review, not a human audit."
+
+[[audits.cfg-if]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.4 -> 1.0.5"
+notes = "1.0.4 -> 1.0.5 diff reviewed by an AI agent (Claude) on 2026-11-27: a deprecation note in the README and crate docs, changelog, version bumps and CI action pins; no code, macro, dependency or build changes; not a human audit."
+
+[[audits.curve25519-dalek]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "5.0.0"
+notes = "5.0.0 reviewed by an AI agent (Claude) on 2026-11-27: build.rs reads CARGO_CFG_* variables and runs rustc --version (rustc_version) to pick the backend and word-size cfgs, nothing else; no_std, no file, network, process or FFI access; unsafe is register-only core::arch intrinsics in the x86_64 AVX2 and AVX-512 IFMA backends (plus two const array-to-__m256i transmutes), reached only through backend.rs after a cpufeatures runtime check, and one repr(transparent) basepoint-table reference cast; arithmetic and constant tables not checked; not a cryptographic review, not a human audit."
+
+[[audits.curve25519-dalek-derive]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "0.1.1 reviewed by an AI agent (Claude) on 2026-11-27: proc macro only, no build script; syn/quote token rewriting with no file, environment, network or process access at compile time; the generated safe wrappers call #[target_feature] inner functions in unsafe blocks, so soundness rests on the caller's CPU feature check (curve25519-dalek 5.0.0 checks with cpufeatures before dispatch); not a human audit."
+
+[[audits.ed25519-dalek]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "3.0.0"
+notes = "3.0.0 reviewed by an AI agent (Claude) on 2026-11-27: no build script, no proc macros, no unsafe code (forbid(unsafe_code) outside test and batch); no_std, no file, network, process or environment access in library code (test vectors and DER fixtures only in tests); secret keys zeroize on drop and compare in constant time, signing keys derive their own verifying key, verify_strict rejects small-order points; curve arithmetic is curve25519-dalek's; not a cryptographic review, not a human audit."
+
+[[audits.getrandom]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "0.4.3"
+notes = "0.4.3 reviewed by an AI agent (Claude) on 2026-11-27: build.rs only emits a getrandom_msan cfg from CARGO_CFG_SANITIZE; all of src read; unsafe is the OS RNG calls (getrandom, getentropy, CCRandomGenerateBytes, ProcessPrng and others), raw-syscall, RDRAND and RNDR asm and dlsym lookups, with writes bounded by the buffer, EINTR and short reads handled and assume_init only after success; only file access is /dev/urandom read-only with O_CLOEXEC (and /dev/random polled, not read on Linux); no network or process access; the nightly opt-in extern_impl backend lets a safe user function skip initialisation (not used here); not a human audit."
+
+[[audits.hex-conservative]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "0.2.3"
+notes = "0.2.3 reviewed by an AI agent (Claude) on 2026-11-27: no build script, no proc macros, no unsafe code; hex encoding and decoding in safe Rust over arrayvec ArrayString/ArrayVec with checked str::from_utf8; the io::Read impl only decodes in-memory hex; no FFI, file, network, process or environment access; not a human audit."
+
+[[audits.hpke]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "0.15.1"
+notes = "0.15.1 reviewed by an AI agent (Claude) on 2026-11-27: no build script, no proc macros, no unsafe code; no_std, no file, network, process or environment access outside cfg(test) KAT tests; OS randomness through the default getrandom feature; secrets zeroize, the sequence counter is overflow-checked, malformed keys and ciphertexts return errors; panics are limited to API misuse in modes and KEM/KDF combinations sealctl does not enable; not a cryptographic review, not a human audit."
+
+[[audits.libc]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "0.2.191"
+notes = "0.2.191 reviewed by an AI agent (Claude) on 2026-11-27: build.rs read in full (runs $RUSTC --version, through RUSTC_WRAPPER if set, and freebsd-version or emcc only for those targets; reads environment variables and emits cfgs only, writes no files); every function body across all targets extracted and every one containing unsafe read (FD_* and CPU_* use checked indexing, CMSG_* mirror the C macros' pointer arithmetic); macros.rs read; extern declarations, types and constants scanned for anything else, not compared against platform headers; no I/O of its own; not a human audit."
+
+[[audits.r-efi]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "6.0.0"
+notes = "6.0.0 reviewed by an AI agent (Claude) on 2026-11-27: no build script, no proc macros, no_std; every function body read; the only library unsafe is two transmutes in Guid::from_bytes and as_bytes, sound for a repr(C) 16-byte struct of byte fields without padding; the rest is UEFI type, constant and function-pointer definitions, not checked against the UEFI specification; no I/O; not a human audit."
+
+[[audits.typenum]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "1.20.1"
+notes = "1.20.1 reviewed by an AI agent (Claude) on 2026-11-27: no build script (the generated files under src/gen are committed: type aliases, ToUInt impls and the op! macro), no proc macros, no_std and forbid(unsafe_code) at the crate root; no I/O or environment access; optional scale-info dependency only; not a human audit."
+
+[[audits.x25519-dalek]]
+who = "AI agent (Claude) for sealctl <support@sealctl.com>"
+criteria = "safe-to-deploy"
+version = "3.0.0"
+notes = "3.0.0 reviewed by an AI agent (Claude) on 2026-11-27: no build script, no proc macros, no unsafe code; no_std, about 300 lines wrapping curve25519-dalek's clamped scalar multiplication; no file, network, process or environment access (OS randomness only behind the optional getrandom feature); secret and shared-secret types zeroize on drop with the default feature; the bundled JPEG is a README image; not a cryptographic review, not a human audit."
+
+[[trusted.aead]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-06-05"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.aead]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-06-08"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/traits)"
+
+[[trusted.aes]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-06-05"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.aes]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/block-ciphers"
+start = "2026-04-10"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/block-ciphers)"
+
+[[trusted.aes-gcm]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-08-16"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.aho-corasick]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-03-28"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.anyhow]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-05"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.async-trait]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-07-23"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.axum]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2026-04-14"
+end = "2027-11-27"
+notes = "tokio maintainer"
+
+[[trusted.base16ct]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2022-01-13"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.base64ct]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2021-01-21"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.bcrypt-pbkdf]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-10-18"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.block-buffer]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-02-24"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/utils)"
+
+[[trusted.block-padding]]
+criteria = "safe-to-deploy"
+user-id = 5059 # Artyom Pavlov (newpavlov)
+start = "2019-04-22"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.blowfish]]
+criteria = "safe-to-deploy"
+user-id = 5059 # Artyom Pavlov (newpavlov)
+start = "2020-08-07"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.bytes]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-11"
+end = "2027-11-27"
+notes = "tokio maintainer"
+
+[[trusted.cbc]]
+criteria = "safe-to-deploy"
+user-id = 5059 # Artyom Pavlov (newpavlov)
+start = "2021-04-10"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.cbc]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/block-modes"
+start = "2026-02-27"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/block-modes)"
+
+[[trusted.chacha20]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-06-24"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.chacha20poly1305]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-08-30"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.cipher]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-02-04"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/traits)"
+
+[[trusted.cmov]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-04-02"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/utils)"
+
+[[trusted.const-oid]]
+criteria = "safe-to-deploy"
+user-id = 11235 # Arthur Gautier (baloo)
+start = "2023-07-10"
+end = "2027-11-27"
+notes = "RustCrypto maintainer (RustCrypto/formats)"
+
+[[trusted.const-oid]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/formats"
+start = "2026-11-10"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/formats)"
+
+[[trusted.cpubits]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-04-28"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/utils)"
+
+[[trusted.cpufeatures]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2021-04-26"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.crypto-bigint]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2021-04-30"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.crypto-common]]
+criteria = "safe-to-deploy"
+user-id = 5059 # Artyom Pavlov (newpavlov)
+start = "2021-02-10"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.crypto-common]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-02-04"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/traits)"
+
+[[trusted.ctr]]
+criteria = "safe-to-deploy"
+user-id = 5059 # Artyom Pavlov (newpavlov)
+start = "2019-03-11"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.ctutils]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-04-02"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/utils)"
+
+[[trusted.digest]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-06-10"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.digest]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-02-12"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/traits)"
+
+[[trusted.ecdsa]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-10-29"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.ed25519]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-08-10"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.ed25519]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/signatures"
+start = "2026-05-03"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/signatures)"
+
+[[trusted.elliptic-curve]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-12-05"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.ghash]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-09-19"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.hkdf]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/KDFs"
+start = "2026-03-30"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/KDFs)"
+
+[[trusted.hmac]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/MACs"
+start = "2026-03-20"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/MACs)"
+
+[[trusted.hybrid-array]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/hybrid-array"
+start = "2026-03-08"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/hybrid-array)"
+
+[[trusted.hyper-rustls]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2019-03-16"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.inout]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-10-14"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/utils)"
+
+[[trusted.itoa]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-02"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.jiff]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:BurntSushi/jiff"
+start = "2026-11-02"
+end = "2027-11-27"
+notes = "jiff release workflow of its maintainer (BurntSushi), crates.io trusted publishing"
+
+[[trusted.jiff-core]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:BurntSushi/jiff"
+start = "2026-11-02"
+end = "2027-11-27"
+notes = "jiff release workflow of its maintainer (BurntSushi), crates.io trusted publishing"
+
+[[trusted.jiff-static]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:BurntSushi/jiff"
+start = "2026-11-02"
+end = "2027-11-27"
+notes = "jiff release workflow of its maintainer (BurntSushi), crates.io trusted publishing"
+
+[[trusted.jiff-tzdb]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2024-07-09"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.jiff-tzdb-platform]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2024-07-09"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.memchr]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-07-07"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.openssl-probe]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2025-12-29"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.p256]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-01-06"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.p384]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-01-06"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.p521]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2023-03-04"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.pbkdf2]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-06-10"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.pkcs1]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-06-12"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.pkcs8]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-06-12"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.poly1305]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-08-15"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.poly1305]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/universal-hashes"
+start = "2026-05-10"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/universal-hashes)"
+
+[[trusted.polyval]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2019-08-13"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.primeorder]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2022-06-30"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.proc-macro2]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-04-23"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.regex]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-27"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.regex-automata]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-25"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.regex-syntax]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-03-30"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.rfc6979]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2021-02-09"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.rustls]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2019-04-02"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.rustls-native-certs]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2023-06-14"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.rustls-pki-types]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2023-09-07"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.rustls-platform-verifier]]
+criteria = "safe-to-deploy"
+user-id = 146896 # ComplexSpaces (complexspaces)
+start = "2024-01-03"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.rustls-platform-verifier-android]]
+criteria = "safe-to-deploy"
+user-id = 146896 # ComplexSpaces (complexspaces)
+start = "2024-01-03"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.rustls-webpki]]
+criteria = "safe-to-deploy"
+user-id = 209038 # Daniel McCarney (cpu)
+start = "2023-07-04"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.rustversion]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-07-08"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.ryu]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-02"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.same-file]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-07-16"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.sec1]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-08-26"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.serde]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.serde_core]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2025-09-13"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.serde_derive]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.serde_json]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-02-28"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.serde_path_to_error]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-08-20"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.serde_repr]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-04-26"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.sha1]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/hashes"
+start = "2026-03-27"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/hashes)"
+
+[[trusted.sha2]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/hashes"
+start = "2026-03-25"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/hashes)"
+
+[[trusted.signature]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-05-02"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/traits)"
+
+[[trusted.slab]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-10-13"
+end = "2027-11-27"
+notes = "tokio maintainer"
+
+[[trusted.spki]]
+criteria = "safe-to-deploy"
+user-id = 11235 # Arthur Gautier (baloo)
+start = "2023-05-04"
+end = "2027-11-27"
+notes = "RustCrypto maintainer (RustCrypto/formats)"
+
+[[trusted.ssh-cipher]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2023-05-29"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.ssh-encoding]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2022-10-21"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.ssh-key]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2021-11-18"
+end = "2027-11-27"
+notes = "RustCrypto maintainer"
+
+[[trusted.syn]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-12-25"
+end = "2027-11-27"
+notes = "tokio maintainer"
+
+[[trusted.tokio-macros]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-10-26"
+end = "2027-11-27"
+notes = "tokio maintainer"
+
+[[trusted.tokio-rustls]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2023-06-09"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.tokio-util]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-12"
+end = "2027-11-27"
+notes = "tokio maintainer"
+
+[[trusted.tracing]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2024-11-27"
+end = "2027-11-27"
+notes = "tokio project maintainer (tracing)"
+
+[[trusted.unicode-ident]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2021-10-02"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.universal-hash]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-02-27"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/traits)"
+
+[[trusted.walkdir]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-06-09"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.webpki-root-certs]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2024-11-21"
+end = "2027-11-27"
+notes = "rustls maintainer"
+
+[[trusted.winapi-util]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2020-01-11"
+end = "2027-11-27"
+notes = "regex, memchr, walkdir and jiff maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
+
+[[trusted.zeroize]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-06-12"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/utils)"
+
+[[trusted.zeroize_derive]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-06-12"
+end = "2027-11-27"
+notes = "RustCrypto release workflow (crates.io trusted publishing from github:RustCrypto/utils)"
+
+[[trusted.zmij]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2025-12-18"
+end = "2027-11-27"
+notes = "serde, syn, anyhow and thiserror maintainer; also trusted by the Mozilla, Bytecode Alliance and ISRG audit sets"
